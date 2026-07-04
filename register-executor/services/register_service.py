@@ -321,6 +321,17 @@ class RegisterService:
                     self._config["enabled"] = True
                 self._save()
                 return self.get()
+        try:
+            metrics = self._pool_metrics()
+        except Exception as exc:
+            self._append_log(f"异常账号修复启动失败：{exc}", "red")
+            raise
+        with self._lock:
+            if self._runner and self._runner.is_alive():
+                if not (self._stop_event and self._stop_event.is_set()):
+                    self._config["enabled"] = True
+                self._save()
+                return self.get()
             self._config["enabled"] = True
             self._logs = []
             self._stop_event = threading.Event()
@@ -336,7 +347,7 @@ class RegisterService:
                 "done": 0,
                 "running": 1,
                 "threads": 1,
-                **self._pool_metrics(),
+                **metrics,
                 "started_at": _now(),
                 "updated_at": _now(),
                 "trigger": "manual",
@@ -756,7 +767,7 @@ class RegisterService:
                 if str(item.get("access_token") or "").strip()
                 and (
                     str(item.get("status") or "正常") != "正常"
-                    or (not bool(item.get("image_quota_unknown")) and int(item.get("quota") or 0) <= 0)
+                    or (not bool(item.get("image_quota_unknown")) and _int_or_default(item.get("quota"), 0) <= 0)
                 )
             ]
             self._append_log(f"待修复异常/无额度账号 {len(candidates)} 个", "yellow")
@@ -784,6 +795,25 @@ class RegisterService:
                 finally:
                     done += 1
                     self._bump(done=done, success=success, fail=fail, running=1)
+        except Exception as exc:
+            fail += 1
+            done += 1
+            self._append_log(f"异常账号修复任务失败：{exc}", "red")
+            self._bump(
+                done=done,
+                success=success,
+                fail=fail,
+                running=0,
+                workers=[
+                    {
+                        "index": 1,
+                        "status": "failed",
+                        "failure_reason": "repair_abnormal_failed",
+                        "last_error": str(exc),
+                        "updated_at": _now(),
+                    }
+                ],
+            )
         finally:
             self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
             with self._lock:

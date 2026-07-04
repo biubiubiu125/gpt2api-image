@@ -174,14 +174,16 @@ func (s *Server) removeRegisterUnusableAccounts(tokens []string, errs []map[stri
 	if len(targets) == 0 {
 		return 0
 	}
-	remove := []string{}
+	changed := 0
 	for _, account := range s.store.LoadAccounts() {
 		if !targets[account.AccessToken] {
 			continue
 		}
-		if account.Status != "正常" || (!account.ImageQuotaUnknown && account.Quota <= 0) {
-			remove = append(remove, account.AccessToken)
+		if reason, ok := imageAccountRecordRemovalReason(account); ok {
+			if s.removeOrMarkImageAccount(account.AccessToken, reason) {
+				changed++
+			}
 		}
 	}
-	return s.deleteAccountTokens(remove)
+	return changed
 }

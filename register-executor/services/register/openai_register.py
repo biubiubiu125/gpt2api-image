@@ -27,6 +27,24 @@ class RegisteredAccountValidationError(RuntimeError):
     pass
 
 
+def _int_or_default(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _saved_image_account_usable(item: dict | None) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return (
+        str(item.get("status") or "正常") == "正常"
+        and not bool(item.get("pending_delete"))
+        and not bool(item.get("image_quota_unknown"))
+        and _int_or_default(item.get("quota"), 0) > 0
+    )
+
+
 base_dir = Path(__file__).resolve().parent
 config = {
     "mail": {
@@ -1367,11 +1385,11 @@ def worker(
             register_proxy_pool.report(selection, ok=False, reason=refresh_reason, error=refresh_error)
             proxy_reported = True
             raise RegisteredAccountValidationError(f"registered_account_refresh_failed: {refresh_result['errors']}")
-        if account_service.get_account(access_token) is None:
-            step(index, "账号保存后已被刷新流程自动移除，不计入成功", "yellow")
+        if not _saved_image_account_usable(account_service.get_account(access_token)):
+            step(index, "账号保存后未通过额度校验，已被移除或标记清退，不计入成功", "yellow")
             register_proxy_pool.report(selection, ok=True)
             proxy_reported = True
-            raise RegisteredAccountValidationError("registered_account_removed_after_refresh")
+            raise RegisteredAccountValidationError("registered_account_unusable_after_refresh")
         _check_run_active(run_id)
         register_proxy_pool.report(selection, ok=True)
         proxy_reported = True

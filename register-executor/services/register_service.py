@@ -98,6 +98,15 @@ def _int_or_default(value: object, default: int) -> int:
         return default
 
 
+def _image_account_usable(item: dict) -> bool:
+    return (
+        str(item.get("status") or "正常") == "正常"
+        and not bool(item.get("pending_delete"))
+        and not bool(item.get("image_quota_unknown"))
+        and _int_or_default(item.get("quota"), 0) > 0
+    )
+
+
 def _default_config() -> dict:
     return {
         **openai_register.config,
@@ -562,9 +571,9 @@ class RegisterService:
 
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
-        normal = [item for item in items if item.get("status") == "正常"]
+        normal = [item for item in items if _image_account_usable(item)]
         return {
-            "current_quota": sum(int(item.get("quota") or 0) for item in normal if not item.get("image_quota_unknown")),
+            "current_quota": sum(int(item.get("quota") or 0) for item in normal),
             "current_available": len(normal),
         }
 
@@ -788,7 +797,9 @@ class RegisterService:
                 if str(item.get("access_token") or "").strip()
                 and (
                     str(item.get("status") or "正常") != "正常"
-                    or (not bool(item.get("image_quota_unknown")) and _int_or_default(item.get("quota"), 0) <= 0)
+                    or bool(item.get("pending_delete"))
+                    or bool(item.get("image_quota_unknown"))
+                    or _int_or_default(item.get("quota"), 0) <= 0
                 )
             ]
             self._append_log(f"待修复异常/无额度账号 {len(candidates)} 个", "yellow")

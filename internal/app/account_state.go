@@ -93,6 +93,7 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 		return
 	}
 	now := nowISO()
+	removeReason := ""
 	_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
 		for i := range accounts {
 			if accounts[i].AccessToken != token {
@@ -102,9 +103,12 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 			accounts[i].LastUsedAt = &now
 			if image && !accounts[i].ImageQuotaUnknown && accounts[i].Quota > 0 {
 				accounts[i].Quota--
+				if accounts[i].Quota <= 0 {
+					removeReason = "image_quota_empty"
+				}
 			}
-			if accounts[i].Status == "限流" && (accounts[i].ImageQuotaUnknown || accounts[i].Quota > 0) {
-				accounts[i].Status = "正常"
+			if isAccountStatus(accounts[i].Status, accountStatusLimited) && !accounts[i].ImageQuotaUnknown && accounts[i].Quota > 0 {
+				accounts[i].Status = accountStatusNormal
 				accounts[i].RestoreAt = nil
 				accounts[i].RateLimitedAt = nil
 				accounts[i].RateLimitResetAt = nil
@@ -113,6 +117,9 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 		}
 		return accounts
 	})
+	if image && removeReason != "" {
+		s.removeOrMarkImageAccount(token, removeReason)
+	}
 }
 
 func (s *Server) markAccountFailure(token string, err error, image bool) {
@@ -120,6 +127,12 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 		return
 	}
 	now := nowISO()
+	removeReason := ""
+	if image {
+		if reason, ok := imageAccountErrorRemovalReason(err); ok {
+			removeReason = reason
+		}
+	}
 	_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
 		for i := range accounts {
 			if accounts[i].AccessToken != token {
@@ -127,8 +140,13 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 			}
 			accounts[i].Fail++
 			accounts[i].LastUsedAt = &now
+			if removeReason != "" {
+				accounts[i].Status = accountStatusInvalid
+				accounts[i].Quota = 0
+				return accounts
+			}
 			if isRateLimitErrorText(err) {
-				accounts[i].Status = "限流"
+				accounts[i].Status = accountStatusLimited
 				reset := time.Now().UTC().Add(rateLimitRestoreDelay(err)).Format(time.RFC3339)
 				accounts[i].RestoreAt = &reset
 				accounts[i].RateLimitResetAt = &reset
@@ -137,7 +155,7 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 					accounts = append(accounts[:i], accounts[i+1:]...)
 				}
 			} else if isInvalidTokenErrorText(err) {
-				accounts[i].Status = "异常"
+				accounts[i].Status = accountStatusInvalid
 				accounts[i].Quota = 0
 				if s.cfg.AutoRemoveInvalidAccounts {
 					accounts = append(accounts[:i], accounts[i+1:]...)
@@ -147,4 +165,7 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 		}
 		return accounts
 	})
+	if removeReason != "" {
+		s.removeOrMarkImageAccount(token, removeReason)
+	}
 }

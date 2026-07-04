@@ -189,13 +189,11 @@ func (s *Server) registerPoolMetrics() (int, int) {
 	quota := 0
 	available := 0
 	for _, account := range s.store.LoadAccounts() {
-		if account.Status != "正常" {
+		if !isAccountStatus(account.Status, accountStatusNormal) || account.ImageQuotaUnknown || account.Quota <= 0 || account.PendingDelete {
 			continue
 		}
 		available++
-		if !account.ImageQuotaUnknown {
-			quota += account.Quota
-		}
+		quota += account.Quota
 	}
 	return quota, available
 }

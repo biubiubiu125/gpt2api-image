@@ -111,7 +111,7 @@ func (s *Store) LoadAccounts() []Account {
 			a.Type = "free"
 		}
 		if a.Status == "" {
-			a.Status = "正常"
+			a.Status = accountStatusNormal
 		}
 		if a.SourceType == "" {
 			a.SourceType = "web"

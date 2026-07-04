@@ -44,6 +44,9 @@ type Account struct {
 	RestoreAt         *string           `json:"restore_at,omitempty"`
 	RateLimitedAt     *string           `json:"rate_limited_at,omitempty"`
 	RateLimitResetAt  *string           `json:"rate_limit_reset_at,omitempty"`
+	PendingDelete     bool              `json:"pending_delete,omitempty"`
+	DeleteReason      *string           `json:"delete_reason,omitempty"`
+	DeleteMarkedAt    *string           `json:"delete_marked_at,omitempty"`
 	Success           int               `json:"success"`
 	Fail              int               `json:"fail"`
 	LastUsedAt        *string           `json:"last_used_at,omitempty"`

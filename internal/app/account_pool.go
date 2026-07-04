@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -52,19 +53,27 @@ func (p *accountPool) pickTokenExcluding(accounts []Account, needCodex bool, cod
 	}
 	premium := map[string]bool{"plus": true, "pro": true, "team": true}
 	now := time.Now().UTC()
+	type candidate struct {
+		account  Account
+		idx      int
+		offset   int
+		inflight int
+		used     int
+	}
+	candidates := []candidate{}
 	for offset := 0; offset < len(accounts); offset++ {
 		idx := (p.index + offset) % len(accounts)
 		a := accounts[idx]
 		if a.AccessToken == "" || excluded[a.AccessToken] {
 			continue
 		}
-		if a.Status == "禁用" {
+		if a.PendingDelete || isAccountDisabled(a.Status) {
 			continue
 		}
-		if a.Status == "异常" {
+		if isAccountInvalidStatus(a.Status) {
 			continue
 		}
-		if a.Status == "限流" {
+		if isAccountStatus(a.Status, accountStatusLimited) {
 			resetAt := firstNonEmpty(ptrString(a.RateLimitResetAt), ptrString(a.RestoreAt))
 			if resetAt != "" {
 				rt, err := parseAccountTime(resetAt)
@@ -75,7 +84,7 @@ func (p *accountPool) pickTokenExcluding(accounts []Account, needCodex bool, cod
 				continue
 			}
 		}
-		if !a.ImageQuotaUnknown && a.Quota <= 0 {
+		if a.ImageQuotaUnknown || a.Quota <= 0 {
 			continue
 		}
 		if needCodex {
@@ -95,9 +104,32 @@ func (p *accountPool) pickTokenExcluding(accounts []Account, needCodex bool, cod
 		if p.inflight[a.AccessToken] >= maxConc {
 			continue
 		}
-		p.index = (idx + 1) % len(accounts)
-		p.inflight[a.AccessToken]++
-		return a.AccessToken, nil
+		candidates = append(candidates, candidate{
+			account:  a,
+			idx:      idx,
+			offset:   offset,
+			inflight: p.inflight[a.AccessToken],
+			used:     a.Success + a.Fail,
+		})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		if left.account.Quota != right.account.Quota {
+			return left.account.Quota > right.account.Quota
+		}
+		if left.used != right.used {
+			return left.used < right.used
+		}
+		if left.inflight != right.inflight {
+			return left.inflight < right.inflight
+		}
+		return left.offset < right.offset
+	})
+	if len(candidates) > 0 {
+		chosen := candidates[0]
+		p.index = (chosen.idx + 1) % len(accounts)
+		p.inflight[chosen.account.AccessToken]++
+		return chosen.account.AccessToken, nil
 	}
 	if needCodex {
 		return "", errors.New("no available codex Plus/Team/Pro account")
@@ -115,6 +147,22 @@ func (p *accountPool) releaseToken(token string) {
 	}
 }
 
+func (p *accountPool) retainToken(token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.inflight[token]++
+}
+
+func (p *accountPool) activeCount(token string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inflight[token]
+}
+
 func (p *accountPool) pickTextToken(accounts []Account, planType string) (string, error) {
 	return p.pickTextTokenExcluding(accounts, planType, nil)
 }
@@ -126,7 +174,7 @@ func (p *accountPool) pickTextTokenExcluding(accounts []Account, planType string
 	for offset := 0; offset < len(accounts); offset++ {
 		idx := (p.index + offset) % len(accounts)
 		a := accounts[idx]
-		if a.AccessToken == "" || excluded[a.AccessToken] || a.Status == "禁用" || a.Status == "异常" {
+		if a.AccessToken == "" || excluded[a.AccessToken] || a.PendingDelete || isAccountDisabled(a.Status) || isAccountInvalidStatus(a.Status) {
 			continue
 		}
 		lower := strings.ToLower(a.Type)

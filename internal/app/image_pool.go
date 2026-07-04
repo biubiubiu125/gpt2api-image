@@ -10,6 +10,70 @@ import (
 
 type imageGeneratorFunc func(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error)
 
+const maxImageAccountFallbackAttempts = 5
+
+type imageAccountAttemptScope struct {
+	mu        sync.Mutex
+	max       int
+	used      int
+	attempted map[string]bool
+}
+
+func newImageAccountAttemptScope(max int) *imageAccountAttemptScope {
+	if max < 1 {
+		max = 1
+	}
+	return &imageAccountAttemptScope{max: max, attempted: map[string]bool{}}
+}
+
+func (s *imageAccountAttemptScope) exhausted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.used >= s.max
+}
+
+func (s *imageAccountAttemptScope) usedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.used
+}
+
+func (s *imageAccountAttemptScope) excludedSnapshot() map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]bool, len(s.attempted))
+	for token, yes := range s.attempted {
+		out[token] = yes
+	}
+	return out
+}
+
+func (s *imageAccountAttemptScope) reserve(primary string) bool {
+	primary = strings.TrimSpace(primary)
+	if primary == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.attempted[primary] || s.used >= s.max {
+		return false
+	}
+	s.attempted[primary] = true
+	s.used++
+	return true
+}
+
+func (s *imageAccountAttemptScope) alias(tokens ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token != "" {
+			s.attempted[token] = true
+		}
+	}
+}
+
 func (s *Server) imageRequestTimeout() time.Duration {
 	opts := s.imageGenerationOptions()
 	return opts.Timeout + opts.PollInitialWait + 60*time.Second
@@ -25,15 +89,19 @@ func (s *Server) imageGenerationOptions() imageGenerationOptions {
 }
 
 func (s *Server) generateImageWithPool(ctx context.Context, prompt, model, size, resolution string, refs [][]byte) ([]upstreamImageResult, error) {
-	accounts := s.store.LoadAccounts()
-	maxAttempts := len(accounts)
-	if maxAttempts < 1 {
-		maxAttempts = 1
+	return s.generateImageWithPoolScoped(ctx, prompt, model, size, resolution, refs, newImageAccountAttemptScope(maxImageAccountFallbackAttempts))
+}
+
+func (s *Server) generateImageWithPoolScoped(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, scope *imageAccountAttemptScope) ([]upstreamImageResult, error) {
+	if scope == nil {
+		scope = newImageAccountAttemptScope(maxImageAccountFallbackAttempts)
 	}
-	excluded := map[string]bool{}
+	s.cleanupPendingDeletedAccounts()
+	s.cleanupUnusableImageAccounts()
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; {
-		traceLogf(ctx, "├─ image account attempt %d/%d model=%s resolution=%s excluded=%d", attempt+1, maxAttempts, model, resolution, len(excluded))
+	for !scope.exhausted() {
+		excluded := scope.excludedSnapshot()
+		traceLogf(ctx, "├─ image account attempt %d/%d model=%s resolution=%s excluded=%d", scope.usedCount()+1, maxImageAccountFallbackAttempts, model, resolution, len(excluded))
 		account, err := s.pickAccountExcluding(model, resolution, excluded)
 		if err != nil {
 			if lastErr != nil {
@@ -42,13 +110,22 @@ func (s *Server) generateImageWithPool(ctx context.Context, prompt, model, size,
 			return nil, err
 		}
 		poolToken := account.AccessToken
+		if !scope.reserve(poolToken) {
+			s.accountPool.releaseToken(poolToken)
+			if scope.exhausted() {
+				break
+			}
+			continue
+		}
 		client, actualAccount, err := s.upstreamClientForImageAccount(model, resolution, account)
 		if err != nil {
+			if !errors.Is(err, errImageAccountBusy) {
+				s.markAccountFailure(poolToken, err, true)
+			}
 			s.accountPool.releaseToken(poolToken)
-			excluded[poolToken] = true
+			s.cleanupPendingDeletedAccounts()
 			if errors.Is(err, errImageAccountBusy) {
 				lastErr = err
-				attempt++
 				continue
 			}
 			if lastErr != nil {
@@ -57,37 +134,43 @@ func (s *Server) generateImageWithPool(ctx context.Context, prompt, model, size,
 			return nil, err
 		}
 		token := actualAccount.AccessToken
+		scope.alias(poolToken, token)
+		hasTokenAlias := token != "" && token != poolToken
+		if hasTokenAlias {
+			s.accountPool.retainToken(token)
+		}
+		releaseSelectedToken := func() {
+			s.accountPool.releaseToken(poolToken)
+			if hasTokenAlias {
+				s.accountPool.releaseToken(token)
+			}
+		}
 		leaseID, leased, err := s.acquireImageAccountLease(ctx, token)
 		if err != nil {
-			s.accountPool.releaseToken(poolToken)
-			excluded[poolToken] = true
-			excluded[token] = true
+			releaseSelectedToken()
 			lastErr = err
-			attempt++
 			continue
 		}
 		if !leased {
-			s.accountPool.releaseToken(poolToken)
-			excluded[poolToken] = true
-			excluded[token] = true
+			releaseSelectedToken()
 			lastErr = errImageAccountBusy
-			attempt++
 			continue
 		}
-		attempt++
 		traceLogf(ctx, "│  ├─ selected image account %s", accountLabel(actualAccount))
-		excluded[poolToken] = true
-		excluded[token] = true
 		items, err := client.GenerateImage(ctx, prompt, model, size, resolution, refs, s.imageGenerationOptions())
-		s.accountPool.releaseToken(poolToken)
-		s.releaseImageAccountLease(ctx, leaseID)
 		if err == nil {
-			traceLogf(ctx, "└─ image account attempt %d success images=%d", attempt+1, len(items))
+			traceLogf(ctx, "└─ image account attempt success images=%d", len(items))
 			s.markAccountSuccess(token, true)
+			releaseSelectedToken()
+			s.releaseImageAccountLease(ctx, leaseID)
+			s.cleanupPendingDeletedAccounts()
 			return items, nil
 		}
-		traceLogf(ctx, "│  └─ image account attempt %d failed error=%v", attempt+1, err)
+		traceLogf(ctx, "│  └─ image account attempt failed error=%v", err)
 		s.markAccountFailure(token, err, true)
+		releaseSelectedToken()
+		s.releaseImageAccountLease(ctx, leaseID)
+		s.cleanupPendingDeletedAccounts()
 		lastErr = err
 		if !shouldRetryImageAccount(err) {
 			return nil, err
@@ -143,6 +226,7 @@ func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size
 	if n <= 1 {
 		return s.generateImageWithPool(ctx, prompt, model, size, resolution, refs)
 	}
+	scope := newImageAccountAttemptScope(maxImageAccountFallbackAttempts)
 	limit := s.cfg.ImageAccountConcurrency
 	if limit <= 0 {
 		limit = 1
@@ -166,7 +250,7 @@ func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size
 			case sem <- struct{}{}:
 			}
 			defer func() { <-sem }()
-			items, err := s.generateImageWithPool(ctx, prompt, model, size, resolution, refs)
+			items, err := s.generateImageWithPoolScoped(ctx, prompt, model, size, resolution, refs, scope)
 			if err != nil {
 				errs[i] = err
 				return

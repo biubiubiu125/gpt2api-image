@@ -599,6 +599,24 @@ func (s *PGTaskStore) ReleaseAccountLease(ctx context.Context, leaseID string) e
 	return err
 }
 
+func (s *PGTaskStore) CountAccountLeases(ctx context.Context, token string) (int, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return 0, nil
+	}
+	nowTS := float64(time.Now().UnixNano()) / 1e9
+	sum := sha256.Sum256([]byte(token))
+	tokenHash := hex.EncodeToString(sum[:])
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM account_leases_v1 WHERE expires_ts <= $1`, nowTS); err != nil {
+		return 0, err
+	}
+	var active int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_leases_v1 WHERE token_hash=$1 AND expires_ts > $2`, tokenHash, nowTS).Scan(&active); err != nil {
+		return 0, err
+	}
+	return active, nil
+}
+
 func limitTaskError(value string, maxLen int) string {
 	value = strings.TrimSpace(value)
 	if maxLen <= 0 || len(value) <= maxLen {

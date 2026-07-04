@@ -110,12 +110,19 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 	if typ == "" {
 		typ = "free"
 	}
-	status := strings.TrimSpace(strAny(rec["status"], "正常"))
+	status := strings.TrimSpace(strAny(rec["status"], accountStatusNormal))
 	if status == "" {
-		status = "正常"
+		status = accountStatusNormal
 	}
 	now := nowISO()
 	a := Account{AccessToken: token, Type: typ, SourceType: source, Status: status, Quota: intAny(rec["quota"], 0), Success: intAny(rec["success"], 0), Fail: intAny(rec["fail"], 0), CreatedAt: &now, ImageQuotaUnknown: boolAny(rec["image_quota_unknown"], false)}
+	a.PendingDelete = boolAny(rec["pending_delete"], false)
+	if v := strings.TrimSpace(strAny(rec["delete_reason"], "")); v != "" {
+		a.DeleteReason = &v
+	}
+	if v := strings.TrimSpace(strAny(rec["delete_marked_at"], "")); v != "" {
+		a.DeleteMarkedAt = &v
+	}
 	if v := strings.TrimSpace(strAny(rec["email"], "")); v != "" {
 		a.Email = &v
 	}
@@ -199,6 +206,15 @@ func mergeAccount(dst *Account, src Account) {
 	}
 	if src.Status != "" {
 		dst.Status = src.Status
+	}
+	if src.PendingDelete {
+		dst.PendingDelete = true
+	}
+	if src.DeleteReason != nil {
+		dst.DeleteReason = src.DeleteReason
+	}
+	if src.DeleteMarkedAt != nil {
+		dst.DeleteMarkedAt = src.DeleteMarkedAt
 	}
 	if !src.ImageQuotaUnknown || src.Quota != 0 || len(src.LimitsProgress) > 0 {
 		dst.Quota = src.Quota
@@ -300,6 +316,7 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (i
 			return accounts
 		})
 	}
+	s.cleanupUnusableImageAccounts()
 	return refreshed, errs
 }
 

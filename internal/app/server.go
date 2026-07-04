@@ -61,6 +61,12 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_BASE_URL")); env != "" {
 		cfg.BaseURL = env
 	}
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_REGISTER_EXECUTOR_URL")); env != "" {
+		cfg.RegisterExecutorURL = env
+	}
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_REGISTER_INTERNAL_KEY")); env != "" {
+		cfg.RegisterInternalKey = env
+	}
 	if strings.TrimSpace(cfg.AuthKey) == "" {
 		return nil, errors.New("auth-key 未设置")
 	}
@@ -175,6 +181,7 @@ func (s *Server) configMap(includeAuth bool) map[string]any {
 		m["auth-key"] = s.cfg.AuthKey
 	} else {
 		delete(m, "auth-key")
+		delete(m, "register_internal_key")
 	}
 	m["refresh_account_interval_minute"] = s.cfg.RefreshAccountIntervalMinute
 	m["image_retention_days"] = s.cfg.ImageRetentionDays
@@ -194,6 +201,12 @@ func (s *Server) configMap(includeAuth bool) map[string]any {
 	m["ai_review"] = s.cfg.AIReview
 	m["image_account_concurrency"] = s.cfg.ImageAccountConcurrency
 	m["cleanup_protect_user_images"] = s.cfg.CleanupProtectUserImages
+	m["register_executor_url"] = s.cfg.RegisterExecutorURL
+	if includeAuth {
+		m["register_internal_key"] = s.cfg.RegisterInternalKey
+	} else {
+		delete(m, "register_internal_key")
+	}
 	return m
 }
 
@@ -273,7 +286,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/register/reset", s.handleRegisterReset)
 	s.mux.HandleFunc("/api/register/repair-abnormal", s.handleRegisterRepairAbnormal)
 	s.mux.HandleFunc("/api/register/outlook-pool/reset", s.handleRegisterOutlookPoolReset)
+	s.mux.HandleFunc("/api/register/outlook-pool/test", s.handleRegisterOutlookPoolTest)
 	s.mux.HandleFunc("/api/register/events", s.handleRegisterEvents)
+	s.mux.HandleFunc("/internal/register/accounts", s.handleInternalRegisterAccounts)
+	s.mux.HandleFunc("/internal/register/accounts/refresh", s.handleInternalRegisterAccountsRefresh)
+	s.mux.HandleFunc("/internal/register/accounts/delete", s.handleInternalRegisterAccountsDelete)
 	s.mux.HandleFunc("/v1/models", s.handleV1Models)
 	s.mux.HandleFunc("/v1/images/generations", s.handleV1ImagesGenerations)
 	s.mux.HandleFunc("/v1/images/edits", s.handleV1ImagesEdits)

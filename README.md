@@ -6,15 +6,16 @@
 
 ## 架构
 
-推荐使用 Docker Compose 部署，一共 3 个容器：
+推荐使用 Docker Compose 部署，一共 4 类容器：
 
 | 容器 | 作用 |
 | --- | --- |
 | `gpt2api-image-postgres` | PostgreSQL，保存异步图片任务队列 |
 | `gpt2api-image-api` | HTTP API 和 Web 管理面板 |
+| `gpt2api-image-register-executor` | 独立注册执行器，负责自动注册、Outlook token 邮箱池、自动补号 |
 | `gpt2api-image-worker-1` | 后台消费异步生图任务 |
 
-这样 API 容器负责接请求，Worker 容器负责跑耗时生图任务。后续要提高并发，优先横向增加 `worker` 副本，而不是把所有任务压在一个容器里。
+这样 API 容器负责接请求和管理面板，`register-executor` 负责注册机真实执行链路，Worker 容器负责跑耗时生图任务。后续要提高生图并发，优先横向增加 `worker` 副本，而不是把所有任务压在一个容器里。
 
 扩容 Worker：
 
@@ -71,7 +72,7 @@ docker compose up -d --build
 查看日志：
 
 ```bash
-docker compose logs -f api worker
+docker compose logs -f api register-executor worker
 ```
 
 访问：
@@ -132,6 +133,8 @@ curl http://localhost:3000/api/image-tasks \
 | 变量 | 说明 |
 | --- | --- |
 | `GPT2API_IMAGE_AUTH_KEY` | 管理员和 API 默认鉴权 Key |
+| `GPT2API_IMAGE_REGISTER_INTERNAL_KEY` | API 与注册执行器之间的内部鉴权 Key，留空时复用 `GPT2API_IMAGE_AUTH_KEY` |
+| `GPT2API_IMAGE_REGISTER_EXECUTOR_URL` | API 访问注册执行器的内网地址，Compose 默认 `http://register-executor:8091` |
 | `GPT2API_IMAGE_BASE_URL` | 生成图片返回 URL 时使用的公网地址 |
 | `GPT2API_IMAGE_DATABASE_URL` | PostgreSQL 连接串，Compose 内已自动配置 |
 | `GPT2API_IMAGE_MODE` | `serve`、`worker` 或 `all` |
@@ -148,9 +151,9 @@ curl http://localhost:3000/api/image-tasks \
 
 ## 注册机说明
 
-注册机页面和配置 API 已保留，方便后续接入真实自动注册执行器。
+注册机通过独立 `register-executor` 容器执行，API 只负责鉴权、配置转发和账号池写入。执行器支持注册任务超时、无进度超时、Outlook token 邮箱池检测、自动补号，并在注册后通过内部接口把账号写回本项目账号池。
 
-当前 Go 版不会伪造“注册成功”：点击开始注册会写入失败日志并明确提示执行器尚未迁移。急需上线时，建议先使用手动导入账号或接入独立注册执行器，避免把不可用的自动注册链路带到生产。
+注册成功写入账号后会刷新账号信息；刷新失败、账号异常或额度为 0 的账号会从账号池移除。Outlook token 邮箱池在管理页只展示脱敏预览，导入框留空保存不会清空已导入凭据。
 
 ## 本地开发
 

@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   LoaderCircle,
+  MailCheck,
   Play,
   Plus,
   RotateCcw,
@@ -39,7 +40,11 @@ export function RegisterCard() {
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
   const setCheckInterval = useSettingsStore((state) => state.setRegisterCheckInterval);
   const setFixedPassword = useSettingsStore((state) => state.setRegisterFixedPassword);
+  const setTaskTimeout = useSettingsStore((state) => state.setRegisterTaskTimeoutSeconds);
+  const setTaskStallTimeout = useSettingsStore((state) => state.setRegisterTaskStallTimeoutSeconds);
   const setMailField = useSettingsStore((state) => state.setRegisterMailField);
+  const setMailUseRegisterProxy = useSettingsStore((state) => state.setRegisterMailUseRegisterProxy);
+  const setAutoRefillField = useSettingsStore((state) => state.setRegisterAutoRefillField);
   const addProvider = useSettingsStore((state) => state.addRegisterProvider);
   const updateProvider = useSettingsStore((state) => state.updateRegisterProvider);
   const deleteProvider = useSettingsStore((state) => state.deleteRegisterProvider);
@@ -47,6 +52,7 @@ export function RegisterCard() {
   const toggle = useSettingsStore((state) => state.toggleRegister);
   const reset = useSettingsStore((state) => state.resetRegister);
   const repairAbnormal = useSettingsStore((state) => state.repairAbnormalRegisterAccounts);
+  const testOutlookPool = useSettingsStore((state) => state.testOutlookPool);
 
   const [configOpen, setConfigOpen] = useState(false);
   const configSectionRef = useRef<HTMLElement | null>(null);
@@ -120,6 +126,7 @@ export function RegisterCard() {
       ...(type === "gptmail" ? { api_key: "", default_domain: "" } : {}),
       ...(type === "yyds_mail" ? { api_base: "https://maliapi.215.im/v1", api_key: "", domain: [], subdomain: "", wildcard: false } : {}),
       ...(type === "cloudmail" ? { api_base: "", admin_email: "", admin_password: "", domain: [] } : {}),
+      ...(type === "outlook_token" ? { mailboxes: "", mode: "auto", imap_host: "outlook.office365.com" } : {}),
     });
   };
 
@@ -420,6 +427,30 @@ export function RegisterCard() {
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">指定账号密码</label>
               <Input type="password" value={String(config.fixed_password || "")} onChange={(event) => setFixedPassword(event.target.value)} placeholder="留空=随机生成" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} autoComplete="new-password" />
             </div>
+            <div className="space-y-1.5">
+              <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">单任务超时（秒）</label>
+              <Input value={String(config.task_timeout_seconds || "")} onChange={(event) => setTaskTimeout(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">无进度超时（秒）</label>
+              <Input value={String(config.task_stall_timeout_seconds || "")} onChange={(event) => setTaskStallTimeout(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled} />
+            </div>
+            <label className="flex items-center gap-2.5 pt-7 text-sm text-foreground">
+              <Checkbox checked={Boolean(config.auto_refill?.enabled)} onCheckedChange={(checked) => setAutoRefillField("enabled", Boolean(checked))} disabled={config.enabled} />
+              <span>启用自动补号</span>
+            </label>
+            <div className="space-y-1.5">
+              <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">补号阈值</label>
+              <Input value={String(config.auto_refill?.min_available || "")} onChange={(event) => setAutoRefillField("min_available", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || !config.auto_refill?.enabled} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">每轮补号数量</label>
+              <Input value={String(config.auto_refill?.batch_total || "")} onChange={(event) => setAutoRefillField("batch_total", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || !config.auto_refill?.enabled} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">补号检查间隔</label>
+              <Input value={String(config.auto_refill?.check_interval || "")} onChange={(event) => setAutoRefillField("check_interval", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || !config.auto_refill?.enabled} />
+            </div>
           </div>
 
           <div className="space-y-3 border-t border-border pt-4">
@@ -428,10 +459,16 @@ export function RegisterCard() {
                 <div className="font-data text-[10px] font-semibold tracking-[0.18em] text-muted-foreground uppercase">Mail Providers</div>
                 <h3 className="text-[14px] font-semibold text-foreground">邮箱配置</h3>
               </div>
-              <Button type="button" variant="outline" className="h-9 cursor-pointer rounded-lg border-border bg-background px-3 text-foreground" onClick={addProvider} disabled={config.enabled}>
-                <Plus className="size-4" />
-                添加
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button type="button" variant="outline" className="h-9 cursor-pointer rounded-lg border-border bg-background px-3 text-foreground" onClick={() => void testOutlookPool()} disabled={isSaving}>
+                  {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : <MailCheck className="size-4" />}
+                  Outlook 检测
+                </Button>
+                <Button type="button" variant="outline" className="h-9 cursor-pointer rounded-lg border-border bg-background px-3 text-foreground" onClick={addProvider} disabled={config.enabled}>
+                  <Plus className="size-4" />
+                  添加
+                </Button>
+              </div>
             </div>
 
             <div className="grid gap-3 md:grid-cols-3">
@@ -448,11 +485,16 @@ export function RegisterCard() {
                 <Input value={String(config.mail.wait_interval || "")} onChange={(event) => setMailField("wait_interval", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled} />
               </div>
             </div>
+            <label className="flex items-center gap-2.5 text-sm text-foreground">
+              <Checkbox checked={Boolean(config.mail.api_use_register_proxy ?? true)} onCheckedChange={(checked) => setMailUseRegisterProxy(Boolean(checked))} disabled={config.enabled} />
+              <span>邮箱 API 请求使用注册代理</span>
+            </label>
 
             <div className="space-y-3">
               {providers.map((provider, index) => {
                 const type = String(provider.type || "tempmail_lol");
                 const domains = Array.isArray(provider.domain) ? provider.domain.map(String).join("\n") : "";
+                const outlookMailboxes = Array.isArray(provider.mailboxes) ? provider.mailboxes.map(String).join("\n") : String(provider.mailboxes || "");
                 return (
                   <div key={index} className="space-y-3 rounded-lg border border-border bg-secondary/30 p-3">
                     <div className="flex items-center justify-between gap-3">
@@ -481,6 +523,7 @@ export function RegisterCard() {
                             <SelectItem value="gptmail">gptmail(未测试)</SelectItem>
                             <SelectItem value="yyds_mail">yyds_mail</SelectItem>
                             <SelectItem value="cloudmail">cloudmail</SelectItem>
+                            <SelectItem value="outlook_token">outlook_token</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -540,12 +583,42 @@ export function RegisterCard() {
                           </label>
                         </>
                       ) : null}
+                      {type === "outlook_token" ? (
+                        <>
+                          <div className="space-y-1.5">
+                            <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">读取模式</label>
+                            <Select value={String(provider.mode || "auto")} onValueChange={(value) => updateProvider(index, { mode: value })} disabled={config.enabled}>
+                              <SelectTrigger className="h-10 rounded-lg border-border bg-background">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="auto">auto</SelectItem>
+                                <SelectItem value="graph">graph</SelectItem>
+                                <SelectItem value="imap">imap</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="space-y-1.5">
+                            <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">IMAP Host</label>
+                            <Input value={String(provider.imap_host || "outlook.office365.com")} onChange={(event) => updateProvider(index, { imap_host: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled || String(provider.mode || "auto") === "graph"} />
+                          </div>
+                        </>
+                      ) : null}
                     </div>
 
                     {type === "tempmail_lol" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "cloudmail" ? (
                       <div className="space-y-1.5">
                         <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">{type === "inbucket" ? "基础域名列表" : "Domain"}</label>
                         <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) })} placeholder={type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : type === "cloudmail" ? "每行一个域名，支持多域名轮询，可加 @ 前缀" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-lg border-border bg-background font-data text-[12px]" disabled={config.enabled} />
+                      </div>
+                    ) : null}
+                    {type === "outlook_token" ? (
+                      <div className="space-y-1.5">
+                        <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">Outlook 邮箱 Token</label>
+                        <Textarea value={outlookMailboxes} onChange={(event) => updateProvider(index, { mailboxes: event.target.value })} placeholder="email----password----client_id----refresh_token&#10;留空保存不会清空已导入邮箱池" className="min-h-28 rounded-lg border-border bg-background font-data text-[12px]" disabled={config.enabled} />
+                        {Array.isArray(provider.mailboxes_preview) && provider.mailboxes_preview.length > 0 ? (
+                          <div className="font-data text-[11px] text-muted-foreground">已导入 {Number(provider.mailboxes_count || provider.mailboxes_preview.length)} 个：{provider.mailboxes_preview.map(String).slice(0, 6).join("、")}</div>
+                        ) : null}
                       </div>
                     ) : null}
                   </div>

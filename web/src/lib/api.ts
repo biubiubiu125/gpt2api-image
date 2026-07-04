@@ -17,6 +17,7 @@ export type Account = {
   image_quota_unknown?: boolean;
   email?: string | null;
   user_id?: string | null;
+  client_id?: string | null;
   limits_progress?: Array<{
     feature_name?: string;
     remaining?: number;
@@ -243,9 +244,12 @@ export type RegisterConfig = {
     request_timeout: number;
     wait_timeout: number;
     wait_interval: number;
+    api_use_register_proxy?: boolean;
     providers: Array<Record<string, unknown>>;
   };
   proxy: string;
+  task_timeout_seconds?: number;
+  task_stall_timeout_seconds?: number;
   total: number;
   threads: number;
   mode: "total" | "quota" | "available";
@@ -253,6 +257,12 @@ export type RegisterConfig = {
   target_available: number;
   check_interval: number;
   fixed_password: string;
+  auto_refill?: {
+    enabled: boolean;
+    min_available: number;
+    batch_total: number;
+    check_interval: number;
+  };
   stats: {
     job_id?: string;
     job_kind?: string;
@@ -269,6 +279,9 @@ export type RegisterConfig = {
     started_at?: string;
     updated_at?: string;
     finished_at?: string;
+    trigger?: string;
+    workers?: Array<Record<string, unknown>>;
+    proxy_pool?: Record<string, unknown>;
   };
   logs?: Array<{
     time: string;
@@ -611,6 +624,21 @@ export async function resetRegister() {
 
 export async function repairAbnormalAccounts() {
   return httpRequest<{ register: RegisterConfig }>("/api/register/repair-abnormal", { method: "POST" });
+}
+
+export type OutlookPoolTestResult = {
+  total: number;
+  checked: number;
+  ok: number;
+  failed: number;
+  items: Array<{ email: string; ok: boolean; messages?: number; error?: string }>;
+};
+
+export async function testRegisterOutlookPool(limit = 5) {
+  return httpRequest<{ result: OutlookPoolTestResult }>("/api/register/outlook-pool/test", {
+    method: "POST",
+    body: { limit },
+  });
 }
 
 // ── Upstream proxy ────────────────────────────────────────────────

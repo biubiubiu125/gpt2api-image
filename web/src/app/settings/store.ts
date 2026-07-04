@@ -10,6 +10,7 @@ import {
   resetRegister as resetRegisterApi,
   startRegister,
   stopRegister,
+  testRegisterOutlookPool,
   updateRegisterConfig,
   updateSettingsConfig,
   type RegisterConfig,
@@ -50,9 +51,12 @@ function normalizeRegister(config: RegisterConfig): RegisterConfig {
       request_timeout: Number(config.mail?.request_timeout || 30),
       wait_timeout: Number(config.mail?.wait_timeout || 180),
       wait_interval: Number(config.mail?.wait_interval || 5),
+      api_use_register_proxy: Boolean(config.mail?.api_use_register_proxy ?? true),
       providers: Array.isArray(config.mail?.providers) ? config.mail.providers : [],
     },
     proxy: String(config.proxy || ""),
+    task_timeout_seconds: Math.max(30, Number(config.task_timeout_seconds) || 300),
+    task_stall_timeout_seconds: Math.max(0, Number(config.task_stall_timeout_seconds ?? 60)),
     total: Number(config.total || 1),
     threads: Number(config.threads || 1),
     mode: config.mode || "total",
@@ -60,6 +64,12 @@ function normalizeRegister(config: RegisterConfig): RegisterConfig {
     target_available: Number(config.target_available || 1),
     check_interval: Number(config.check_interval || 5),
     fixed_password: String(config.fixed_password || ""),
+    auto_refill: {
+      enabled: Boolean(config.auto_refill?.enabled),
+      min_available: Math.max(1, Number(config.auto_refill?.min_available) || 30),
+      batch_total: Math.max(1, Number(config.auto_refill?.batch_total) || 100),
+      check_interval: Math.max(10, Number(config.auto_refill?.check_interval) || 300),
+    },
     stats: {
       ...(config.stats || {}),
       success: Number(config.stats?.success || 0),
@@ -113,7 +123,11 @@ type SettingsStore = {
   setRegisterTargetAvailable: (value: string) => void;
   setRegisterCheckInterval: (value: string) => void;
   setRegisterFixedPassword: (value: string) => void;
+  setRegisterTaskTimeoutSeconds: (value: string) => void;
+  setRegisterTaskStallTimeoutSeconds: (value: string) => void;
   setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
+  setRegisterMailUseRegisterProxy: (value: boolean) => void;
+  setRegisterAutoRefillField: (key: "enabled" | "min_available" | "batch_total" | "check_interval", value: string | boolean) => void;
   addRegisterProvider: () => void;
   updateRegisterProvider: (index: number, updates: Record<string, unknown>) => void;
   deleteRegisterProvider: (index: number) => void;
@@ -121,6 +135,7 @@ type SettingsStore = {
   toggleRegister: () => Promise<void>;
   resetRegister: () => Promise<void>;
   repairAbnormalRegisterAccounts: () => Promise<void>;
+  testOutlookPool: () => Promise<void>;
 };
 
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
@@ -296,6 +311,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setRegisterFixedPassword: (value) => {
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, fixed_password: value } } : {});
   },
+  setRegisterTaskTimeoutSeconds: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, task_timeout_seconds: Number(value) || 0 } } : {});
+  },
+  setRegisterTaskStallTimeoutSeconds: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, task_stall_timeout_seconds: Number(value) || 0 } } : {});
+  },
   setRegisterMailField: (key, value) => {
     set((state) => state.registerConfig ? {
       registerConfig: {
@@ -303,6 +324,34 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         mail: { ...state.registerConfig.mail, [key]: Number(value) || 0 },
       },
     } : {});
+  },
+  setRegisterMailUseRegisterProxy: (value) => {
+    set((state) => state.registerConfig ? {
+      registerConfig: {
+        ...state.registerConfig,
+        mail: { ...state.registerConfig.mail, api_use_register_proxy: value },
+      },
+    } : {});
+  },
+  setRegisterAutoRefillField: (key, value) => {
+    set((state) => {
+      if (!state.registerConfig) return {};
+      const current = state.registerConfig.auto_refill || {
+        enabled: false,
+        min_available: 30,
+        batch_total: 100,
+        check_interval: 300,
+      };
+      return {
+        registerConfig: {
+          ...state.registerConfig,
+          auto_refill: {
+            ...current,
+            [key]: typeof value === "boolean" ? value : Number(value) || 0,
+          },
+        },
+      };
+    });
   },
   addRegisterProvider: () => {
     set((state) => state.registerConfig ? {
@@ -353,6 +402,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         target_available: Math.max(1, Number(registerConfig.target_available) || 1),
         check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
         fixed_password: registerConfig.fixed_password,
+        task_timeout_seconds: Math.max(30, Number(registerConfig.task_timeout_seconds) || 300),
+        task_stall_timeout_seconds: Math.max(0, Number(registerConfig.task_stall_timeout_seconds) || 60),
+        auto_refill: {
+          enabled: Boolean(registerConfig.auto_refill?.enabled),
+          min_available: Math.max(1, Number(registerConfig.auto_refill?.min_available) || 30),
+          batch_total: Math.max(1, Number(registerConfig.auto_refill?.batch_total) || 100),
+          check_interval: Math.max(10, Number(registerConfig.auto_refill?.check_interval) || 300),
+        },
       });
       set({ registerConfig: normalizeRegister(data.register) });
       toast.success("注册配置已保存");
@@ -379,6 +436,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           target_available: Math.max(1, Number(registerConfig.target_available) || 1),
           check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
           fixed_password: registerConfig.fixed_password,
+          task_timeout_seconds: Math.max(30, Number(registerConfig.task_timeout_seconds) || 300),
+          task_stall_timeout_seconds: Math.max(0, Number(registerConfig.task_stall_timeout_seconds) || 60),
+          auto_refill: {
+            enabled: Boolean(registerConfig.auto_refill?.enabled),
+            min_available: Math.max(1, Number(registerConfig.auto_refill?.min_available) || 30),
+            batch_total: Math.max(1, Number(registerConfig.auto_refill?.batch_total) || 100),
+            check_interval: Math.max(10, Number(registerConfig.auto_refill?.check_interval) || 300),
+          },
         });
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();
@@ -420,6 +485,18 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.success("已请求启动异常账号修复");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "启动异常账号修复失败");
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+  testOutlookPool: async () => {
+    set({ isSavingRegister: true });
+    try {
+      const data = await testRegisterOutlookPool(5);
+      const result = data.result;
+      toast.success(`Outlook 检测完成：成功 ${result.ok}/${result.checked}，邮箱池 ${result.total} 个`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Outlook 邮箱池检测失败");
     } finally {
       set({ isSavingRegister: false });
     }

@@ -128,6 +128,9 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 	if v := strings.TrimSpace(strAny(rec["id_token"], "")); v != "" {
 		a.IDToken = &v
 	}
+	if v := strings.TrimSpace(strAny(rec["password"], "")); v != "" {
+		a.Password = &v
+	}
 	if v := strings.TrimSpace(strAny(rec["account_id"], strAny(rec["chatgpt_account_id"], ""))); v != "" {
 		a.AccountID = &v
 	}
@@ -249,6 +252,9 @@ func mergeAccount(dst *Account, src Account) {
 	}
 	if dst.InitialQuota < dst.Quota {
 		dst.InitialQuota = dst.Quota
+	}
+	if src.Password != nil {
+		dst.Password = src.Password
 	}
 }
 

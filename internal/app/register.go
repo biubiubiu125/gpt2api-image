@@ -21,6 +21,7 @@ type RegisterConfig struct {
 	TargetAvailable         int                    `json:"target_available"`
 	CheckInterval           int                    `json:"check_interval"`
 	FixedPassword           string                 `json:"fixed_password"`
+	AutoRefill              map[string]any         `json:"auto_refill,omitempty"`
 	Stats                   RegisterStats          `json:"stats"`
 	Logs                    []RegisterLog          `json:"logs,omitempty"`
 	Executor                map[string]any         `json:"executor,omitempty"`
@@ -81,6 +82,12 @@ func defaultRegisterConfig() RegisterConfig {
 		TargetAvailable:         10,
 		CheckInterval:           5,
 		FixedPassword:           "",
+		AutoRefill: map[string]any{
+			"enabled":        false,
+			"min_available":  30,
+			"batch_total":    100,
+			"check_interval": 300,
+		},
 		Stats: RegisterStats{
 			Success:          0,
 			Fail:             0,
@@ -153,6 +160,10 @@ func normalizeRegisterConfig(cfg RegisterConfig) RegisterConfig {
 	cfg.CheckInterval = maxInt(1, cfg.CheckInterval)
 	cfg.TaskTimeoutSeconds = maxInt(30, cfg.TaskTimeoutSeconds)
 	cfg.TaskStallTimeoutSeconds = maxInt(0, cfg.TaskStallTimeoutSeconds)
+	cfg.FixedPassword = strings.TrimSpace(cfg.FixedPassword)
+	if cfg.AutoRefill == nil {
+		cfg.AutoRefill = def.AutoRefill
+	}
 	cfg.Stats.Threads = cfg.Threads
 	if cfg.Logs == nil {
 		cfg.Logs = []RegisterLog{}
@@ -243,6 +254,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
+	if s.registerExecutorConfigured() {
+		s.proxyRegisterExecutorJSON(w, r, "/api/register")
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, 200, map[string]any{"register": s.registerSnapshot()})
@@ -269,7 +284,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 func applyRegisterUpdates(cfg *RegisterConfig, body map[string]any) {
 	if v, ok := body["mail"]; ok {
 		if raw, err := json.Marshal(v); err == nil {
-			_ = json.Unmarshal(raw, &cfg.Mail)
+			oldMail := cfg.Mail
+			var nextMail RegisterMailConfig
+			if json.Unmarshal(raw, &nextMail) == nil {
+				mergeRegisterOutlookMailboxes(oldMail, &nextMail)
+				cfg.Mail = nextMail
+			}
 		}
 	}
 	if v, ok := body["proxy"]; ok {
@@ -296,12 +316,92 @@ func applyRegisterUpdates(cfg *RegisterConfig, body map[string]any) {
 	if v, ok := body["fixed_password"]; ok {
 		cfg.FixedPassword = strAny(v, "")
 	}
+	if v, ok := body["auto_refill"]; ok {
+		if raw, err := json.Marshal(v); err == nil {
+			var autoRefill map[string]any
+			if json.Unmarshal(raw, &autoRefill) == nil {
+				cfg.AutoRefill = autoRefill
+			}
+		}
+	}
 	if v, ok := body["task_timeout_seconds"]; ok {
 		cfg.TaskTimeoutSeconds = intAny(v, cfg.TaskTimeoutSeconds)
 	}
 	if v, ok := body["task_stall_timeout_seconds"]; ok {
 		cfg.TaskStallTimeoutSeconds = intAny(v, cfg.TaskStallTimeoutSeconds)
 	}
+}
+
+func mergeRegisterOutlookMailboxes(oldMail RegisterMailConfig, nextMail *RegisterMailConfig) {
+	oldByID := map[string]map[string]any{}
+	oldOutlooks := []map[string]any{}
+	for _, provider := range oldMail.Providers {
+		if strAny(provider["type"], "") != "outlook_token" {
+			continue
+		}
+		oldOutlooks = append(oldOutlooks, provider)
+		if id := strings.TrimSpace(strAny(provider["provider_id"], strAny(provider["id"], ""))); id != "" {
+			oldByID[id] = provider
+		}
+	}
+	outlookIndex := 0
+	for index, provider := range nextMail.Providers {
+		if strAny(provider["type"], "") != "outlook_token" {
+			continue
+		}
+		id := strings.TrimSpace(strAny(provider["provider_id"], strAny(provider["id"], "")))
+		old := oldByID[id]
+		if old == nil && id == "" && outlookIndex < len(oldOutlooks) {
+			old = oldOutlooks[outlookIndex]
+			outlookIndex++
+		}
+		if old == nil && index < len(oldMail.Providers) && strAny(oldMail.Providers[index]["type"], "") == "outlook_token" {
+			old = oldMail.Providers[index]
+		}
+		oldText := ""
+		if old != nil {
+			oldText = strAny(old["mailboxes"], "")
+		}
+		newText := strAny(provider["mailboxes"], "")
+		if strings.TrimSpace(oldText) != "" || strings.TrimSpace(newText) != "" {
+			provider["mailboxes"] = mergeOutlookMailboxText(oldText, newText)
+		}
+		delete(provider, "mailboxes_count")
+		delete(provider, "mailboxes_preview")
+		delete(provider, "mailboxes_stats")
+	}
+}
+
+func mergeOutlookMailboxText(oldText string, newText string) string {
+	lines := []string{}
+	positions := map[string]int{}
+	addLine := func(line string) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return
+		}
+		email := line
+		if before, _, ok := strings.Cut(line, "----"); ok {
+			email = before
+		}
+		email = strings.ToLower(strings.TrimSpace(email))
+		if email == "" {
+			return
+		}
+		if pos, ok := positions[email]; ok {
+			lines[pos] = line
+			return
+		}
+		positions[email] = len(lines)
+		lines = append(lines, line)
+	}
+	for _, line := range strings.Split(oldText, "\n") {
+		addLine(line)
+	}
+	for _, line := range strings.Split(newText, "\n") {
+		addLine(line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (s *Server) handleRegisterStart(w http.ResponseWriter, r *http.Request) {
@@ -318,6 +418,10 @@ func (s *Server) handleRegisterStartKind(w http.ResponseWriter, r *http.Request,
 	}
 	if r.Method != http.MethodPost {
 		writeErr(w, 405, "method not allowed")
+		return
+	}
+	if s.registerExecutorConfigured() && kind == "register" {
+		s.proxyRegisterExecutorJSON(w, r, "/api/register/start")
 		return
 	}
 	_, err := s.store.UpdateRegisterConfig(func(cfg RegisterConfig) RegisterConfig {
@@ -369,6 +473,10 @@ func (s *Server) handleRegisterStop(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
+	if s.registerExecutorConfigured() {
+		s.proxyRegisterExecutorJSON(w, r, "/api/register/stop")
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeErr(w, 405, "method not allowed")
 		return
@@ -389,6 +497,10 @@ func (s *Server) handleRegisterStop(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRegisterReset(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if s.registerExecutorConfigured() {
+		s.proxyRegisterExecutorJSON(w, r, "/api/register/reset")
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -425,6 +537,10 @@ func (s *Server) handleRegisterOutlookPoolReset(w http.ResponseWriter, r *http.R
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
+	if s.registerExecutorConfigured() {
+		s.proxyRegisterExecutorJSON(w, r, "/api/register/outlook-pool/reset")
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeErr(w, 405, "method not allowed")
 		return
@@ -440,8 +556,23 @@ func (s *Server) handleRegisterOutlookPoolReset(w http.ResponseWriter, r *http.R
 	writeJSON(w, 200, map[string]any{"register": s.registerSnapshot()})
 }
 
+func (s *Server) handleRegisterOutlookPoolTest(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if s.registerExecutorConfigured() {
+		s.proxyRegisterExecutorJSON(w, r, "/api/register/outlook-pool/test")
+		return
+	}
+	writeErr(w, 400, "register executor is not configured")
+}
+
 func (s *Server) handleRegisterEvents(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if s.registerExecutorConfigured() {
+		s.proxyRegisterExecutorEvents(w, r)
 		return
 	}
 	if r.Method != http.MethodGet {

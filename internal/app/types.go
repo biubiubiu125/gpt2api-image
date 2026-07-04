@@ -23,6 +23,8 @@ type Config struct {
 	AIReview                      map[string]any `json:"ai_review"`
 	ImageAccountConcurrency       int            `json:"image_account_concurrency"`
 	CleanupProtectUserImages      bool           `json:"cleanup_protect_user_images"`
+	RegisterExecutorURL           string         `json:"register_executor_url"`
+	RegisterInternalKey           string         `json:"register_internal_key"`
 	Extra                         map[string]any `json:"-"`
 }
 

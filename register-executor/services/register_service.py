@@ -388,11 +388,32 @@ class RegisterService:
                     )
                 return self.get()
             run_config = _normalize({**self._config, **(run_overrides or {})})
+        try:
             _validate_mail_providers(run_config)
+            metrics = self._pool_metrics()
+        except Exception as exc:
+            self._append_log(f"注册任务启动失败：{exc}", "red")
+            raise
+        with self._lock:
+            if self._runner and self._runner.is_alive():
+                if not (self._stop_event and self._stop_event.is_set()):
+                    self._config["enabled"] = True
+                self._save()
+                if trigger == "auto_refill":
+                    current_available = int(self._config.get("stats", {}).get("current_available") or 0)
+                    auto_refill = self._config.get("auto_refill") if isinstance(self._config.get("auto_refill"), dict) else {}
+                    self._log_auto_refill_decision(
+                        started=False,
+                        reason="register_task_running",
+                        current_available=current_available,
+                        min_available=max(1, int(auto_refill.get("min_available") or 1)),
+                        batch_total=max(1, int((run_overrides or {}).get("total") or auto_refill.get("batch_total") or 1)),
+                        message=trigger_log or "",
+                    )
+                return self.get()
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
-            metrics = self._pool_metrics()
             register_proxy_pool.configure(run_config)
             register_proxy_pool.prepare(force=True)
             self._stop_event = threading.Event()

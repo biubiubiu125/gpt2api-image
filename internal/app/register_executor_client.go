@@ -50,7 +50,7 @@ func (s *Server) proxyRegisterExecutorJSON(w http.ResponseWriter, r *http.Reques
 		}
 		body = bytes.NewReader(data)
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), registerExecutorTimeout(path))
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, r.Method, target, body)
 	if err != nil {
@@ -77,6 +77,13 @@ func (s *Server) proxyRegisterExecutorJSON(w http.ResponseWriter, r *http.Reques
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func registerExecutorTimeout(path string) time.Duration {
+	if path == "/api/register/outlook-pool/test" {
+		return 7 * time.Minute
+	}
+	return 180 * time.Second
 }
 
 func (s *Server) proxyRegisterExecutorEvents(w http.ResponseWriter, r *http.Request) {

@@ -192,11 +192,12 @@ class RegisterService:
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
         self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    def get(self) -> dict:
+    def get(self, redact: bool = True) -> dict:
         with self._lock:
             self._refresh_proxy_pool_state_locked(force=False)
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
-        self._redact_outlook_pools(snapshot)
+        if redact:
+            self._redact_outlook_pools(snapshot)
         return snapshot
 
     @staticmethod
@@ -312,6 +313,45 @@ class RegisterService:
 
     def start(self) -> dict:
         return self._start(trigger="manual")
+
+    def repair_abnormal(self) -> dict:
+        with self._lock:
+            if self._runner and self._runner.is_alive():
+                if not (self._stop_event and self._stop_event.is_set()):
+                    self._config["enabled"] = True
+                self._save()
+                return self.get()
+            self._config["enabled"] = True
+            self._logs = []
+            self._stop_event = threading.Event()
+            self._active_futures = set()
+            openai_register.clear_worker_states()
+            job_id = uuid.uuid4().hex
+            self._run_id = job_id
+            self._config["stats"] = {
+                "job_id": job_id,
+                "job_kind": "repair_abnormal",
+                "success": 0,
+                "fail": 0,
+                "done": 0,
+                "running": 1,
+                "threads": 1,
+                **self._pool_metrics(),
+                "started_at": _now(),
+                "updated_at": _now(),
+                "trigger": "manual",
+                "workers": [],
+            }
+            self._save()
+            self._runner = threading.Thread(
+                target=self._run_repair_abnormal,
+                args=(self._stop_event, job_id),
+                daemon=True,
+                name="register-repair-abnormal",
+            )
+            self._runner.start()
+            self._append_log("异常账号修复任务启动", "yellow")
+            return self.get()
 
     def _start(
         self,
@@ -606,7 +646,7 @@ class RegisterService:
         stop_event: threading.Event | None = None,
         run_id: str = "",
     ) -> None:
-        base_config = dict(run_config or self.get())
+        base_config = dict(run_config or self.get(redact=False))
         threads = int(base_config["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
         stall_logged = False
@@ -616,7 +656,7 @@ class RegisterService:
         try:
             futures = set()
             while True:
-                cfg = dict(base_config if trigger == "auto_refill" else self.get())
+                cfg = dict(base_config if trigger == "auto_refill" else self.get(redact=False))
                 self._set_active_futures(futures)
                 if stop_event and stop_event.is_set():
                     cancelled_count = self._invalidate_running_workers(
@@ -706,6 +746,55 @@ class RegisterService:
             self._save()
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 
+    def _run_repair_abnormal(self, stop_event: threading.Event, run_id: str) -> None:
+        success, fail, done = 0, 0, 0
+        try:
+            accounts = account_service.list_accounts()
+            candidates = [
+                item
+                for item in accounts
+                if str(item.get("access_token") or "").strip()
+                and (
+                    str(item.get("status") or "正常") != "正常"
+                    or (not bool(item.get("image_quota_unknown")) and int(item.get("quota") or 0) <= 0)
+                )
+            ]
+            self._append_log(f"待修复异常/无额度账号 {len(candidates)} 个", "yellow")
+            for item in candidates:
+                if stop_event.is_set():
+                    break
+                token = str(item.get("access_token") or "").strip()
+                email = str(item.get("email") or token[:8])
+                try:
+                    result = account_service.refresh_accounts([token], defer_invalid_removal=False)
+                    removed = int(result.get("removed_unusable") or 0)
+                    errors = result.get("errors") if isinstance(result.get("errors"), list) else []
+                    if errors:
+                        fail += 1
+                        self._append_log(f"{email} 刷新失败，已按状态尝试移除：{errors}", "red")
+                    elif removed:
+                        fail += 1
+                        self._append_log(f"{email} 刷新后仍不可用，已移除", "yellow")
+                    else:
+                        success += 1
+                        self._append_log(f"{email} 刷新恢复正常", "green")
+                except Exception as exc:
+                    fail += 1
+                    self._append_log(f"{email} 修复失败：{exc}", "red")
+                finally:
+                    done += 1
+                    self._bump(done=done, success=success, fail=fail, running=1)
+        finally:
+            self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
+            with self._lock:
+                self._config["enabled"] = False
+                if self._stop_event is stop_event:
+                    self._stop_event = None
+                if self._run_id == run_id:
+                    self._run_id = ""
+                self._save()
+            self._append_log(f"异常账号修复任务结束，恢复{success}，失败/移除{fail}", "yellow")
+
     def start_auto_refill_watcher(self, stop_event: threading.Event) -> threading.Thread:
         thread = threading.Thread(
             target=self._auto_refill_loop,
@@ -718,36 +807,41 @@ class RegisterService:
 
     def _auto_refill_loop(self, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
-            cfg = self.get()
-            auto_refill = cfg.get("auto_refill") if isinstance(cfg.get("auto_refill"), dict) else {}
-            interval = max(10, int(auto_refill.get("check_interval") or 300))
-            if auto_refill.get("enabled"):
-                metrics = self._pool_metrics()
-                min_available = max(1, int(auto_refill.get("min_available") or 1))
-                batch_total = max(1, int(auto_refill.get("batch_total") or 1))
-                running = bool(cfg.get("enabled")) or self.is_running()
-                if metrics["current_available"] < min_available and running:
-                    self._log_auto_refill_decision(
-                        started=False,
-                        reason="register_task_running",
-                        current_available=metrics["current_available"],
-                        min_available=min_available,
-                        batch_total=batch_total,
-                    )
-                elif metrics["current_available"] < min_available:
-                    trigger_log = (
-                        f"自动补号触发：当前正常账号={metrics['current_available']}，"
-                        f"阈值={min_available}，本轮注册={batch_total}"
-                    )
-                    self.start_auto_refill(batch_total, trigger_log=trigger_log)
-                else:
-                    self._log_auto_refill_decision(
-                        started=False,
-                        reason="enough_available",
-                        current_available=metrics["current_available"],
-                        min_available=min_available,
-                        batch_total=batch_total,
-                    )
+            interval = 300
+            try:
+                cfg = self.get()
+                auto_refill = cfg.get("auto_refill") if isinstance(cfg.get("auto_refill"), dict) else {}
+                interval = max(10, int(auto_refill.get("check_interval") or 300))
+                if auto_refill.get("enabled"):
+                    metrics = self._pool_metrics()
+                    min_available = max(1, int(auto_refill.get("min_available") or 1))
+                    batch_total = max(1, int(auto_refill.get("batch_total") or 1))
+                    running = bool(cfg.get("enabled")) or self.is_running()
+                    if metrics["current_available"] < min_available and running:
+                        self._log_auto_refill_decision(
+                            started=False,
+                            reason="register_task_running",
+                            current_available=metrics["current_available"],
+                            min_available=min_available,
+                            batch_total=batch_total,
+                        )
+                    elif metrics["current_available"] < min_available:
+                        trigger_log = (
+                            f"自动补号触发：当前正常账号={metrics['current_available']}，"
+                            f"阈值={min_available}，本轮注册={batch_total}"
+                        )
+                        self.start_auto_refill(batch_total, trigger_log=trigger_log)
+                    else:
+                        self._log_auto_refill_decision(
+                            started=False,
+                            reason="enough_available",
+                            current_available=metrics["current_available"],
+                            min_available=min_available,
+                            batch_total=batch_total,
+                        )
+            except Exception as exc:
+                self._append_log(f"自动补号检查失败：{exc}", "red")
+                interval = 60
             if stop_event.wait(interval):
                 break
 

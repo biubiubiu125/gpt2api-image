@@ -420,7 +420,11 @@ func (s *Server) handleRegisterStartKind(w http.ResponseWriter, r *http.Request,
 		writeErr(w, 405, "method not allowed")
 		return
 	}
-	if s.registerExecutorConfigured() && kind == "register" {
+	if s.registerExecutorConfigured() {
+		if kind == "repair_abnormal" {
+			s.proxyRegisterExecutorJSON(w, r, "/api/register/repair-abnormal")
+			return
+		}
 		s.proxyRegisterExecutorJSON(w, r, "/api/register/start")
 		return
 	}

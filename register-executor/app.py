@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import threading
 from typing import Any
 
@@ -32,13 +33,14 @@ class OutlookPoolTestRequest(BaseModel):
 
 
 def _require_internal(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)) -> None:
-    expected = config.register_internal_key
+    expected = config.register_internal_key or config.auth_key
     if not expected:
-        return
+        raise HTTPException(status_code=401, detail="register executor internal key is required")
     bearer = ""
     if authorization and authorization.lower().startswith("bearer "):
         bearer = authorization[7:].strip()
-    if x_register_internal_key == expected or bearer == expected:
+    header_key = x_register_internal_key or ""
+    if secrets.compare_digest(header_key, expected) or secrets.compare_digest(bearer, expected):
         return
     raise HTTPException(status_code=401, detail="register executor unauthorized")
 
@@ -77,6 +79,12 @@ def start_register(x_register_internal_key: str | None = Header(default=None), a
     return {"register": register_service.start()}
 
 
+@app.post("/api/register/repair-abnormal")
+def repair_abnormal_register(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
+    _require_internal(x_register_internal_key, authorization)
+    return {"register": register_service.repair_abnormal()}
+
+
 @app.post("/api/register/stop")
 def stop_register(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
@@ -98,7 +106,7 @@ def reset_outlook_pool(body: OutlookPoolResetRequest, x_register_internal_key: s
 @app.post("/api/register/outlook-pool/test")
 def test_outlook_pool(body: OutlookPoolTestRequest, x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
-    return {"result": check_outlook_pool(register_service.get(), body.limit)}
+    return {"result": check_outlook_pool(register_service.get(redact=False), body.limit)}
 
 
 @app.get("/api/register/events")

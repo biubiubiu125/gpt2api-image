@@ -26,9 +26,9 @@ function imageKey(item: ManagedImage) {
   return item.rel || item.url;
 }
 
-// 用户筛选下拉。max-h 限定 320px，列表本身用 .scrollbar-fancy 走自定义细滚动条，
-// 视觉风格与全局 stone 色系保持一致；空状态、未归属、已删用户都显式提示。
-// 三类语义置顶：全部用户 / 管理员（__admin__） / 未归属（__unowned__），其余具体用户在分隔线下面可搜索。
+// 来源筛选下拉。max-h 限定 320px，列表本身用 .scrollbar-fancy 走自定义细滚动条，
+// 视觉风格与全局 stone 色系保持一致；空状态、未归属、已删密钥都显式提示。
+// 三类语义置顶：全部来源 / 主密钥（__admin__） / 未归属（__unowned__），其余具体 API 密钥在分隔线下面可搜索。
 function OwnerFilter({
   value,
   owners,
@@ -61,9 +61,9 @@ function OwnerFilter({
 
   const selected = owners.find((item) => item.id === value) ?? null;
   const buttonLabel = !value
-    ? "全部用户"
+    ? "全部来源"
     : value === "__admin__"
-      ? "管理员"
+      ? "主密钥"
       : value === "__unowned__"
         ? "未归属"
         : selected?.name || value;
@@ -100,7 +100,7 @@ function OwnerFilter({
               autoFocus
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索用户"
+              placeholder="搜索密钥"
               className="h-8 w-full rounded-lg border border-stone-200 bg-white pr-7 pl-7 text-[12.5px] text-stone-700 placeholder:text-stone-400 focus:border-stone-400 focus:outline-none"
             />
             {query ? (
@@ -116,17 +116,17 @@ function OwnerFilter({
           </div>
         </div>
         <div className="scrollbar-fancy max-h-[320px] overflow-y-auto py-1">
-          {/* 三个固定导航项：全部 / 管理员 / 未归属。query 非空也保持显示，
+          {/* 三个固定导航项：全部 / 主密钥 / 未归属。query 非空也保持显示，
               它们是导航类入口，搜索时也希望随时切回。 */}
           <OwnerOption
-            label="全部用户"
+            label="全部来源"
             hint={`${totalCount} 张`}
             selected={!value}
             onClick={() => onChange("")}
           />
           {adminBucket ? (
             <OwnerOption
-              label="管理员"
+              label="主密钥"
               hint={`${adminBucket.count} 张`}
               special
               selected={value === "__admin__"}
@@ -144,9 +144,9 @@ function OwnerFilter({
           ) : null}
           <div className="my-1 h-px bg-stone-100" />
           {realOwners.length === 0 ? (
-            <div className="px-3 py-6 text-center text-xs text-stone-400">还没有用户密钥</div>
+            <div className="px-3 py-6 text-center text-xs text-stone-400">还没有 API 密钥</div>
           ) : filteredOwners.length === 0 ? (
-            <div className="px-3 py-6 text-center text-xs text-stone-400">没有匹配的用户</div>
+            <div className="px-3 py-6 text-center text-xs text-stone-400">没有匹配的密钥</div>
           ) : (
             filteredOwners.map((item) => (
               <OwnerOption
@@ -732,11 +732,11 @@ function ImageManagerContent() {
                   <div className="flex flex-wrap items-center gap-1">
                     {item.owner_id ? (() => {
                       // 三类来源不同的展示规则：
-                      // - admin（包括旧 auth_key 的固定 id "admin"）：统一显示"管理员"，不暴露具体密钥名
-                      // - 普通用户：显示用户名（ownerNameById 已涵盖），找不到时兜底显示截断 id
+                      // - admin（旧 auth_key 的固定 id "admin"）：统一显示"主密钥"
+                      // - API 密钥：显示密钥名称（ownerNameById 已涵盖），找不到时兜底显示截断 id
                       // - 真孤儿（owner_id 为空）：上面的条件已经过滤掉了
                       const isAdmin = item.is_admin_owner || item.owner_id === "admin";
-                      const display = isAdmin ? "管理员" : (ownerNameById.get(item.owner_id) || item.owner_id);
+                      const display = isAdmin ? "主密钥" : (ownerNameById.get(item.owner_id) || item.owner_id);
                       return (
                         <Badge
                           variant="outline"

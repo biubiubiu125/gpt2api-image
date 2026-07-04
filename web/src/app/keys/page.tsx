@@ -13,13 +13,13 @@ function KeysPageContent() {
         <div className="space-y-1.5">
           <div className="flex items-center gap-2">
             <span className="font-data text-[10px] font-semibold tracking-[0.22em] text-muted-foreground uppercase">
-              Auth · User Keys
+              Auth · API Keys
             </span>
             <span className="h-px w-8 bg-border" />
           </div>
-          <h1 className="text-[26px] font-semibold tracking-tight text-foreground">用户密钥</h1>
+          <h1 className="text-[26px] font-semibold tracking-tight text-foreground">API 密钥</h1>
           <p className="text-[13px] text-muted-foreground">
-            为下游调用方分发独立 API key，按生图日 / 月 / 总额度独立计费。
+            为 newapi 或其他下游渠道配置多个后端调用密钥，所有请求都必须携带 Bearer 密钥。
           </p>
         </div>
       </section>

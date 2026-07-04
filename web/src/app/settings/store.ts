@@ -61,12 +61,12 @@ function normalizeRegister(config: RegisterConfig): RegisterConfig {
     check_interval: Number(config.check_interval || 5),
     fixed_password: String(config.fixed_password || ""),
     stats: {
-      success: 0,
-      fail: 0,
-      done: 0,
-      running: 0,
-      threads: Number(config.threads || 1),
       ...(config.stats || {}),
+      success: Number(config.stats?.success || 0),
+      fail: Number(config.stats?.fail || 0),
+      done: Number(config.stats?.done || 0),
+      running: Number(config.stats?.running || 0),
+      threads: Number(config.stats?.threads || config.threads || 1),
     },
     logs: Array.isArray(config.logs) ? config.logs : [],
   };

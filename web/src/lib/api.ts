@@ -101,8 +101,8 @@ export type ManagedImage = {
   height?: number;
   tags?: string[];
   owner_id?: string;
-  // 后端在 list_images 里打的标记：true 表示该 owner_id 落在 admin 集合里。
-  // 前端用它把 badge 显示成"管理员"，避免暴露具体 admin 密钥 id。
+  // 后端在 list_images 里打的标记：true 表示该 owner_id 落在主密钥集合里。
+  // 前端用它把 badge 显示成"主密钥"，避免暴露具体管理密钥 id。
   is_admin_owner?: boolean;
   // 生成时记下来的 prompt 原文（image_prompts.json）。老数据为空字符串。
   // 给图片管理和一键复用使用；为空时前端按无提示词处理。
@@ -169,7 +169,7 @@ export type LoginResponse = {
 export type UserKey = {
   id: string;
   name: string;
-  role: "user";
+  role: AuthRole;
   enabled: boolean;
   created_at: string | null;
   last_used_at: string | null;
@@ -544,44 +544,12 @@ export async function fetchMyIdentity() {
 export type UserKeyCreatePayload = {
   name?: string;
   key?: string;
-  account_tier?: AccountTier;
-  image_daily_quota?: number;
-  image_daily_unlimited?: boolean;
-  image_monthly_quota?: number;
-  image_monthly_unlimited?: boolean;
-  image_total_quota?: number;
-  image_total_unlimited?: boolean;
-  chat_daily_quota?: number;
-  chat_daily_unlimited?: boolean;
-  chat_monthly_quota?: number;
-  chat_monthly_unlimited?: boolean;
-  chat_total_quota?: number;
-  chat_total_unlimited?: boolean;
 };
 
 export type UserKeyUpdatePayload = {
   enabled?: boolean;
   name?: string;
   key?: string;
-  account_tier?: AccountTier;
-  image_daily_quota?: number;
-  image_daily_unlimited?: boolean;
-  image_monthly_quota?: number;
-  image_monthly_unlimited?: boolean;
-  image_total_quota?: number;
-  image_total_unlimited?: boolean;
-  chat_daily_quota?: number;
-  chat_daily_unlimited?: boolean;
-  chat_monthly_quota?: number;
-  chat_monthly_unlimited?: boolean;
-  chat_total_quota?: number;
-  chat_total_unlimited?: boolean;
-  reset_image_daily_used?: boolean;
-  reset_image_monthly_used?: boolean;
-  reset_image_total_used?: boolean;
-  reset_chat_daily_used?: boolean;
-  reset_chat_monthly_used?: boolean;
-  reset_chat_total_used?: boolean;
 };
 
 export async function createUserKey(payload: UserKeyCreatePayload) {
@@ -590,19 +558,6 @@ export async function createUserKey(payload: UserKeyCreatePayload) {
     body: {
       name: payload.name ?? "",
       ...(payload.key ? { key: payload.key } : {}),
-      account_tier: payload.account_tier ?? "free",
-      image_daily_quota: Math.max(0, Number(payload.image_daily_quota ?? 0) || 0),
-      image_daily_unlimited: payload.image_daily_unlimited ?? true,
-      image_monthly_quota: Math.max(0, Number(payload.image_monthly_quota ?? 0) || 0),
-      image_monthly_unlimited: payload.image_monthly_unlimited ?? true,
-      image_total_quota: Math.max(0, Number(payload.image_total_quota ?? 0) || 0),
-      image_total_unlimited: Boolean(payload.image_total_unlimited),
-      chat_daily_quota: Math.max(0, Number(payload.chat_daily_quota ?? 0) || 0),
-      chat_daily_unlimited: payload.chat_daily_unlimited ?? true,
-      chat_monthly_quota: Math.max(0, Number(payload.chat_monthly_quota ?? 0) || 0),
-      chat_monthly_unlimited: payload.chat_monthly_unlimited ?? true,
-      chat_total_quota: Math.max(0, Number(payload.chat_total_quota ?? 0) || 0),
-      chat_total_unlimited: payload.chat_total_unlimited ?? true,
     },
   });
 }

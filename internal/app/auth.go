@@ -9,49 +9,51 @@ import (
 func normalizeKeys(items []UserKey) []UserKey {
 	out := make([]UserKey, 0, len(items))
 	for _, k := range items {
-		if k.ID == "" {
-			k.ID = randID(6)
-		}
-		if k.Role == "" {
-			k.Role = "user"
-		}
-		if k.Name == "" {
-			if k.Role == "admin" {
-				k.Name = "管理员密钥"
-			} else {
-				k.Name = "普通用户"
-			}
-		}
-		if k.AccountTier == "" {
-			k.AccountTier = "free"
-		}
-		if k.CreatedAt == "" {
-			k.CreatedAt = nowISO()
-		}
-		if k.ImageDailyResetAt == "" {
-			k.ImageDailyResetAt = todayKey()
-		}
-		if k.ImageMonthlyResetAt == "" {
-			k.ImageMonthlyResetAt = monthKey()
-		}
-		if k.ChatDailyResetAt == "" {
-			k.ChatDailyResetAt = todayKey()
-		}
-		if k.ChatMonthlyResetAt == "" {
-			k.ChatMonthlyResetAt = monthKey()
-		}
-		if k.Role == "admin" {
-			k.AccountTier = "premium"
-			k.ImageDailyUnlimited = true
-			k.ImageMonthlyUnlimited = true
-			k.ImageTotalUnlimited = true
-			k.ChatDailyUnlimited = true
-			k.ChatMonthlyUnlimited = true
-			k.ChatTotalUnlimited = true
-		}
-		out = append(out, k)
+		out = append(out, normalizeServiceKey(k))
 	}
 	return out
+}
+
+func normalizeServiceKey(k UserKey) UserKey {
+	if k.ID == "" {
+		k.ID = randID(6)
+	}
+	if k.Name == "" {
+		k.Name = "API 密钥"
+	}
+	if k.KeyHash == "" && k.Key != "" {
+		k.KeyHash = hashKey(k.Key)
+	}
+	if k.CreatedAt == "" {
+		k.CreatedAt = nowISO()
+	}
+	if k.ImageDailyResetAt == "" {
+		k.ImageDailyResetAt = todayKey()
+	}
+	if k.ImageMonthlyResetAt == "" {
+		k.ImageMonthlyResetAt = monthKey()
+	}
+	if k.ChatDailyResetAt == "" {
+		k.ChatDailyResetAt = todayKey()
+	}
+	if k.ChatMonthlyResetAt == "" {
+		k.ChatMonthlyResetAt = monthKey()
+	}
+	k.Role = "admin"
+	k.AccountTier = "premium"
+	k.ImageDailyQuota = 0
+	k.ImageMonthlyQuota = 0
+	k.ImageTotalQuota = 0
+	k.ChatDailyQuota = 0
+	k.ChatMonthlyQuota = 0
+	k.ChatTotalQuota = 0
+	k.ImageDailyUnlimited = true
+	k.ImageMonthlyUnlimited = true
+	k.ImageTotalUnlimited = true
+	k.ChatDailyUnlimited = true
+	k.ChatMonthlyUnlimited = true
+	k.ChatTotalUnlimited = true
+	return k
 }
 
 func (s *Server) bearer(r *http.Request) string {
@@ -90,8 +92,7 @@ func (s *Server) requireIdentity(w http.ResponseWriter, r *http.Request) (*Ident
 				}
 				return keys
 			})
-			prem := k.AccountTier == "premium"
-			return &Identity{ID: k.ID, Name: k.Name, Role: k.Role, AccountTier: k.AccountTier, CanUsePaidImageAccounts: prem || k.Role == "admin", CanUseHighResolution: prem || k.Role == "admin"}, true
+			return &Identity{ID: k.ID, Name: k.Name, Role: "admin", AccountTier: "premium", CanUsePaidImageAccounts: true, CanUseHighResolution: true}, true
 		}
 	}
 	writeErr(w, 401, "密钥无效或已失效，请重新登录")
@@ -125,13 +126,8 @@ func (s *Server) checkImageAccess(id *Identity, model, resolution string) error 
 }
 
 func publicKey(k UserKey) map[string]any {
-	prem := k.Role == "admin" || k.AccountTier == "premium"
-	res := map[string]any{"id": k.ID, "name": k.Name, "role": k.Role, "enabled": k.Enabled, "created_at": k.CreatedAt, "last_used_at": k.LastUsedAt, "account_tier": func() string {
-		if k.Role == "admin" {
-			return "premium"
-		}
-		return k.AccountTier
-	}(), "can_use_paid_image_accounts": prem, "can_use_high_resolution": prem, "key_visible": k.Role == "user" && k.Key != ""}
+	k = normalizeServiceKey(k)
+	res := map[string]any{"id": k.ID, "name": k.Name, "role": "admin", "enabled": k.Enabled, "created_at": k.CreatedAt, "last_used_at": k.LastUsedAt, "account_tier": "premium", "can_use_paid_image_accounts": true, "can_use_high_resolution": true, "key_visible": k.Key != ""}
 	add := func(prefix string, quota, used int, unl bool) {
 		res[prefix+"_quota"] = quota
 		res[prefix+"_used"] = used
@@ -194,12 +190,9 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		keys := s.store.LoadAuthKeys()
 		items := []map[string]any{}
-		for _, k := range keys {
-			if k.Role == "user" {
-				items = append(items, publicKey(k))
-			}
+		for _, k := range s.store.LoadAuthKeys() {
+			items = append(items, publicKey(k))
 		}
 		writeJSON(w, 200, map[string]any{"items": items})
 	case http.MethodPost:
@@ -211,22 +204,11 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		if raw == "" {
 			raw = "sk-" + randID(24)
 		}
-		role := "user"
-		tier := strings.ToLower(strings.TrimSpace(strAny(body["account_tier"], "free")))
-		if tier != "premium" {
-			tier = "free"
-		}
-		k := UserKey{ID: randID(6), Name: strings.TrimSpace(strAny(body["name"], "普通用户")), Role: role, KeyHash: hashKey(raw), Key: raw, AccountTier: tier, Enabled: true, CreatedAt: nowISO(), ImageDailyQuota: intAny(body["image_daily_quota"], 0), ImageDailyUnlimited: boolAny(body["image_daily_unlimited"], true), ImageMonthlyQuota: intAny(body["image_monthly_quota"], 0), ImageMonthlyUnlimited: boolAny(body["image_monthly_unlimited"], true), ImageTotalQuota: intAny(body["image_total_quota"], 0), ImageTotalUnlimited: boolAny(body["image_total_unlimited"], false), ChatDailyQuota: intAny(body["chat_daily_quota"], 0), ChatDailyUnlimited: boolAny(body["chat_daily_unlimited"], true), ChatMonthlyQuota: intAny(body["chat_monthly_quota"], 0), ChatMonthlyUnlimited: boolAny(body["chat_monthly_unlimited"], true), ChatTotalQuota: intAny(body["chat_total_quota"], 0), ChatTotalUnlimited: boolAny(body["chat_total_unlimited"], true), ImageDailyResetAt: todayKey(), ImageMonthlyResetAt: monthKey(), ChatDailyResetAt: todayKey(), ChatMonthlyResetAt: monthKey()}
+		k := normalizeServiceKey(UserKey{ID: randID(6), Name: strings.TrimSpace(strAny(body["name"], "API 密钥")), KeyHash: hashKey(raw), Key: raw, Enabled: true, CreatedAt: nowISO()})
 		_ = s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
 			return append(keys, k)
 		})
-		items := []map[string]any{}
-		for _, it := range s.store.LoadAuthKeys() {
-			if it.Role == "user" {
-				items = append(items, publicKey(it))
-			}
-		}
-		writeJSON(w, 200, map[string]any{"item": publicKey(k), "key": raw, "items": items})
+		writeJSON(w, 200, map[string]any{"item": publicKey(k), "key": raw, "items": s.publicUserKeys()})
 	default:
 		writeErr(w, 405, "method not allowed")
 	}
@@ -246,13 +228,13 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 	keys := s.store.LoadAuthKeys()
 	idx := -1
 	for i, k := range keys {
-		if k.ID == id && k.Role == "user" {
+		if k.ID == id {
 			idx = i
 			break
 		}
 	}
 	if idx < 0 {
-		writeErr(w, 404, "这条用户密钥不存在，可能已经被删除")
+		writeErr(w, 404, "这条 API 密钥不存在，可能已经被删除")
 		return
 	}
 	if len(parts) > 1 && parts[1] == "key" {
@@ -273,10 +255,11 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 		var item UserKey
 		_ = s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
 			for i := range keys {
-				if keys[i].ID == id && keys[i].Role == "user" {
+				if keys[i].ID == id {
 					keys[i].Key = raw
 					keys[i].KeyHash = hashKey(raw)
-					item = keys[i]
+					item = normalizeServiceKey(keys[i])
+					keys[i] = item
 					break
 				}
 			}
@@ -290,7 +273,7 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
 			out := keys[:0]
 			for _, k := range keys {
-				if k.ID == id && k.Role == "user" {
+				if k.ID == id {
 					continue
 				}
 				out = append(out, k)
@@ -306,7 +289,7 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 		var k UserKey
 		_ = s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
 			for i := range keys {
-				if keys[i].ID != id || keys[i].Role != "user" {
+				if keys[i].ID != id {
 					continue
 				}
 				k = keys[i]
@@ -320,14 +303,7 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 					k.Key = v
 					k.KeyHash = hashKey(v)
 				}
-				if v, ok := b["account_tier"]; ok {
-					t := strings.ToLower(strAny(v, "free"))
-					if t != "premium" {
-						t = "free"
-					}
-					k.AccountTier = t
-				}
-				applyQuotaUpdate(&k, b)
+				k = normalizeServiceKey(k)
 				keys[i] = k
 				break
 			}
@@ -342,9 +318,7 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 func (s *Server) publicUserKeys() []map[string]any {
 	out := []map[string]any{}
 	for _, k := range s.store.LoadAuthKeys() {
-		if k.Role == "user" {
-			out = append(out, publicKey(k))
-		}
+		out = append(out, publicKey(k))
 	}
 	return out
 }

@@ -203,6 +203,74 @@ func TestFreeUserHighResolutionRejectedBeforeDBTaskCreate(t *testing.T) {
 	}
 }
 
+func TestStoredAuthKeyBecomesServiceAdminKey(t *testing.T) {
+	s := &Server{
+		cfg:   Config{AuthKey: "root-key"},
+		store: NewStore(t.TempDir()),
+	}
+	if err := s.store.SaveAuthKeys([]UserKey{{
+		ID:                  "newapi",
+		Name:                "newapi",
+		Role:                "user",
+		Key:                 "sk-newapi",
+		KeyHash:             hashKey("sk-newapi"),
+		AccountTier:         "free",
+		Enabled:             true,
+		ImageTotalQuota:     1,
+		ImageTotalUnlimited: false,
+	}}); err != nil {
+		t.Fatalf("save auth keys: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	req.Header.Set("Authorization", "Bearer sk-newapi")
+	rr := httptest.NewRecorder()
+	id, ok := s.requireAdmin(rr, req)
+	if !ok {
+		t.Fatalf("service key should pass admin auth, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if id.ID != "newapi" || id.Role != "admin" || id.AccountTier != "premium" {
+		t.Fatalf("identity = %#v, want newapi admin premium", id)
+	}
+	if !id.CanUseHighResolution || !id.CanUsePaidImageAccounts {
+		t.Fatalf("service key should have full image access: %#v", id)
+	}
+
+	keys := s.store.LoadAuthKeys()
+	if len(keys) != 1 {
+		t.Fatalf("keys len = %d, want 1", len(keys))
+	}
+	if keys[0].Role != "admin" || keys[0].AccountTier != "premium" || !keys[0].ImageTotalUnlimited {
+		t.Fatalf("stored key normalized = %#v, want admin premium unlimited", keys[0])
+	}
+}
+
+func TestCreateAuthUserEndpointCreatesServiceKey(t *testing.T) {
+	s := &Server{
+		cfg:   Config{AuthKey: "root-key"},
+		store: NewStore(t.TempDir()),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/users", strings.NewReader(`{"name":"newapi","key":"sk-service"}`))
+	req.Header.Set("Authorization", "Bearer root-key")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.handleAuthUsers(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create key status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req.Header.Set("Authorization", "Bearer sk-service")
+	rr = httptest.NewRecorder()
+	id, ok := s.requireAdmin(rr, req)
+	if !ok {
+		t.Fatalf("created service key should pass admin auth, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if id.Role != "admin" || id.AccountTier != "premium" {
+		t.Fatalf("created key identity = %#v, want admin premium", id)
+	}
+}
+
 func TestSaveImageWithBaseURLUniqueForSameBytes(t *testing.T) {
 	root := t.TempDir()
 	s := &Server{

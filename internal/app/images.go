@@ -174,13 +174,16 @@ func (s *Server) listImages(r *http.Request, ownerFilter string) map[string]any 
 			if ownerFilter == "__unowned__" && owner != "" {
 				return nil
 			}
-			if ownerFilter != "__unowned__" && owner != ownerFilter {
+			if ownerFilter == "__admin__" && owner != "admin" {
+				return nil
+			}
+			if ownerFilter != "__unowned__" && ownerFilter != "__admin__" && owner != ownerFilter {
 				return nil
 			}
 		}
 		st, _ := d.Info()
 		pr := prompts[rel]
-		items = append(items, map[string]any{"rel": rel, "path": rel, "name": d.Name(), "date": st.ModTime().Format("2006-01-02"), "size": st.Size(), "url": s.baseURL(r) + "/images/" + rel, "thumbnail_url": s.baseURL(r) + "/image-thumbnails/" + rel, "created_at": st.ModTime().Format(time.RFC3339), "tags": tags[rel], "owner_id": owner, "prompt": strAny(pr["prompt"], "")})
+		items = append(items, map[string]any{"rel": rel, "path": rel, "name": d.Name(), "date": st.ModTime().Format("2006-01-02"), "size": st.Size(), "url": s.baseURL(r) + "/images/" + rel, "thumbnail_url": s.baseURL(r) + "/image-thumbnails/" + rel, "created_at": st.ModTime().Format(time.RFC3339), "tags": tags[rel], "owner_id": owner, "is_admin_owner": owner == "admin", "prompt": strAny(pr["prompt"], "")})
 		return nil
 	})
 	sort.Slice(items, func(i, j int) bool { return strAny(items[i]["created_at"], "") > strAny(items[j]["created_at"], "") })
@@ -198,9 +201,6 @@ func (s *Server) handleMyImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	owner := id.ID
-	if id.Role == "admin" {
-		owner = "admin"
-	}
 	writeJSON(w, 200, s.listImages(r, owner))
 }
 func (s *Server) handleImageOwners(w http.ResponseWriter, r *http.Request) {
@@ -212,11 +212,9 @@ func (s *Server) handleImageOwners(w http.ResponseWriter, r *http.Request) {
 	for _, o := range owners {
 		counts[o]++
 	}
-	items := []map[string]any{{"id": "__admin__", "name": "管理员", "deleted": false, "count": counts["admin"]}, {"id": "__unowned__", "name": "未归属", "deleted": false, "count": 0}}
+	items := []map[string]any{{"id": "__admin__", "name": "主密钥", "deleted": false, "count": counts["admin"]}, {"id": "__unowned__", "name": "未归属", "deleted": false, "count": 0}}
 	for _, k := range s.store.LoadAuthKeys() {
-		if k.Role == "user" {
-			items = append(items, map[string]any{"id": k.ID, "name": k.Name, "deleted": false, "count": counts[k.ID]})
-		}
+		items = append(items, map[string]any{"id": k.ID, "name": k.Name, "deleted": false, "count": counts[k.ID]})
 	}
 	writeJSON(w, 200, map[string]any{"items": items})
 }

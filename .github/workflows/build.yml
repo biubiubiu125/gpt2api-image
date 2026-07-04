@@ -1,0 +1,310 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Run Go tests
+        run: go test ./cmd/... ./internal/...
+
+  web:
+    name: Build frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.22.0
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: web
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+        run: pnpm run build
+
+      - name: Upload frontend for packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/out
+          if-no-files-found: error
+
+  integration:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: gpt2api_image_test
+          POSTGRES_USER: gpt2api_image_test
+          POSTGRES_PASSWORD: gpt2api_image_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gpt2api_image_test -d gpt2api_image_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Run PostgreSQL task lifecycle test
+        env:
+          GPT2API_IMAGE_TEST_DATABASE_URL: postgresql://gpt2api_image_test:gpt2api_image_test@127.0.0.1:5432/gpt2api_image_test?sslmode=disable
+        run: go test ./internal/app -run TestPGTaskStoreIntegrationAsyncLifecycle -count=1 -v
+
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - web
+      - integration
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+            binary_ext: ""
+            archive_ext: tar.gz
+            curl_asset: curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+            binary_ext: ""
+            archive_ext: tar.gz
+            curl_asset: curl-impersonate-v0.6.1.aarch64-linux-gnu.tar.gz
+          - target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            binary_ext: ""
+            archive_ext: tar.gz
+            curl_asset: curl-impersonate-v0.6.1.x86_64-macos.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web_dist
+
+      - name: Build binary and package release asset
+        env:
+          TARGET: ${{ matrix.target }}
+          GOOS_VALUE: ${{ matrix.goos }}
+          GOARCH_VALUE: ${{ matrix.goarch }}
+          BINARY_EXT: ${{ matrix.binary_ext }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          CURL_ASSET: ${{ matrix.curl_asset }}
+        run: |
+          set -euo pipefail
+
+          app_name="gpt2api-image"
+          package_name="${app_name}-${TARGET}"
+          package_dir="dist/${package_name}"
+          binary_name="${app_name}${BINARY_EXT}"
+          curl_url="https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/${CURL_ASSET}"
+
+          rm -rf dist
+          mkdir -p "${package_dir}/bin" "${package_dir}/data/bin/curl-impersonate"
+
+          CGO_ENABLED=0 GOOS="${GOOS_VALUE}" GOARCH="${GOARCH_VALUE}" \
+            go build -buildvcs=false -trimpath -ldflags="-s -w" -o "${package_dir}/bin/${binary_name}" ./cmd/server
+
+          cp "${package_dir}/bin/${binary_name}" "${package_dir}/${binary_name}"
+          cp -R web_dist "${package_dir}/web_dist"
+
+          curl -fsSL "${curl_url}" | tar -xz -C "${package_dir}/data/bin/curl-impersonate"
+          test -n "$(find "${package_dir}/data/bin/curl-impersonate" -type f \( -name 'curl_edge101' -o -name 'curl_chrome116' -o -name 'curl-impersonate-chrome' -o -name 'curl-impersonate' \) -print -quit)"
+
+          for file in README.md LICENSE VERSION GO_MIGRATION.md THIRD_PARTY_NOTICES.md; do
+            if [ -f "${file}" ]; then
+              cp "${file}" "${package_dir}/"
+            fi
+          done
+
+          if [ -f start.sh ]; then
+            cp start.sh "${package_dir}/"
+          fi
+
+          cp config.json "${package_dir}/config.example.json"
+
+          cat > "${package_dir}/README_RELEASE.md" <<EOF
+          # ${package_name}
+
+          This archive contains:
+
+          - The ${TARGET} server binary.
+          - The built frontend files in web_dist/.
+          - A matching curl-impersonate binary bundle in data/bin/curl-impersonate/.
+
+          ## Run
+
+          Start from this directory:
+
+          \`\`\`bash
+          ./${binary_name}
+          \`\`\`
+
+          If start.sh is supported by your shell, you can also run:
+
+          \`\`\`bash
+          ./start.sh --port 3000
+          \`\`\`
+
+          If you use PostgreSQL async tasks without Docker Compose, run API and worker in one process:
+
+          \`\`\`bash
+          GPT2API_IMAGE_MODE=all ./start.sh --port 3000
+          \`\`\`
+
+          ## Use bundled curl-impersonate
+
+          \`\`\`bash
+          GPT2API_IMAGE_UPSTREAM_TRANSPORT=curl-impersonate \\
+          GPT2API_IMAGE_CURL_IMPERSONATE_BIN="\$PWD/data/bin/curl-impersonate/curl_edge101" \\
+          ./${binary_name}
+          \`\`\`
+
+          If curl_edge101 is not present in this target bundle, use one of the curl_* launcher scripts or curl-impersonate executables in data/bin/curl-impersonate/.
+
+          ## Runtime files
+
+          Runtime JSON data, generated images, and logs are stored under data/ in the current working directory.
+          EOF
+
+          chmod +x "${package_dir}/${binary_name}" "${package_dir}/bin/${binary_name}"
+          if [ -f "${package_dir}/start.sh" ]; then
+            chmod +x "${package_dir}/start.sh"
+          fi
+          find "${package_dir}/data/bin/curl-impersonate" -type f -exec chmod +x {} +
+
+          test -d "${package_dir}/web_dist"
+          test -f "${package_dir}/bin/${binary_name}"
+          test -n "$(find "${package_dir}/data/bin/curl-impersonate" -type f -print -quit)"
+
+          if [ "${ARCHIVE_EXT}" = "zip" ]; then
+            (
+              cd dist
+              zip -qr "${package_name}.zip" "${package_name}"
+            )
+          else
+            (
+              cd dist
+              tar -czf "${package_name}.tar.gz" "${package_name}"
+            )
+          fi
+
+      - name: Upload release asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  github-release:
+    name: Upload GitHub Release assets
+    runs-on: ubuntu-latest
+    needs:
+      - package
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Show release assets
+        run: find release-assets -type f | sort
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "${TAG_NAME}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            gh release create "${TAG_NAME}" --repo "${GH_REPO}" --title "${TAG_NAME}" --notes "Automated release for ${TAG_NAME}."
+          fi
+
+          while IFS= read -r -d '' asset; do
+            gh release upload "${TAG_NAME}" "${asset}" --repo "${GH_REPO}" --clobber
+          done < <(find release-assets -type f -print0)

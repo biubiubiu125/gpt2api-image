@@ -1,0 +1,478 @@
+package app
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type RegisterConfig struct {
+	Enabled                 bool                   `json:"enabled"`
+	Mail                    RegisterMailConfig     `json:"mail"`
+	Proxy                   string                 `json:"proxy"`
+	TaskTimeoutSeconds      int                    `json:"task_timeout_seconds"`
+	TaskStallTimeoutSeconds int                    `json:"task_stall_timeout_seconds"`
+	Total                   int                    `json:"total"`
+	Threads                 int                    `json:"threads"`
+	Mode                    string                 `json:"mode"`
+	TargetQuota             int                    `json:"target_quota"`
+	TargetAvailable         int                    `json:"target_available"`
+	CheckInterval           int                    `json:"check_interval"`
+	FixedPassword           string                 `json:"fixed_password"`
+	Stats                   RegisterStats          `json:"stats"`
+	Logs                    []RegisterLog          `json:"logs,omitempty"`
+	Executor                map[string]any         `json:"executor,omitempty"`
+	Extra                   map[string]interface{} `json:"-"`
+}
+
+type RegisterMailConfig struct {
+	RequestTimeout      int              `json:"request_timeout"`
+	WaitTimeout         int              `json:"wait_timeout"`
+	WaitInterval        int              `json:"wait_interval"`
+	APIUseRegisterProxy bool             `json:"api_use_register_proxy"`
+	Providers           []map[string]any `json:"providers"`
+}
+
+type RegisterStats struct {
+	JobID            string           `json:"job_id,omitempty"`
+	JobKind          string           `json:"job_kind,omitempty"`
+	Success          int              `json:"success"`
+	Fail             int              `json:"fail"`
+	Done             int              `json:"done"`
+	Running          int              `json:"running"`
+	Threads          int              `json:"threads"`
+	ElapsedSeconds   float64          `json:"elapsed_seconds"`
+	AvgSeconds       float64          `json:"avg_seconds"`
+	SuccessRate      float64          `json:"success_rate"`
+	CurrentQuota     int              `json:"current_quota"`
+	CurrentAvailable int              `json:"current_available"`
+	StartedAt        string           `json:"started_at,omitempty"`
+	UpdatedAt        string           `json:"updated_at,omitempty"`
+	FinishedAt       string           `json:"finished_at,omitempty"`
+	Trigger          string           `json:"trigger,omitempty"`
+	Workers          []map[string]any `json:"workers,omitempty"`
+}
+
+type RegisterLog struct {
+	Time  string `json:"time"`
+	Text  string `json:"text"`
+	Level string `json:"level"`
+}
+
+func defaultRegisterConfig() RegisterConfig {
+	return RegisterConfig{
+		Enabled: false,
+		Mail: RegisterMailConfig{
+			RequestTimeout:      30,
+			WaitTimeout:         30,
+			WaitInterval:        2,
+			APIUseRegisterProxy: true,
+			Providers:           []map[string]any{},
+		},
+		Proxy:                   "",
+		TaskTimeoutSeconds:      300,
+		TaskStallTimeoutSeconds: 60,
+		Total:                   10,
+		Threads:                 3,
+		Mode:                    "total",
+		TargetQuota:             100,
+		TargetAvailable:         10,
+		CheckInterval:           5,
+		FixedPassword:           "",
+		Stats: RegisterStats{
+			Success:          0,
+			Fail:             0,
+			Done:             0,
+			Running:          0,
+			Threads:          3,
+			ElapsedSeconds:   0,
+			AvgSeconds:       0,
+			SuccessRate:      0,
+			CurrentQuota:     0,
+			CurrentAvailable: 0,
+		},
+		Logs: []RegisterLog{},
+		Executor: map[string]any{
+			"status":  "pending_migration",
+			"message": "Go 版注册执行器尚未接入；配置、状态和接口已保留。",
+		},
+	}
+}
+
+func (s *Store) LoadRegisterConfig() RegisterConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return normalizeRegisterConfig(readJSONFile(s.path("register.json"), defaultRegisterConfig()))
+}
+
+func (s *Store) SaveRegisterConfig(cfg RegisterConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return writeJSONFile(s.path("register.json"), normalizeRegisterConfig(cfg))
+}
+
+func (s *Store) UpdateRegisterConfig(fn func(RegisterConfig) RegisterConfig) (RegisterConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg := normalizeRegisterConfig(readJSONFile(s.path("register.json"), defaultRegisterConfig()))
+	cfg = normalizeRegisterConfig(fn(cfg))
+	err := writeJSONFile(s.path("register.json"), cfg)
+	return cfg, err
+}
+
+func normalizeRegisterConfig(cfg RegisterConfig) RegisterConfig {
+	def := defaultRegisterConfig()
+	if cfg.Mail.RequestTimeout <= 0 {
+		cfg.Mail.RequestTimeout = def.Mail.RequestTimeout
+	}
+	if cfg.Mail.WaitTimeout <= 0 {
+		cfg.Mail.WaitTimeout = def.Mail.WaitTimeout
+	}
+	if cfg.Mail.WaitInterval <= 0 {
+		cfg.Mail.WaitInterval = def.Mail.WaitInterval
+	}
+	if cfg.Mail.Providers == nil {
+		cfg.Mail.Providers = []map[string]any{}
+	}
+	cfg.Mail.APIUseRegisterProxy = boolAny(cfg.Mail.APIUseRegisterProxy, true)
+	for i := range cfg.Mail.Providers {
+		if strings.TrimSpace(strAny(cfg.Mail.Providers[i]["provider_id"], "")) == "" {
+			cfg.Mail.Providers[i]["provider_id"] = randID(16)
+		}
+	}
+	cfg.Proxy = strings.TrimSpace(cfg.Proxy)
+	cfg.Total = maxInt(1, cfg.Total)
+	cfg.Threads = maxInt(1, cfg.Threads)
+	if cfg.Mode != "total" && cfg.Mode != "quota" && cfg.Mode != "available" {
+		cfg.Mode = "total"
+	}
+	cfg.TargetQuota = maxInt(1, cfg.TargetQuota)
+	cfg.TargetAvailable = maxInt(1, cfg.TargetAvailable)
+	cfg.CheckInterval = maxInt(1, cfg.CheckInterval)
+	cfg.TaskTimeoutSeconds = maxInt(30, cfg.TaskTimeoutSeconds)
+	cfg.TaskStallTimeoutSeconds = maxInt(0, cfg.TaskStallTimeoutSeconds)
+	cfg.Stats.Threads = cfg.Threads
+	if cfg.Logs == nil {
+		cfg.Logs = []RegisterLog{}
+	}
+	if len(cfg.Logs) > 300 {
+		cfg.Logs = cfg.Logs[len(cfg.Logs)-300:]
+	}
+	if cfg.Executor == nil {
+		cfg.Executor = def.Executor
+	}
+	return cfg
+}
+
+func (s *Server) registerSnapshot() RegisterConfig {
+	cfg := s.store.LoadRegisterConfig()
+	cfg.Stats.CurrentQuota, cfg.Stats.CurrentAvailable = s.registerPoolMetrics()
+	cfg.Stats.Threads = cfg.Threads
+	cfg = redactRegisterSecrets(cfg)
+	return cfg
+}
+
+func (s *Server) registerPoolMetrics() (int, int) {
+	quota := 0
+	available := 0
+	for _, account := range s.store.LoadAccounts() {
+		if account.Status != "正常" {
+			continue
+		}
+		available++
+		if !account.ImageQuotaUnknown {
+			quota += account.Quota
+		}
+	}
+	return quota, available
+}
+
+func redactRegisterSecrets(cfg RegisterConfig) RegisterConfig {
+	for i := range cfg.Mail.Providers {
+		provider := cfg.Mail.Providers[i]
+		if strings.EqualFold(strAny(provider["type"], ""), "outlook_token") {
+			text := strAny(provider["mailboxes"], "")
+			provider["mailboxes"] = ""
+			provider["mailboxes_count"] = countNonEmptyLines(text)
+			provider["mailboxes_preview"] = maskedMailboxPreview(text, 20)
+		}
+	}
+	return cfg
+}
+
+func countNonEmptyLines(text string) int {
+	count := 0
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func maskedMailboxPreview(text string, limit int) []string {
+	out := []string{}
+	for _, line := range strings.Split(text, "\n") {
+		if len(out) >= limit {
+			break
+		}
+		email := strings.TrimSpace(strings.Split(line, "----")[0])
+		if email == "" {
+			continue
+		}
+		local, domain, found := strings.Cut(email, "@")
+		if !found {
+			out = append(out, "***")
+			continue
+		}
+		mask := "***"
+		if len(local) > 0 {
+			mask = local[:1] + "***"
+			if len(local) > 2 {
+				mask += local[len(local)-1:]
+			}
+		}
+		out = append(out, mask+"@"+domain)
+	}
+	return out
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, 200, map[string]any{"register": s.registerSnapshot()})
+	case http.MethodPost:
+		var body map[string]any
+		if !readBody(w, r, &body) {
+			return
+		}
+		_, err := s.store.UpdateRegisterConfig(func(cfg RegisterConfig) RegisterConfig {
+			applyRegisterUpdates(&cfg, body)
+			s.appendRegisterLogLocked(&cfg, "注册配置已保存", "green")
+			return cfg
+		})
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"register": s.registerSnapshot()})
+	default:
+		writeErr(w, 405, "method not allowed")
+	}
+}
+
+func applyRegisterUpdates(cfg *RegisterConfig, body map[string]any) {
+	if v, ok := body["mail"]; ok {
+		if raw, err := json.Marshal(v); err == nil {
+			_ = json.Unmarshal(raw, &cfg.Mail)
+		}
+	}
+	if v, ok := body["proxy"]; ok {
+		cfg.Proxy = strAny(v, "")
+	}
+	if v, ok := body["total"]; ok {
+		cfg.Total = intAny(v, cfg.Total)
+	}
+	if v, ok := body["threads"]; ok {
+		cfg.Threads = intAny(v, cfg.Threads)
+	}
+	if v, ok := body["mode"]; ok {
+		cfg.Mode = strings.TrimSpace(strAny(v, cfg.Mode))
+	}
+	if v, ok := body["target_quota"]; ok {
+		cfg.TargetQuota = intAny(v, cfg.TargetQuota)
+	}
+	if v, ok := body["target_available"]; ok {
+		cfg.TargetAvailable = intAny(v, cfg.TargetAvailable)
+	}
+	if v, ok := body["check_interval"]; ok {
+		cfg.CheckInterval = intAny(v, cfg.CheckInterval)
+	}
+	if v, ok := body["fixed_password"]; ok {
+		cfg.FixedPassword = strAny(v, "")
+	}
+	if v, ok := body["task_timeout_seconds"]; ok {
+		cfg.TaskTimeoutSeconds = intAny(v, cfg.TaskTimeoutSeconds)
+	}
+	if v, ok := body["task_stall_timeout_seconds"]; ok {
+		cfg.TaskStallTimeoutSeconds = intAny(v, cfg.TaskStallTimeoutSeconds)
+	}
+}
+
+func (s *Server) handleRegisterStart(w http.ResponseWriter, r *http.Request) {
+	s.handleRegisterStartKind(w, r, "register")
+}
+
+func (s *Server) handleRegisterRepairAbnormal(w http.ResponseWriter, r *http.Request) {
+	s.handleRegisterStartKind(w, r, "repair_abnormal")
+}
+
+func (s *Server) handleRegisterStartKind(w http.ResponseWriter, r *http.Request, kind string) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	_, err := s.store.UpdateRegisterConfig(func(cfg RegisterConfig) RegisterConfig {
+		now := nowISO()
+		jobID := randID(16)
+		cfg.Enabled = false
+		cfg.Stats = RegisterStats{
+			JobID:            jobID,
+			JobKind:          kind,
+			Success:          0,
+			Fail:             1,
+			Done:             1,
+			Running:          0,
+			Threads:          cfg.Threads,
+			ElapsedSeconds:   0,
+			AvgSeconds:       0,
+			SuccessRate:      0,
+			CurrentQuota:     0,
+			CurrentAvailable: 0,
+			StartedAt:        now,
+			UpdatedAt:        now,
+			FinishedAt:       now,
+			Trigger:          "manual",
+			Workers: []map[string]any{
+				{
+					"index":          1,
+					"status":         "failed",
+					"failure_reason": "register_executor_pending_migration",
+					"last_error":     "Go 版自动注册执行器尚未迁移完成；请先手动导入账号或接入独立注册执行器。",
+					"updated_at":     now,
+				},
+			},
+		}
+		cfg.Executor = map[string]any{
+			"status":  "pending_migration",
+			"message": "Go 版自动注册执行器尚未迁移完成；API 生图与异步队列可正常运行。",
+		}
+		s.appendRegisterLogLocked(&cfg, "已收到启动注册机请求，但 Go 版自动注册执行器尚未迁移完成；本次任务不会创建账号。", "red")
+		return cfg
+	})
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"register": s.registerSnapshot()})
+}
+
+func (s *Server) handleRegisterStop(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	_, err := s.store.UpdateRegisterConfig(func(cfg RegisterConfig) RegisterConfig {
+		cfg.Enabled = false
+		cfg.Stats.Running = 0
+		cfg.Stats.UpdatedAt = nowISO()
+		s.appendRegisterLogLocked(&cfg, "已停止注册任务", "yellow")
+		return cfg
+	})
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"register": s.registerSnapshot()})
+}
+
+func (s *Server) handleRegisterReset(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	quota, available := s.registerPoolMetrics()
+	_, err := s.store.UpdateRegisterConfig(func(cfg RegisterConfig) RegisterConfig {
+		cfg.Enabled = false
+		cfg.Stats = RegisterStats{
+			Success:          0,
+			Fail:             0,
+			Done:             0,
+			Running:          0,
+			Threads:          cfg.Threads,
+			ElapsedSeconds:   0,
+			AvgSeconds:       0,
+			SuccessRate:      0,
+			CurrentQuota:     quota,
+			CurrentAvailable: available,
+			UpdatedAt:        nowISO(),
+		}
+		cfg.Logs = []RegisterLog{}
+		return cfg
+	})
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"register": s.registerSnapshot()})
+}
+
+func (s *Server) handleRegisterOutlookPoolReset(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	_, err := s.store.UpdateRegisterConfig(func(cfg RegisterConfig) RegisterConfig {
+		s.appendRegisterLogLocked(&cfg, "Outlook 邮箱池运行状态已重置；Go 版暂不维护独立邮箱池占用表。", "yellow")
+		return cfg
+	})
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"register": s.registerSnapshot()})
+}
+
+func (s *Server) handleRegisterEvents(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	last := ""
+	for {
+		payload, _ := json.Marshal(s.registerSnapshot())
+		cur := string(payload)
+		if cur != last {
+			fmt.Fprintf(w, "data: %s\n\n", cur)
+			flushSSE(w)
+			last = cur
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) appendRegisterLogLocked(cfg *RegisterConfig, text, level string) {
+	cfg.Logs = append(cfg.Logs, RegisterLog{Time: nowISO(), Text: text, Level: firstNonEmpty(level, "info")})
+	if len(cfg.Logs) > 300 {
+		cfg.Logs = cfg.Logs[len(cfg.Logs)-300:]
+	}
+}

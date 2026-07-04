@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gpt2api-image-local-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gpt2api_image
+      POSTGRES_USER: gpt2api_image
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gpt2api_image}
+    volumes:
+      - postgres_local_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gpt2api_image -d gpt2api_image"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${GPT2API_IMAGE_IMAGE:-gpt2api-image:local}
+    container_name: gpt2api-image-local-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:80"
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      - GPT2API_IMAGE_MODE=serve
+      - GPT2API_IMAGE_ADDR=:80
+      - GPT2API_IMAGE_AUTH_KEY=${GPT2API_IMAGE_AUTH_KEY:-}
+      - GPT2API_IMAGE_DATABASE_URL=postgresql://gpt2api_image:${POSTGRES_PASSWORD:-gpt2api_image}@postgres:5432/gpt2api_image
+      - GPT2API_IMAGE_BASE_URL=${GPT2API_IMAGE_BASE_URL:-}
+      - GPT2API_IMAGE_DB_MAX_OPEN_CONNS=${GPT2API_IMAGE_DB_MAX_OPEN_CONNS:-20}
+      - GPT2API_IMAGE_DB_MAX_IDLE_CONNS=${GPT2API_IMAGE_DB_MAX_IDLE_CONNS:-10}
+      - GPT2API_IMAGE_UPSTREAM_TRANSPORT=${GPT2API_IMAGE_UPSTREAM_TRANSPORT:-tls-client}
+      - GPT2API_IMAGE_CURL_IMPERSONATE_AUTO_DOWNLOAD=${GPT2API_IMAGE_CURL_IMPERSONATE_AUTO_DOWNLOAD:-1}
+      - TZ=${TZ:-Asia/Shanghai}
+
+  worker:
+    image: ${GPT2API_IMAGE_IMAGE:-gpt2api-image:local}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      - GPT2API_IMAGE_MODE=worker
+      - GPT2API_IMAGE_AUTH_KEY=${GPT2API_IMAGE_AUTH_KEY:-}
+      - GPT2API_IMAGE_DATABASE_URL=postgresql://gpt2api_image:${POSTGRES_PASSWORD:-gpt2api_image}@postgres:5432/gpt2api_image
+      - GPT2API_IMAGE_BASE_URL=${GPT2API_IMAGE_BASE_URL:-http://127.0.0.1:8000}
+      - GPT2API_IMAGE_WORKER_CONCURRENCY=${GPT2API_IMAGE_WORKER_CONCURRENCY:-2}
+      - GPT2API_IMAGE_WORKER_HEARTBEAT_INTERVAL_SECS=${GPT2API_IMAGE_WORKER_HEARTBEAT_INTERVAL_SECS:-5}
+      - GPT2API_IMAGE_DB_MAX_OPEN_CONNS=${GPT2API_IMAGE_DB_MAX_OPEN_CONNS:-20}
+      - GPT2API_IMAGE_DB_MAX_IDLE_CONNS=${GPT2API_IMAGE_DB_MAX_IDLE_CONNS:-10}
+      - GPT2API_IMAGE_UPSTREAM_TRANSPORT=${GPT2API_IMAGE_UPSTREAM_TRANSPORT:-tls-client}
+      - GPT2API_IMAGE_CURL_IMPERSONATE_AUTO_DOWNLOAD=${GPT2API_IMAGE_CURL_IMPERSONATE_AUTO_DOWNLOAD:-1}
+      - TZ=${TZ:-Asia/Shanghai}
+
+volumes:
+  postgres_local_data:

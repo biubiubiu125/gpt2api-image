@@ -1,0 +1,39 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Build outputs
+bin/
+release/
+web_dist/
+
+# Local runtime data
+.venv/
+.idea/
+data/
+edit
+
+test.md
+
+docker-compose-local.yml
+
+.claude/settings.local.json
+CLAUDE.md
+AGENTS.md
+*.patch
+
+# Environment variables
+.env
+.env.local
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Git cache
+git_cache/

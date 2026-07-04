@@ -274,6 +274,18 @@ func mergeAccount(dst *Account, src Account) {
 	}
 }
 
+func mergeRefreshedAccountInfo(dst *Account, src Account) {
+	accessToken := dst.AccessToken
+	mergeAccount(dst, src)
+	dst.AccessToken = accessToken
+	dst.ImageQuotaUnknown = src.ImageQuotaUnknown
+	dst.Quota = src.Quota
+	dst.LimitsProgress = src.LimitsProgress
+	if dst.InitialQuota < dst.Quota {
+		dst.InitialQuota = dst.Quota
+	}
+}
+
 func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (int, []map[string]any) {
 	want := map[string]bool{}
 	for _, t := range tokens {
@@ -285,7 +297,7 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (i
 	refreshed := 0
 	errs := []map[string]any{}
 	updates := map[string]Account{}
-	for i, a := range accounts {
+	for _, a := range accounts {
 		if len(want) > 0 && !want[a.AccessToken] {
 			continue
 		}
@@ -295,8 +307,7 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (i
 			var info Account
 			info, err = client.GetUserInfo(ctx)
 			if err == nil {
-				mergeAccount(&a, info)
-				a.AccessToken = accounts[i].AccessToken
+				mergeRefreshedAccountInfo(&a, info)
 				updates[a.AccessToken] = a
 				refreshed++
 			}

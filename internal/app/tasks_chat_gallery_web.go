@@ -585,31 +585,31 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		defer s.popTaskCancel(task.ID)
 		defer cancel()
 		data := []map[string]any{}
-		for i := 0; i < b.N; i++ {
-			items, err := s.generateImageWithPool(ctx, b.Prompt, b.Model, b.Size, b.Resolution, nil)
+		items, err := s.generateImagesWithPool(ctx, b.Prompt, b.Model, b.Size, b.Resolution, nil, b.N)
+		if err != nil {
+			s.refundImage(identity, b.N)
+			if ctx.Err() != nil {
+				s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
+				s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", errors.New("canceled"), map[string]any{"task_id": task.ID})
+			} else {
+				s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+				s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", err, map[string]any{"task_id": task.ID})
+			}
+			return
+		}
+		for _, res := range items {
+			rel, url, err := s.saveImage(r, res.Bytes)
 			if err != nil {
 				s.refundImage(identity, b.N-len(data))
-				if ctx.Err() != nil {
-					s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
-					s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", errors.New("canceled"), map[string]any{"task_id": task.ID})
-				} else {
-					s.updateTaskStatus(task.ID, "error", err.Error(), nil)
-					s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", err, map[string]any{"task_id": task.ID})
-				}
+				s.updateTaskStatus(task.ID, "error", err.Error(), nil)
 				return
 			}
-			for _, res := range items {
-				rel, url, err := s.saveImage(r, res.Bytes)
-				if err != nil {
-					s.refundImage(identity, b.N-len(data))
-					s.updateTaskStatus(task.ID, "error", err.Error(), nil)
-					return
-				}
-				s.recordOwner(identity, rel)
-				s.recordPrompt(rel, b.Prompt, false)
-				data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, b.Prompt)})
-				break
-			}
+			s.recordOwner(identity, rel)
+			s.recordPrompt(rel, b.Prompt, false)
+			data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, b.Prompt)})
+		}
+		if len(data) < b.N {
+			s.refundImage(identity, b.N-len(data))
 		}
 		s.updateTaskStatus(task.ID, "success", "", data)
 		s.logCallSuccess(callID, "/api/image-tasks/generations", b.Model, "文生图任务", map[string]any{"task_id": task.ID, "image_count": len(data)})

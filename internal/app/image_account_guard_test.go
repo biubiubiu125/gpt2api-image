@@ -147,3 +147,28 @@ func TestRegisterRemovalDeletesUnknownQuotaAccounts(t *testing.T) {
 		t.Fatalf("unknown quota account should be removed, got %#v", got)
 	}
 }
+
+func TestMergeRefreshedAccountInfoOverridesStaleKnownQuota(t *testing.T) {
+	account := Account{AccessToken: "tok", Status: accountStatusNormal, Quota: 100, ImageQuotaUnknown: false}
+	mergeRefreshedAccountInfo(&account, Account{
+		AccessToken:       "new-token-ignored",
+		Status:            accountStatusNormal,
+		Quota:             0,
+		ImageQuotaUnknown: true,
+	})
+	if account.AccessToken != "tok" {
+		t.Fatalf("refresh merge should keep stored token, got %q", account.AccessToken)
+	}
+	if !account.ImageQuotaUnknown || account.Quota != 0 {
+		t.Fatalf("refresh merge should overwrite stale quota with unknown state: %#v", account)
+	}
+
+	s := newImageAccountGuardTestServer(t)
+	if err := s.store.SaveAccounts([]Account{account}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+	s.cleanupUnusableImageAccounts()
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("refreshed unknown quota account should be removed, got %#v", got)
+	}
+}

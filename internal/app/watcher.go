@@ -17,7 +17,7 @@ func (s *Server) startLimitedAccountWatcher() {
 			accounts := s.store.LoadAccounts()
 			var limited []string
 			for _, a := range accounts {
-				if a.Status == "限流" && a.AccessToken != "" {
+				if isAccountStatus(a.Status, accountStatusLimited) && a.AccessToken != "" {
 					limited = append(limited, a.AccessToken)
 				}
 			}
@@ -42,10 +42,9 @@ func (s *Server) startLimitedAccountWatcher() {
 						if updated[i].AccessToken != token {
 							continue
 						}
-						mergeAccount(&updated[i], info)
-						updated[i].AccessToken = token
-						if info.Status == "正常" && (info.ImageQuotaUnknown || info.Quota > 0) {
-							updated[i].Status = "正常"
+						mergeRefreshedAccountInfo(&updated[i], info)
+						if isAccountStatus(info.Status, accountStatusNormal) && !info.ImageQuotaUnknown && info.Quota > 0 {
+							updated[i].Status = accountStatusNormal
 							updated[i].RestoreAt = nil
 							updated[i].RateLimitedAt = nil
 							updated[i].RateLimitResetAt = nil
@@ -54,6 +53,7 @@ func (s *Server) startLimitedAccountWatcher() {
 					}
 					return updated
 				})
+				s.cleanupUnusableImageAccounts()
 			}
 		}
 	}()

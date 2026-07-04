@@ -869,30 +869,30 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 	refs := inputs
 	w.Header().Set("Content-Type", "text/event-stream")
 	created := time.Now().Unix()
-	for i := 0; i < n; i++ {
-		items, err := s.generateImageWithPool(ctx, prompt, model, size, resolution, refs)
+	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
+	if err != nil {
+		s.refundImage(id, n)
+		s.logSvc.add("call", "上游图片生成失败", map[string]any{"model": model, "error": err.Error()})
+		sse(w, map[string]any{"object": "image.generation.message", "created": created, "model": model, "index": 0, "total": n, "message": err.Error()})
+		sseDone(w)
+		return
+	}
+	for i, result := range items {
+		data := []map[string]any{}
+		rel, url, err := s.saveImage(r, result.Bytes)
 		if err != nil {
 			s.refundImage(id, n-i)
-			s.logSvc.add("call", "上游图片生成失败", map[string]any{"model": model, "error": err.Error()})
-			sse(w, map[string]any{"object": "image.generation.message", "created": created, "model": model, "index": i, "total": n, "message": err.Error()})
+			sse(w, map[string]any{"error": err.Error()})
 			sseDone(w)
 			return
 		}
-		data := []map[string]any{}
-		for _, result := range items {
-			rel, url, err := s.saveImage(r, result.Bytes)
-			if err != nil {
-				s.refundImage(id, n-i)
-				sse(w, map[string]any{"error": err.Error()})
-				sseDone(w)
-				return
-			}
-			s.recordOwner(id, rel)
-			s.recordPrompt(rel, prompt, isEdit)
-			data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt)})
-			break
-		}
+		s.recordOwner(id, rel)
+		s.recordPrompt(rel, prompt, isEdit)
+		data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt)})
 		sse(w, map[string]any{"object": "image.generation.result", "created": created, "model": model, "index": i, "total": n, "data": data})
+	}
+	if len(items) < n {
+		s.refundImage(id, n-len(items))
 	}
 	ssedoneAndDone(w)
 }

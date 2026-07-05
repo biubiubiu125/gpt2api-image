@@ -141,6 +141,7 @@ export function NetworkSection() {
 export function ImageSection() {
   const config = useSettingsStore((s) => s.config);
   const setBaseUrl = useSettingsStore((s) => s.setBaseUrl);
+  const setImageRouteStrategy = useSettingsStore((s) => s.setImageRouteStrategy);
   const setImageRetentionDays = useSettingsStore((s) => s.setImageRetentionDays);
   const setCleanupProtectUserImages = useSettingsStore((s) => s.setCleanupProtectUserImages);
   const setImagePollTimeoutSecs = useSettingsStore((s) => s.setImagePollTimeoutSecs);
@@ -159,6 +160,21 @@ export function ImageSection() {
           className={INPUT_CLASS}
         />
         <p className={HELP_CLASS}>用作生成结果 URL 的前缀。留空则按请求 host 自动推断。</p>
+      </div>
+
+      <div className="space-y-2">
+        <label className={LABEL_CLASS}>内部生图路由</label>
+        <select
+          value={String(config?.image_route_strategy || "web_first")}
+          onChange={(e) => setImageRouteStrategy(e.target.value)}
+          className={INPUT_CLASS + " w-full px-3 text-sm text-stone-700 md:max-w-xs"}
+        >
+          <option value="web_first">Web 优先，Codex 备用</option>
+          <option value="web_only">仅 Web 网页生图</option>
+          <option value="codex_first">Codex 优先，Web 备用</option>
+          <option value="codex_only">仅 Codex</option>
+        </select>
+        <p className={HELP_CLASS}>下游请求模型统一为 gpt-image-2；这里只控制服务内部选择哪条真实上游链路。</p>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">

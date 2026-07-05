@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"mime"
 	stdhttp "net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	"unicode/utf8"
 
 	http "github.com/bogdanfinn/fhttp"
+	tlsclient "github.com/bogdanfinn/tls-client"
 )
 
 const chatGPTBaseURL = "https://chatgpt.com"
@@ -95,13 +97,46 @@ func NewUpstreamClient(token, proxyURL string, binGetter func() (string, error))
 }
 
 func NewUpstreamClientForAccount(account Account, proxyURL string, binGetter func() (string, error)) (*UpstreamClient, error) {
+	return NewUpstreamClientForAccountWithTransport(account, proxyURL, binGetter, os.Getenv("GPT2API_IMAGE_UPSTREAM_TRANSPORT"))
+}
+
+func NewUpstreamClientForAccountWithTransport(account Account, proxyURL string, binGetter func() (string, error), transport string) (*UpstreamClient, error) {
 	token := account.AccessToken
 	fp := accountFingerprint(account)
-	client, err := newCurlImpersonateClient(proxyURL, binGetter)
+	client, err := newUpstreamHTTPClient(normalizeUpstreamTransport(transport), proxyURL, binGetter)
 	if err != nil {
 		return nil, err
 	}
 	return &UpstreamClient{token: token, client: client, userAgent: fp["user-agent"], deviceID: fp["oai-device-id"], sessionID: fp["oai-session-id"], secCHUA: fp["sec-ch-ua"], secCHUAMobile: fp["sec-ch-ua-mobile"], secCHUAPlatform: fp["sec-ch-ua-platform"], scriptSources: []string{defaultPowScript}}, nil
+}
+
+func normalizeUpstreamTransport(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "tls", "tlsclient", "tls-client":
+		return "tls-client"
+	case "curl", "curl-impersonate", "curl_impersonate":
+		return "curl-impersonate"
+	default:
+		return "tls-client"
+	}
+}
+
+func newUpstreamHTTPClient(transport, proxyURL string, binGetter func() (string, error)) (upstreamHTTPDoer, error) {
+	switch normalizeUpstreamTransport(transport) {
+	case "curl-impersonate":
+		return newCurlImpersonateClient(proxyURL, binGetter)
+	default:
+		options := []tlsclient.HttpClientOption{
+			tlsclient.WithClientProfile(upstreamTLSProfile()),
+			tlsclient.WithRandomTLSExtensionOrder(),
+			tlsclient.WithNotFollowRedirects(),
+			tlsclient.WithTimeoutSeconds(0),
+		}
+		if strings.TrimSpace(proxyURL) != "" {
+			options = append(options, tlsclient.WithProxyUrl(strings.TrimSpace(proxyURL)))
+		}
+		return tlsclient.NewHttpClient(nil, options...)
+	}
 }
 
 func accountFingerprint(account Account) map[string]string {
@@ -487,11 +522,11 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 	if c.token == "" {
 		return nil, errors.New("access token is required for image generation")
 	}
+	finalPrompt := buildEnhancedImagePrompt(prompt, size, resolution, len(refs) > 0)
 	if isCodexImageRequest(model, resolution) {
 		traceLogf(ctx, "│  ├─ route to Codex image path")
-		return c.GenerateCodexImage(ctx, buildImagePrompt(prompt, size), model, codexImageSize(size, resolution), refs, opts.Timeout)
+		return c.GenerateCodexImage(ctx, finalPrompt, model, codexImageSize(size, resolution), refs, opts.Timeout)
 	}
-	finalPrompt := buildImagePromptWithOptions(prompt, size, resolution)
 	if err := c.bootstrap(ctx); err != nil {
 		return nil, err
 	}
@@ -1751,19 +1786,30 @@ func normalizeImageResolution(value string) string {
 }
 
 func buildImagePromptWithOptions(prompt, size, resolution string) string {
-	final := strings.TrimSpace(buildImagePrompt(prompt, size))
-	switch normalizeImageResolution(resolution) {
-	case "1k":
-		return final + "\n\n目标输出分辨率为 1K 级别，优先保证构图稳定和主体清晰。"
-	case "2k":
-		return final + "\n\n目标输出分辨率为 2K 级别，尽可能输出长边约 2048px 的高清图片，保留细节纹理。"
-	case "4k":
-		return final + "\n\n目标输出分辨率为 4K 级别，尽可能输出接近 3840px 长边的超清图片，保留丰富细节和干净边缘。"
-	default:
-		return final
-	}
+	return buildEnhancedImagePrompt(prompt, size, resolution, false)
 }
 
+func buildEnhancedImagePrompt(prompt, size, resolution string, hasReferenceImages bool) string {
+	final := strings.TrimSpace(buildImagePrompt(prompt, size))
+	instructions := []string{
+		"Generate the final image directly. Do not return descriptions, markdown, JSON, tool parameters, or extra text.",
+		"Generate an ultra high definition image with sharp details, clean textures, natural lighting, high visual clarity, rich fine detail, and professional image quality. Avoid blurry, low-resolution, compressed, pixelated, or artifact-heavy appearance.",
+		"Preserve the user's original intent and do not add unrelated elements.",
+		"If the image contains Chinese, Japanese, Korean, Latin text, logos, UI labels, packaging, signs, or brand-like marks, keep them accurate, legible, correctly spelled, and not garbled.",
+	}
+	switch normalizeImageResolution(resolution) {
+	case "1k":
+		instructions = append(instructions, "Target a 1K output level and prioritize stable composition with a clear main subject.")
+	case "2k":
+		instructions = append(instructions, "Target a 2K output level, about 2048px on the long edge when possible, while preserving fine texture detail.")
+	case "4k":
+		instructions = append(instructions, "Target a 4K output level, close to 3840px on the long edge when possible, with rich detail and clean edges.")
+	}
+	if hasReferenceImages {
+		instructions = append(instructions, "Use every uploaded reference image as visual input. Preserve the main subject, identity, composition, and requested edit intent. Do not ignore, drop, replace, or merely describe the reference images.")
+	}
+	return final + "\n\n" + strings.Join(instructions, "\n")
+}
 func normalizeAccountType(value string) string {
 	raw := strings.TrimSpace(value)
 	if raw == "" {
@@ -2019,7 +2065,7 @@ func (s *Server) upstreamClientForImageAccount(model, resolution string, account
 			account = refreshed
 		}
 	}
-	client, err := NewUpstreamClientForAccount(account, s.cfg.Proxy, s.ensureCurlImpersonateBinary)
+	client, err := NewUpstreamClientForAccountWithTransport(account, s.cfg.Proxy, s.ensureCurlImpersonateBinary, s.cfg.UpstreamTransport)
 	return client, account, err
 }
 

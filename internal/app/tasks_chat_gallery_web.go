@@ -381,9 +381,7 @@ func (s *Server) createDBImageTask(ctx context.Context, id *Identity, req imageT
 	if req.Prompt == "" {
 		return ImageTask{}, false, httpStatusError(400, "prompt is required")
 	}
-	if req.Model == "" {
-		req.Model = "gpt-image-2"
-	}
+	req.Model = normalizeImageModel(req.Model)
 	if req.N < 1 {
 		req.N = 1
 	}
@@ -568,6 +566,7 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 	if b.N > 4 {
 		b.N = 4
 	}
+	b.Model = normalizeImageModel(b.Model)
 	if s.taskStore != nil {
 		task, _, err := s.createDBImageTask(r.Context(), id, imageTaskCreateRequest{
 			ClientTaskID:   b.ClientTaskID,
@@ -663,10 +662,7 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "prompt is required")
 		return
 	}
-	model := r.FormValue("model")
-	if model == "" {
-		model = "gpt-image-2"
-	}
+	model := normalizeImageModel(r.FormValue("model"))
 	if s.taskStore != nil {
 		inputs, err := s.readMultipartImageInputs(r)
 		if err != nil {
@@ -884,6 +880,10 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := strAny(b["model"], "auto")
+	if isImageChatRequest(b) {
+		model = normalizeImageModel(strAny(b["model"], "gpt-image-2"))
+		b["model"] = model
+	}
 	requestText := extractPrompt(b)
 	callID := s.logCallStart(id, "/api/chat/stream", model, "聊天", requestText)
 	if isImageChatRequest(b) {
@@ -1012,10 +1012,8 @@ func (s *Server) resolveChatStreamImages(ctx context.Context, r *http.Request, i
 }
 
 func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, id *Identity, b map[string]any, callID string) {
-	model := strAny(b["model"], "gpt-image-2")
-	if !isSupportedImageModel(model) {
-		model = "gpt-image-2"
-	}
+	model := normalizeImageModel(strAny(b["model"], "gpt-image-2"))
+	b["model"] = model
 	prompt := extractChatPrompt(b)
 	if prompt == "" {
 		err := errors.New("prompt is required")

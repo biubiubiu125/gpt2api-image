@@ -67,6 +67,18 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_REGISTER_INTERNAL_KEY")); env != "" {
 		cfg.RegisterInternalKey = env
 	}
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_UPSTREAM_TRANSPORT")); env != "" {
+		cfg.UpstreamTransport = env
+	}
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_ROUTE_STRATEGY")); env != "" {
+		cfg.ImageRouteStrategy = env
+	}
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_CORS_ALLOWED_ORIGINS")); env != "" {
+		cfg.CORSAllowedOrigins = splitConfigList(env)
+	}
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_LOG_REQUEST_TEXT")); env != "" {
+		cfg.LogRequestText = parseBoolEnv(env)
+	}
 	if strings.TrimSpace(cfg.AuthKey) == "" {
 		return nil, errors.New("auth-key 未设置")
 	}
@@ -106,6 +118,8 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 	if cfg.ImageAccountConcurrency <= 0 {
 		cfg.ImageAccountConcurrency = 3
 	}
+	cfg.UpstreamTransport = normalizeUpstreamTransport(cfg.UpstreamTransport)
+	cfg.ImageRouteStrategy = normalizeImageRouteStrategy(cfg.ImageRouteStrategy)
 	if cfg.AIReview == nil {
 		cfg.AIReview = map[string]any{"enabled": false}
 	}
@@ -194,7 +208,11 @@ func (s *Server) configMap(includeAuth bool) map[string]any {
 	m["auto_remove_rate_limited_accounts"] = s.cfg.AutoRemoveRateLimitedAccounts
 	m["auto_remove_invalid_accounts"] = s.cfg.AutoRemoveInvalidAccounts
 	m["log_levels"] = s.cfg.LogLevels
+	m["log_request_text"] = s.cfg.LogRequestText
+	m["cors_allowed_origins"] = s.cfg.CORSAllowedOrigins
 	m["proxy"] = s.cfg.Proxy
+	m["upstream_transport"] = s.cfg.UpstreamTransport
+	m["image_route_strategy"] = s.cfg.ImageRouteStrategy
 	m["base_url"] = s.cfg.BaseURL
 	m["sensitive_words"] = s.cfg.SensitiveWords
 	m["global_system_prompt"] = s.cfg.GlobalSystemPrompt
@@ -208,6 +226,63 @@ func (s *Server) configMap(includeAuth bool) map[string]any {
 		delete(m, "register_internal_key")
 	}
 	return m
+}
+
+func splitConfigList(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '\n' || r == ';'
+	})
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if item := strings.TrimSpace(part); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func parseBoolEnv(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) {
+	allowed := s.cfg.CORSAllowedOrigins
+	if len(allowed) == 0 {
+		return
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return
+	}
+	allowOrigin := ""
+	for _, item := range allowed {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if item == "*" {
+			allowOrigin = "*"
+			break
+		}
+		if item == origin {
+			allowOrigin = origin
+			break
+		}
+	}
+	if allowOrigin == "" {
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
+	if allowOrigin != "*" {
+		w.Header().Add("Vary", "Origin")
+	}
+	w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,x-api-key,anthropic-version")
 }
 
 func isLegacyConfigKey(key string) bool {
@@ -234,9 +309,7 @@ func (s *Server) Handler() http.Handler {
 			}
 			traceLogf(ctx, "└─ client response status=%d bytes=%d duration=%s", status, tw.bytes, traceHTTPDuration(start))
 		}()
-		tw.Header().Set("Access-Control-Allow-Origin", "*")
-		tw.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-		tw.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,x-api-key,anthropic-version")
+		s.applyCORS(tw, r)
 		if r.Method == http.MethodOptions {
 			tw.WriteHeader(204)
 			return

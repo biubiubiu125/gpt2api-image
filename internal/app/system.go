@@ -83,6 +83,18 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if v, ok := body["log_levels"]; ok {
 			s.cfg.LogLevels = stringSliceAny(v)
 		}
+		if v, ok := body["log_request_text"]; ok {
+			s.cfg.LogRequestText = boolAny(v, false)
+		}
+		if v, ok := body["cors_allowed_origins"]; ok {
+			s.cfg.CORSAllowedOrigins = stringSliceAny(v)
+		}
+		if v, ok := body["upstream_transport"]; ok {
+			s.cfg.UpstreamTransport = normalizeUpstreamTransport(strAny(v, ""))
+		}
+		if v, ok := body["image_route_strategy"]; ok {
+			s.cfg.ImageRouteStrategy = normalizeImageRouteStrategy(strAny(v, ""))
+		}
 		if v, ok := body["sensitive_words"]; ok {
 			s.cfg.SensitiveWords = stringSliceAny(v)
 		}
@@ -99,26 +111,55 @@ func (s *Server) handleStorageInfo(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
+	if s.taskStore != nil {
+		writeJSON(w, 200, map[string]any{
+			"backend": map[string]any{
+				"type":                   "postgresql",
+				"description":            "PostgreSQL 图片任务队列，本地 JSON 仍保存账号、密钥和图片归属",
+				"accounts_file_path":     s.store.path("accounts.json"),
+				"auth_keys_file_path":    s.store.path("auth_keys.json"),
+				"image_owners_file_path": s.store.path("image_owners.json"),
+			},
+			"health": map[string]any{"status": "healthy", "backend": "postgresql"},
+		})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"backend": map[string]any{"type": "json", "description": "本地 JSON 文件存储", "accounts_file_path": s.store.path("accounts.json"), "auth_keys_file_path": s.store.path("auth_keys.json"), "image_owners_file_path": s.store.path("image_owners.json")}, "health": map[string]any{"status": "healthy", "backend": "json"}})
 }
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
-	transport := "curl-impersonate"
-	bin := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_CURL_IMPERSONATE_BIN"))
-	if bin == "" {
-		if p, err := s.ensureCurlImpersonateBinary(); err == nil {
-			bin = p
-		}
-	}
+	transport := normalizeUpstreamTransport(s.cfg.UpstreamTransport)
+	bin := ""
 	binOK := false
-	if bin != "" {
-		if st, err := os.Stat(bin); err == nil && !st.IsDir() && st.Mode()&0111 != 0 {
-			binOK = true
+	if transport == "curl-impersonate" {
+		bin = strings.TrimSpace(os.Getenv("GPT2API_IMAGE_CURL_IMPERSONATE_BIN"))
+		if bin == "" {
+			if p, err := s.ensureCurlImpersonateBinary(); err == nil {
+				bin = p
+			}
+		}
+		if bin != "" {
+			if st, err := os.Stat(bin); err == nil && !st.IsDir() && st.Mode()&0111 != 0 {
+				binOK = true
+			}
 		}
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "version": s.version(), "storage": "json", "transport": transport, "curl_impersonate_bin": bin, "curl_impersonate_executable": binOK, "accounts": len(s.store.LoadAccounts()), "tasks": len(s.store.LoadTasks())})
+	storage := "json"
+	taskCount := len(s.store.LoadTasks())
+	body := map[string]any{"ok": true, "version": s.version(), "storage": storage, "transport": transport, "image_route_strategy": normalizeImageRouteStrategy(s.cfg.ImageRouteStrategy), "curl_impersonate_bin": bin, "curl_impersonate_executable": binOK, "accounts": len(s.store.LoadAccounts()), "tasks": taskCount}
+	if s.taskStore != nil {
+		storage = "postgresql"
+		body["storage"] = storage
+		if count, err := s.taskStore.CountTasks(r.Context()); err == nil {
+			body["tasks"] = count
+		} else {
+			body["tasks"] = nil
+			body["tasks_error"] = err.Error()
+		}
+	}
+	writeJSON(w, 200, body)
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {

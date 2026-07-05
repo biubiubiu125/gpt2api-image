@@ -31,6 +31,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
     log_levels: Array.isArray(config.log_levels) ? config.log_levels : [],
     proxy: typeof config.proxy === "string" ? config.proxy : "",
+    image_route_strategy: String(config.image_route_strategy || "web_first"),
     base_url: typeof config.base_url === "string" ? config.base_url : "",
     global_system_prompt: String(config.global_system_prompt || ""),
     sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
@@ -108,6 +109,7 @@ type SettingsStore = {
   setAutoRemoveRateLimitedAccounts: (value: boolean) => void;
   setLogLevel: (level: string, enabled: boolean) => void;
   setProxy: (value: string) => void;
+  setImageRouteStrategy: (value: string) => void;
   setBaseUrl: (value: string) => void;
   setGlobalSystemPrompt: (value: string) => void;
   setSensitiveWordsText: (value: string) => void;
@@ -191,6 +193,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
       auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
       proxy: String(config.proxy || "").trim(),
+      image_route_strategy: String(config.image_route_strategy || "web_first").trim(),
       base_url: String(config.base_url || "").trim(),
       global_system_prompt: String(config.global_system_prompt || "").trim(),
       sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
@@ -258,6 +261,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
   setProxy: (value) => {
     set((state) => state.config ? { config: { ...state.config, proxy: value }, isDirty: true } : {});
+  },
+  setImageRouteStrategy: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_route_strategy: value }, isDirty: true } : {});
   },
   setBaseUrl: (value) => {
     set((state) => state.config ? { config: { ...state.config, base_url: value }, isDirty: true } : {});

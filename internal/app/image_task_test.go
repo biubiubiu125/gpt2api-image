@@ -855,6 +855,104 @@ func TestUnsafeDefaultAuthKeyRejected(t *testing.T) {
 	}
 }
 
+func TestUpstreamTransportTLSClientDoesNotRequireCurl(t *testing.T) {
+	called := false
+	client, err := NewUpstreamClientForAccountWithTransport(Account{AccessToken: "token"}, "", func() (string, error) {
+		called = true
+		return "", errors.New("curl should not be used")
+	}, "tls-client")
+	if err != nil {
+		t.Fatalf("new tls-client upstream client: %v", err)
+	}
+	if client == nil {
+		t.Fatalf("client is nil")
+	}
+	if called {
+		t.Fatalf("tls-client transport should not request curl-impersonate binary")
+	}
+}
+
+func TestSystemStatusAndCORSUseConfiguredRuntime(t *testing.T) {
+	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "")
+	t.Setenv("GPT2API_IMAGE_DATABASE_URL", "")
+	t.Setenv("GPT2API_IMAGE_BASE_URL", "")
+	root := t.TempDir()
+	raw := []byte(`{"auth-key":"test","upstream_transport":"tls-client","cors_allowed_origins":["https://allowed.example"]}`)
+	if err := os.WriteFile(filepath.Join(root, "config.json"), raw, 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	s, err := newServer(root, false)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/settings", nil)
+	req.Header.Set("Origin", "https://allowed.example")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("options status = %d, want 204", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://allowed.example" {
+		t.Fatalf("allow origin = %q, want configured origin", got)
+	}
+
+	req = httptest.NewRequest(http.MethodOptions, "/api/settings", nil)
+	req.Header.Set("Origin", "https://blocked.example")
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("blocked origin got allow header %q", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/system/status", nil)
+	req.Header.Set("Authorization", "Bearer test")
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("system status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if body["transport"] != "tls-client" {
+		t.Fatalf("transport = %#v, want tls-client", body["transport"])
+	}
+	if body["storage"] != "json" {
+		t.Fatalf("storage = %#v, want json", body["storage"])
+	}
+	if body["curl_impersonate_bin"] != "" || body["curl_impersonate_executable"] != false {
+		t.Fatalf("tls status should not resolve curl binary: %#v", body)
+	}
+}
+
+func TestCallLogsHidePromptByDefaultAndRedactSecrets(t *testing.T) {
+	s := &Server{
+		cfg:        Config{},
+		logSvc:     newLogService(t.TempDir()),
+		callStarts: map[string]time.Time{},
+	}
+	callID := s.logCallStart(&Identity{ID: "svc", Role: "admin"}, "/v1/images/generations", "gpt-image-2", "文生图", "private prompt")
+	s.logCallFailure(callID, "/v1/images/generations", "gpt-image-2", "文生图", errors.New(`access_token: abc123 Bearer xyz789 password=secret {"refresh_token":"rrr456"}`), nil)
+
+	items := s.logSvc.listFiltered("call", "", "", "", "", "", "", 10)
+	if len(items) != 2 {
+		t.Fatalf("logs len = %d, want 2", len(items))
+	}
+	for _, item := range items {
+		detail, _ := item["detail"].(map[string]any)
+		if _, ok := detail["request_text"]; ok {
+			t.Fatalf("request_text should be disabled by default: %#v", detail)
+		}
+		if errText := strAny(detail["error"], ""); errText != "" {
+			if strings.Contains(errText, "abc123") || strings.Contains(errText, "xyz789") || strings.Contains(errText, "secret") || strings.Contains(errText, "rrr456") {
+				t.Fatalf("error was not redacted: %q", errText)
+			}
+		}
+	}
+}
+
 func TestV1ModelsImageOnly(t *testing.T) {
 	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "")
 	t.Setenv("GPT2API_IMAGE_DATABASE_URL", "")

@@ -16,7 +16,11 @@
     "info",
     "warning"
   ],
+  "log_request_text": false,
+  "cors_allowed_origins": [],
   "proxy": "",
+  "upstream_transport": "tls-client",
+  "image_route_strategy": "web_first",
   "base_url": "",
   "sensitive_words": [],
   "global_system_prompt": "",

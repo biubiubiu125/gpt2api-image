@@ -151,9 +151,7 @@ func (s *PGTaskStore) CreateTask(ctx context.Context, task DBImageTask) (DBImage
 	if task.N > 4 {
 		task.N = 4
 	}
-	if task.Model == "" {
-		task.Model = "gpt-image-2"
-	}
+	task.Model = normalizeImageModel(task.Model)
 	if task.ResponseFormat == "" {
 		task.ResponseFormat = "url"
 	}
@@ -203,6 +201,12 @@ func (s *PGTaskStore) GetTask(ctx context.Context, id string, identity Identity)
 	}
 	row := s.db.QueryRowContext(ctx, query, args...)
 	return scanDBTask(row)
+}
+
+func (s *PGTaskStore) CountTasks(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM image_tasks_v3`).Scan(&count)
+	return count, err
 }
 
 func (s *PGTaskStore) ListTasks(ctx context.Context, identity Identity, ids []string) ([]DBImageTask, []string, error) {
@@ -651,7 +655,7 @@ func (t DBImageTask) Public() ImageTask {
 		OwnerID:      t.OwnerID,
 		Status:       t.Status,
 		Mode:         t.Mode,
-		Model:        t.Model,
+		Model:        normalizeImageModel(t.Model),
 		Size:         t.Size,
 		Resolution:   t.Resolution,
 		CreatedAt:    t.CreatedAt,

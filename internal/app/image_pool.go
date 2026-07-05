@@ -93,6 +93,33 @@ func (s *Server) generateImageWithPool(ctx context.Context, prompt, model, size,
 }
 
 func (s *Server) generateImageWithPoolScoped(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, scope *imageAccountAttemptScope) ([]upstreamImageResult, error) {
+	model = normalizeImageModel(model)
+	routes := s.imageRoutePlan()
+	var lastErr error
+	for idx, route := range routes {
+		routeScope := scope
+		if idx > 0 {
+			routeScope = newImageAccountAttemptScope(maxImageAccountFallbackAttempts)
+		}
+		routeModel := internalImageModelForRoute(model, route)
+		traceLogf(ctx, "├─ image route %s public_model=%s internal_model=%s", route, model, routeModel)
+		items, err := s.generateImageWithPoolScopedRoute(ctx, prompt, routeModel, size, resolution, refs, routeScope)
+		if err == nil {
+			return items, nil
+		}
+		lastErr = err
+		traceLogf(ctx, "│  └─ image route %s failed error=%v", route, err)
+		if !shouldTryNextImageRoute(err, ctx.Err()) {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no image route configured")
+	}
+	return nil, lastErr
+}
+
+func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, scope *imageAccountAttemptScope) ([]upstreamImageResult, error) {
 	if scope == nil {
 		scope = newImageAccountAttemptScope(maxImageAccountFallbackAttempts)
 	}

@@ -116,6 +116,7 @@ func (s *Server) runDBImageTask(parent context.Context, workerID string, ttl tim
 		endpoint = "/api/image-tasks/edits"
 		action = "async image edit"
 	}
+	task.Model = normalizeImageModel(task.Model)
 	callID := s.logCallStart(identity, endpoint, task.Model, action, task.Prompt)
 	if timeout <= 0 {
 		err := errors.New("image task timed out")

@@ -1,5 +1,5 @@
 "use client";
-import { ArrowUp, Check, ChevronDown, CornerDownRight, ImagePlus, Infinity as InfinityIcon, X } from "lucide-react";
+import { ArrowUp, Check, ChevronDown, CornerDownRight, Cpu, ImagePlus, Infinity as InfinityIcon, X } from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
@@ -35,6 +35,11 @@ const RESOLUTION_OPTIONS: ResolutionOption[] = [
   { value: "4k", label: "4K", desc: "尽量超清" },
 ];
 
+function imageModelLabel(model: string) {
+  const value = model.trim();
+  return value || "gpt-image-2";
+}
+
 const TEXTAREA_MIN_HEIGHT = 96;
 const TEXTAREA_MAX_HEIGHT = 360;
 
@@ -46,6 +51,7 @@ type ReplyTarget = {
 type ImageComposerProps = {
   prompt: string;
   imageCount: string;
+  imageModel: string;
   imageSize: string;
   imageResolution: string;
   canUseHighResolution: boolean;
@@ -69,6 +75,7 @@ type ImageComposerProps = {
 export function ImageComposer({
   prompt,
   imageCount,
+  imageModel,
   imageSize,
   imageResolution,
   canUseHighResolution,
@@ -110,6 +117,7 @@ export function ImageComposer({
   );
   const selectedSize = SIZE_OPTIONS.find((option) => option.value === imageSize) ?? SIZE_OPTIONS[0];
   const selectedResolution = RESOLUTION_OPTIONS.find((option) => option.value === imageResolution) ?? RESOLUTION_OPTIONS[0];
+  const selectedModel = imageModel || "gpt-image-2";
   const parsedCount = Math.max(1, Math.min(8, Number(imageCount) || 1));
   const isResolutionDisabled = (value: string) => !canUseHighResolution && (value === "2k" || value === "4k");
 
@@ -391,6 +399,11 @@ export function ImageComposer({
                     ) : (
                       <span className="font-data tabular-nums text-stone-900">{availableQuota}</span>
                     )}
+                  </span>
+                  <span className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-full bg-stone-100 px-3 text-[12px] font-medium text-stone-700 sm:h-10 sm:gap-2 sm:px-4 sm:text-[13px]">
+                    <Cpu className="size-3.5 shrink-0 opacity-70" />
+                    <span className="hidden text-stone-500 sm:inline">模型</span>
+                    <span className="font-data tabular-nums">{imageModelLabel(selectedModel)}</span>
                   </span>
                   <div className="relative shrink-0">
                     <button

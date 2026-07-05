@@ -102,8 +102,8 @@ func defaultRegisterConfig() RegisterConfig {
 		},
 		Logs: []RegisterLog{},
 		Executor: map[string]any{
-			"status":  "pending_migration",
-			"message": "Go 版注册执行器尚未接入；配置、状态和接口已保留。",
+			"status":  "not_configured",
+			"message": "注册执行器未配置；配置 GPT2API_IMAGE_REGISTER_EXECUTOR_URL 后可接入独立执行器。",
 		},
 	}
 }

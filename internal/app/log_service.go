@@ -4,10 +4,16 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+)
+
+var (
+	logSecretPattern = regexp.MustCompile(`(?i)(access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|password|api[_-]?key|auth[_-]?key|register[_-]?internal[_-]?key)\s*["']?\s*[:=]\s*["']?[^"',\s}]+`)
+	logBearerPattern = regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+`)
 )
 
 type logService struct {
@@ -58,8 +64,8 @@ func (s *Server) logCallStart(id *Identity, endpoint, model, action, requestText
 		detail["role"] = id.Role
 		detail["name"] = id.Name
 	}
-	if strings.TrimSpace(requestText) != "" {
-		detail["request_text"] = truncateText(requestText, 500)
+	if s.cfg.LogRequestText && strings.TrimSpace(requestText) != "" {
+		detail["request_text"] = truncateText(sanitizeLogText(requestText), 500)
 	}
 	s.logSvc.add("call", action+"开始", detail)
 	return callID
@@ -82,12 +88,26 @@ func (s *Server) logCallFailure(callID, endpoint, model, action string, err erro
 		detail["duration_ms"] = duration
 	}
 	if err != nil {
-		detail["error"] = err.Error()
+		detail["error"] = sanitizeLogText(err.Error())
 	}
 	for k, v := range extra {
 		detail[k] = v
 	}
 	s.logSvc.add("call", action+"失败", detail)
+}
+
+func sanitizeLogText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	value = logBearerPattern.ReplaceAllString(value, "Bearer ***")
+	return logSecretPattern.ReplaceAllStringFunc(value, func(match string) string {
+		if idx := strings.IndexAny(match, ":="); idx >= 0 {
+			return strings.TrimSpace(match[:idx]) + "=***"
+		}
+		return "***"
+	})
 }
 
 func (s *Server) callDurationMS(callID string) int64 {

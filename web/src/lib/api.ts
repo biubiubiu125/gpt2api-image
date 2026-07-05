@@ -2,7 +2,7 @@ import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
-export type ImageModel = "gpt-image-2" | "codex-gpt-image-2";
+export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 export type AccountTier = "free" | "premium";
 
@@ -66,6 +66,7 @@ type AccountUpdateResponse = {
 
 export type SettingsConfig = {
   proxy: string;
+  image_route_strategy?: string;
   base_url?: string;
   global_system_prompt?: string;
   sensitive_words?: string[];
@@ -552,6 +553,16 @@ export async function fetchUserKeys() {
 
 export async function fetchMyIdentity() {
   return httpRequest<{ identity: AuthIdentity }>("/api/auth/me");
+}
+
+export type ImageModelListItem = {
+  id: ImageModel;
+  object?: string;
+  owned_by?: string;
+};
+
+export async function fetchImageModels() {
+  return httpRequest<{ object?: string; data: ImageModelListItem[] }>("/v1/models");
 }
 
 export type UserKeyCreatePayload = {

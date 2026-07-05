@@ -87,9 +87,10 @@ func (p *accountPool) pickTokenExcluding(accounts []Account, needCodex bool, cod
 		if a.ImageQuotaUnknown || a.Quota <= 0 {
 			continue
 		}
+		sourceType := strings.ToLower(strings.TrimSpace(a.SourceType))
 		if needCodex {
 			accountType := strings.ToLower(a.Type)
-			if strings.ToLower(a.SourceType) != "codex" {
+			if sourceType != "codex" {
 				continue
 			}
 			if codexPlanType != "" {
@@ -99,6 +100,8 @@ func (p *accountPool) pickTokenExcluding(accounts []Account, needCodex bool, cod
 			} else if !premium[accountType] {
 				continue
 			}
+		} else if sourceType == "codex" {
+			continue
 		}
 		// 检查并发槽
 		if p.inflight[a.AccessToken] >= maxConc {

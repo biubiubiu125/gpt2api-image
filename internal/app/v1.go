@@ -32,6 +32,7 @@ func (s *Server) handleV1Models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }
 func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identity, prompt, model, size, resolution, responseFormat string, n int, isEdit bool, inputs [][]byte) {
+	model = normalizeImageModel(model)
 	action := "文生图"
 	endpoint := "/v1/images/generations"
 	if isEdit {
@@ -119,9 +120,7 @@ func (s *Server) handleV1ImagesGenerations(w http.ResponseWriter, r *http.Reques
 		writeErr(w, 400, "prompt is required")
 		return
 	}
-	if b.Model == "" {
-		b.Model = "gpt-image-2"
-	}
+	b.Model = normalizeImageModel(b.Model)
 	if s.enqueueV1ImageTask(w, r, id, imageTaskCreateRequest{
 		ClientTaskID:   b.ClientTaskID,
 		Mode:           "generate",
@@ -153,10 +152,7 @@ func (s *Server) handleV1ImagesEdits(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "prompt is required")
 		return
 	}
-	model := r.FormValue("model")
-	if model == "" {
-		model = "gpt-image-2"
-	}
+	model := normalizeImageModel(r.FormValue("model"))
 	n := 1
 	fmt.Sscanf(r.FormValue("n"), "%d", &n)
 	inputs := [][]byte{}
@@ -226,7 +222,8 @@ func (s *Server) handleV1ResponsesImageOnly(w http.ResponseWriter, r *http.Reque
 		writeErr(w, 404, "text responses API is disabled in gpt2api-image")
 		return
 	}
-	model := strAny(b["model"], "gpt-image-2")
+	model := normalizeImageModel(strAny(b["model"], "gpt-image-2"))
+	b["model"] = model
 	requestText := extractPrompt(b)
 	callID := s.logCallStart(id, "/v1/responses", model, "Responses image", requestText)
 	s.handleV1ResponseImage(w, r, id, b, callID)
@@ -355,10 +352,8 @@ func (s *Server) handleV1ChatCompletions(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, 200, map[string]any{"id": "chatcmpl-" + randID(8), "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": chatCompletionMessage(cleanContent, toolCalls), "finish_reason": chatCompletionFinishReason(toolCalls)}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}})
 }
 func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Request, id *Identity, b map[string]any) {
-	model := strAny(b["model"], "gpt-image-2")
-	if strings.TrimSpace(model) == "" || !isSupportedImageModel(model) {
-		model = "gpt-image-2"
-	}
+	model := normalizeImageModel(strAny(b["model"], "gpt-image-2"))
+	b["model"] = model
 	prompt := extractChatPrompt(b)
 	if strings.TrimSpace(prompt) == "" {
 		writeErr(w, 400, "prompt is required")
@@ -459,6 +454,10 @@ func (s *Server) handleV1Responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := strAny(b["model"], "auto")
+	if hasResponseImageGenerationTool(b) {
+		model = normalizeImageModel(strAny(b["model"], "gpt-image-2"))
+		b["model"] = model
+	}
 	requestText := extractPrompt(b)
 	callID := s.logCallStart(id, "/v1/responses", model, "Responses", requestText)
 	if hasResponseImageGenerationTool(b) {
@@ -570,10 +569,8 @@ func (s *Server) handleV1Messages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"id": "msg_" + randID(8), "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stopReason, "stop_sequence": nil, "usage": map[string]any{"input_tokens": approxTokens(requestText), "output_tokens": approxTokens(content)}})
 }
 func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, id *Identity, b map[string]any, callID string) {
-	model := strAny(b["model"], "gpt-image-2")
-	if strings.TrimSpace(model) == "" || !isSupportedImageModel(model) {
-		model = "gpt-image-2"
-	}
+	model := normalizeImageModel(strAny(b["model"], "gpt-image-2"))
+	b["model"] = model
 	prompt := extractResponsePrompt(b["input"])
 	if prompt == "" {
 		err := fmt.Errorf("input text is required")
@@ -846,6 +843,7 @@ func (s *Server) streamAnthropicEvents(w http.ResponseWriter, r *http.Request, i
 }
 
 func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *Identity, prompt, model, size, resolution string, n int, isEdit bool, inputs [][]byte) {
+	model = normalizeImageModel(model)
 	if n < 1 {
 		n = 1
 	}
@@ -1475,11 +1473,7 @@ func approxTokens(s string) int {
 }
 
 func isSupportedImageModel(model string) bool {
-	m := strings.ToLower(strings.TrimSpace(model))
-	if m == "gpt-image-2" || m == "codex-gpt-image-2" {
-		return true
-	}
-	return strings.HasSuffix(m, "-codex-gpt-image-2")
+	return isImageModelAlias(model)
 }
 
 func isImageChatRequest(b map[string]any) bool {

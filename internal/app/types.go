@@ -16,7 +16,11 @@ type Config struct {
 	AutoRemoveRateLimitedAccounts bool           `json:"auto_remove_rate_limited_accounts"`
 	AutoRemoveInvalidAccounts     bool           `json:"auto_remove_invalid_accounts"`
 	LogLevels                     []string       `json:"log_levels"`
+	LogRequestText                bool           `json:"log_request_text"`
+	CORSAllowedOrigins            []string       `json:"cors_allowed_origins"`
 	Proxy                         string         `json:"proxy"`
+	UpstreamTransport             string         `json:"upstream_transport"`
+	ImageRouteStrategy            string         `json:"image_route_strategy"`
 	BaseURL                       string         `json:"base_url"`
 	SensitiveWords                []string       `json:"sensitive_words"`
 	GlobalSystemPrompt            string         `json:"global_system_prompt"`

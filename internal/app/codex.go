@@ -17,7 +17,7 @@ const codexImageInstruction = "You are an image generation assistant."
 
 func isCodexImageRequest(model, resolution string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
-	return strings.Contains(m, "codex-gpt-image-2") || normalizeResolution(resolution) == "2k" || normalizeResolution(resolution) == "4k"
+	return m == "codex-gpt-image-2" || strings.HasSuffix(m, "-codex-gpt-image-2")
 }
 
 func codexPlanTypeFromModel(model string) string {

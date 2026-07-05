@@ -23,6 +23,7 @@ import {
   cancelImageTasks,
   fetchImageTasks,
   fetchMyIdentity,
+  type ImageModel,
   type ImageTask,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
@@ -412,6 +413,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const [imagePrompt, setImagePrompt] = useState("");
   const [imageCount, setImageCount] = useState("1");
+  const imageModel: ImageModel = "gpt-image-2";
   const [imageSize, setImageSize] = useState("");
   const [imageResolution, setImageResolution] = useState("");
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
@@ -1513,7 +1515,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const draftTurn: ImageTurn = {
       id: turnId,
       prompt,
-      model: "gpt-image-2",
+      model: imageModel,
       mode: effectiveImageMode,
       referenceImages: effectiveImageMode === "edit" ? referenceImages : [],
       count: parsedCount,
@@ -1694,6 +1696,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             <ImageComposer
               prompt={imagePrompt}
               imageCount={imageCount}
+              imageModel={imageModel}
               imageSize={imageSize}
               imageResolution={imageResolution}
               canUseHighResolution={canUseHighResolution}

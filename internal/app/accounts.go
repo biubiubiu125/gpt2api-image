@@ -48,6 +48,10 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "tokens or account_records is required")
 			return
 		}
+		if msg := validateAccountRecordsForSource(tokset, source, s.store.LoadAccounts()); msg != "" {
+			writeErr(w, 400, msg)
+			return
+		}
 		added, skipped := 0, 0
 		_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
 			existing := map[string]int{}
@@ -55,7 +59,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 				existing[a.AccessToken] = i
 			}
 			for token, rec := range tokset {
-				a := accountFromRecord(token, source, rec)
+				a := accountFromRecord(token, accountRecordSource(source, rec), rec)
 				if idx, ok := existing[token]; ok {
 					cur := accounts[idx]
 					mergeAccount(&cur, a)
@@ -105,6 +109,36 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func accountRecordSource(defaultSource string, rec map[string]any) string {
+	source := strings.ToLower(strings.TrimSpace(strAny(rec["source_type"], strAny(rec["sourceType"], defaultSource))))
+	if source != "web" && source != "codex" {
+		return "web"
+	}
+	return source
+}
+
+func accountRecordRefreshToken(rec map[string]any) string {
+	return strings.TrimSpace(strAny(rec["refresh_token"], strAny(rec["refreshToken"], "")))
+}
+
+func validateAccountRecordsForSource(records map[string]map[string]any, defaultSource string, existing []Account) string {
+	existingRefresh := map[string]bool{}
+	for _, account := range existing {
+		if account.RefreshToken != nil && strings.TrimSpace(*account.RefreshToken) != "" {
+			existingRefresh[account.AccessToken] = true
+		}
+	}
+	for token, rec := range records {
+		if accountRecordSource(defaultSource, rec) != "codex" {
+			continue
+		}
+		if accountRecordRefreshToken(rec) == "" && !existingRefresh[token] {
+			return "codex account requires refresh_token"
+		}
+	}
+	return ""
+}
+
 func accountFromRecord(token, source string, rec map[string]any) Account {
 	typ := strings.TrimSpace(strAny(rec["type"], strAny(rec["plan_type"], "free")))
 	if typ == "" {
@@ -129,10 +163,10 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 	if v := strings.TrimSpace(strAny(rec["user_id"], "")); v != "" {
 		a.UserID = &v
 	}
-	if v := strings.TrimSpace(strAny(rec["refresh_token"], "")); v != "" {
+	if v := accountRecordRefreshToken(rec); v != "" {
 		a.RefreshToken = &v
 	}
-	if v := strings.TrimSpace(strAny(rec["id_token"], "")); v != "" {
+	if v := strings.TrimSpace(strAny(rec["id_token"], strAny(rec["idToken"], ""))); v != "" {
 		a.IDToken = &v
 	}
 	if v := strings.TrimSpace(strAny(rec["password"], "")); v != "" {
@@ -141,7 +175,7 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 	if v := strings.TrimSpace(strAny(rec["account_id"], strAny(rec["chatgpt_account_id"], ""))); v != "" {
 		a.AccountID = &v
 	}
-	if v := strings.TrimSpace(strAny(rec["client_id"], "")); v != "" {
+	if v := strings.TrimSpace(strAny(rec["client_id"], strAny(rec["clientId"], ""))); v != "" {
 		a.ClientID = &v
 	}
 	if v := strings.TrimSpace(strAny(rec["default_model_slug"], "")); v != "" {
@@ -276,8 +310,12 @@ func mergeAccount(dst *Account, src Account) {
 
 func mergeRefreshedAccountInfo(dst *Account, src Account) {
 	accessToken := dst.AccessToken
+	sourceType := dst.SourceType
 	mergeAccount(dst, src)
 	dst.AccessToken = accessToken
+	if strings.TrimSpace(sourceType) != "" {
+		dst.SourceType = sourceType
+	}
 	dst.ImageQuotaUnknown = src.ImageQuotaUnknown
 	dst.Quota = src.Quota
 	dst.LimitsProgress = src.LimitsProgress
@@ -302,13 +340,21 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (i
 			continue
 		}
 		ctx, cancel := context.WithTimeout(parent, 45*time.Second)
-		client, err := NewUpstreamClientForAccount(a, s.cfg.Proxy, s.ensureCurlImpersonateBinary)
+		account := a
+		var err error
+		if strings.EqualFold(account.SourceType, "codex") && account.RefreshToken != nil && strings.TrimSpace(*account.RefreshToken) != "" {
+			account, err = s.refreshOAuthAccount(ctx, account.AccessToken)
+		}
+		var client *UpstreamClient
+		if err == nil {
+			client, err = NewUpstreamClientForAccount(account, s.cfg.Proxy, s.ensureCurlImpersonateBinary)
+		}
 		if err == nil {
 			var info Account
 			info, err = client.GetUserInfo(ctx)
 			if err == nil {
-				mergeRefreshedAccountInfo(&a, info)
-				updates[a.AccessToken] = a
+				mergeRefreshedAccountInfo(&account, info)
+				updates[account.AccessToken] = account
 				refreshed++
 			}
 		}

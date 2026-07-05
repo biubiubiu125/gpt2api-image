@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"time"
@@ -54,7 +55,8 @@ func (s *Server) refreshOAuthAccount(ctx context.Context, oldToken string) (Acco
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return Account{}, fmt.Errorf("oauth refresh failed: status=%d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return Account{}, fmt.Errorf("oauth refresh failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var payload map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {

@@ -32,6 +32,9 @@ func isInvalidTokenErrorText(err error) bool {
 		strings.Contains(text, "http 401") ||
 		strings.Contains(text, "token_invalidated") ||
 		strings.Contains(text, "token_revoked") ||
+		strings.Contains(text, "invalid_grant") ||
+		strings.Contains(text, "refresh_token not found") ||
+		(strings.Contains(text, "refresh token") && (strings.Contains(text, "invalid") || strings.Contains(text, "expired") || strings.Contains(text, "revoked"))) ||
 		strings.Contains(text, "invalidated oauth token") ||
 		strings.Contains(text, "authentication token has been invalidated")
 }
@@ -42,7 +45,16 @@ func isUpstreamBlockErrorText(err error) bool {
 	}
 	text := strings.ToLower(err.Error())
 	return (strings.Contains(text, "status=403") || strings.Contains(text, "http 403")) &&
-		(strings.Contains(text, "<html") || strings.Contains(text, "<body") || strings.Contains(text, "meta http-equiv") || strings.Contains(text, "something seems to have gone wrong"))
+		(strings.Contains(text, "<html") ||
+			strings.Contains(text, "<body") ||
+			strings.Contains(text, "meta http-equiv") ||
+			strings.Contains(text, "something seems to have gone wrong") ||
+			strings.Contains(text, "cloudflare") ||
+			strings.Contains(text, "just a moment") ||
+			strings.Contains(text, "attention required") ||
+			strings.Contains(text, "cf-chl") ||
+			strings.Contains(text, "__cf_chl") ||
+			strings.Contains(text, "cf-browser-verification"))
 }
 
 func isTurnstileRequirementErrorText(err error) bool {

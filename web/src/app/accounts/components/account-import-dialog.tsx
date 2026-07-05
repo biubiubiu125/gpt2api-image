@@ -63,6 +63,18 @@ function getAccountAccessToken(value: unknown) {
   return typeof token === "string" ? token.trim() : "";
 }
 
+function getAccountRefreshToken(value: unknown) {
+  const payload = value as { refresh_token?: unknown; refreshToken?: unknown };
+  const token = payload?.refresh_token ?? payload?.refreshToken;
+  return typeof token === "string" ? token.trim() : "";
+}
+
+function getAccountSourceType(value: unknown): AccountSourceType | "" {
+  const payload = value as { source_type?: unknown; sourceType?: unknown };
+  const source = String(payload?.source_type ?? payload?.sourceType ?? "").toLowerCase().trim();
+  return source === "web" || source === "codex" ? source : "";
+}
+
 function readFileAsText(file: File) {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -141,15 +153,31 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   ) => {
     const normalizedTokens = tokens.map((item) => item.trim()).filter(Boolean);
     const normalizedRecords = accountRecords.filter((item) => getAccountAccessToken(item));
+    const effectiveSourceType = overrideSourceType ?? sourceType;
 
     if (normalizedTokens.length === 0 && normalizedRecords.length === 0) {
       toast.error("请先提供至少一个可用 Token");
       return;
     }
 
+    const recordTokens = new Set(normalizedRecords.map((item) => getAccountAccessToken(item)));
+    const tokenOnlyCount = normalizedTokens.filter((token) => !recordTokens.has(token)).length;
+    const missingCodexRefreshCount = normalizedRecords.filter((item) => {
+      const recordSource = getAccountSourceType(item) || effectiveSourceType;
+      return recordSource === "codex" && !getAccountRefreshToken(item);
+    }).length;
+    if (effectiveSourceType === "codex" && tokenOnlyCount > 0) {
+      toast.error("Codex account import requires account JSON with refresh_token");
+      return;
+    }
+    if (missingCodexRefreshCount > 0) {
+      toast.error(`Codex account JSON missing refresh_token: ${missingCodexRefreshCount}`);
+      return;
+    }
+
     setIsSubmitting(true);
     try {
-      const data = await createAccounts(normalizedTokens, overrideSourceType ?? sourceType, normalizedRecords);
+      const data = await createAccounts(normalizedTokens, effectiveSourceType, normalizedRecords);
       onImported(data.items);
       setOpen(false);
       resetState();
@@ -422,6 +450,35 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                 每个文件应为一个 JSON 对象。系统会保留 `access_token`、`refresh_token`、`id_token` 等凭据字段。
               </div>
             </div>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              {([
+                { value: "web", label: "Web", desc: "普通 ChatGPT Web 画图" },
+                { value: "codex", label: "Codex", desc: "需账号 JSON 包含 refresh_token" },
+              ] as const).map((item) => {
+                const active = sourceType === item.value;
+                return (
+                  <button
+                    key={item.value}
+                    type="button"
+                    onClick={() => setSourceType(item.value)}
+                    className={cn(
+                      "rounded-xl border p-3 text-left transition",
+                      active
+                        ? "border-stone-900 bg-stone-950 text-white"
+                        : "border-stone-200 bg-white text-stone-700 hover:border-stone-300",
+                    )}
+                  >
+                    <div className="flex items-center gap-2 text-sm font-semibold">
+                      {item.value === "codex" ? <Bot className="size-4" /> : <KeyRound className="size-4" />}
+                      {item.label}
+                    </div>
+                    <div className={cn("mt-1 text-xs", active ? "text-white/65" : "text-stone-500")}>
+                      {item.desc}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
             <Button
               type="button"
               className="mt-4 rounded-xl bg-stone-950 text-white hover:bg-stone-800"
@@ -584,7 +641,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                 void submitTokens(
                   pendingJsonImport?.tokens ?? [],
                   "账号 JSON 导入完成",
-                  "web",
+                  sourceType,
                   pendingJsonImport?.records ?? [],
                 )
               }

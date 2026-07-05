@@ -2004,7 +2004,11 @@ func (s *Server) upstreamClientForImageAccount(model, resolution string, account
 		}
 		if leased {
 			defer s.releaseImageAccountLease(ctx, leaseID)
-			if refreshed, err := s.refreshOAuthAccount(ctx, account.AccessToken); err == nil && refreshed.AccessToken != "" {
+			refreshed, err := s.refreshOAuthAccount(ctx, account.AccessToken)
+			if err != nil {
+				return nil, account, err
+			}
+			if refreshed.AccessToken != "" {
 				account = refreshed
 			}
 		} else {

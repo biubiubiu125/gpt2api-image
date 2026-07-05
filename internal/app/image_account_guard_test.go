@@ -1,7 +1,9 @@
 package app
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -110,6 +112,9 @@ func TestImageFailureDeletesInactiveTemporaryAndTurnstileAccounts(t *testing.T) 
 		{name: "temporary", err: errors.New("image generation SSE timed out (600s)")},
 		{name: "turnstile", err: errors.New("turnstile required")},
 		{name: "cloudflare", err: errors.New("GET failed: status=403 body=<html>something seems to have gone wrong</html>")},
+		{name: "cloudflare marker", err: errors.New("GET failed: status=403 body=cloudflare cf-chl just a moment")},
+		{name: "oauth invalid grant", err: errors.New(`oauth refresh failed: status=400 body={"error":"invalid_grant"}`)},
+		{name: "oauth missing refresh token", err: errors.New("refresh_token not found")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newImageAccountGuardTestServer(t)
@@ -121,6 +126,27 @@ func TestImageFailureDeletesInactiveTemporaryAndTurnstileAccounts(t *testing.T) 
 				t.Fatalf("inactive abnormal account should be removed, got %#v", got)
 			}
 		})
+	}
+}
+
+func TestCodexSetupInvalidRefreshTokenRetriesAndDeletesAccounts(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	if err := s.store.SaveAccounts([]Account{
+		{AccessToken: "bad-high", SourceType: "codex", Type: "plus", Status: accountStatusNormal, Quota: 50},
+		{AccessToken: "bad-low", SourceType: "codex", Type: "plus", Status: accountStatusNormal, Quota: 40},
+	}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+
+	_, err := s.generateImageWithPool(context.Background(), "prompt", "codex-gpt-image-2", "1:1", "", nil)
+	if err == nil {
+		t.Fatal("expected setup error")
+	}
+	if !strings.Contains(err.Error(), "refresh_token not found") {
+		t.Fatalf("error = %q, want refresh token setup error", err.Error())
+	}
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("codex setup should retry and delete invalid accounts, got %#v", got)
 	}
 }
 
@@ -148,16 +174,77 @@ func TestRegisterRemovalDeletesUnknownQuotaAccounts(t *testing.T) {
 	}
 }
 
+func TestCodexAccountImportRequiresRefreshToken(t *testing.T) {
+	records := map[string]map[string]any{
+		"tok": {"access_token": "tok"},
+	}
+	if msg := validateAccountRecordsForSource(records, "codex", nil); msg == "" {
+		t.Fatal("expected codex token-only import to be rejected")
+	}
+
+	records["tok"]["refreshToken"] = "refresh-token"
+	if msg := validateAccountRecordsForSource(records, "codex", nil); msg != "" {
+		t.Fatalf("codex import with refreshToken rejected: %s", msg)
+	}
+
+	refreshToken := "existing-refresh"
+	if msg := validateAccountRecordsForSource(map[string]map[string]any{
+		"tok": {"access_token": "tok"},
+	}, "codex", []Account{{AccessToken: "tok", RefreshToken: &refreshToken}}); msg != "" {
+		t.Fatalf("existing codex refresh token should satisfy update: %s", msg)
+	}
+}
+
+func TestInternalRegisterAccountRecordsUseSharedCodexValidation(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	added, skipped, msg := s.addAccountRecords([]map[string]any{
+		{"accessToken": "tok", "sourceType": "codex", "quota": 10},
+	})
+	if msg == "" {
+		t.Fatal("expected internal codex account without refresh token to be rejected")
+	}
+	if added != 0 || skipped != 0 {
+		t.Fatalf("added=%d skipped=%d, want 0/0", added, skipped)
+	}
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("rejected codex account should not be stored, got %#v", got)
+	}
+
+	added, skipped, msg = s.addAccountRecords([]map[string]any{
+		{"accessToken": "tok", "sourceType": "codex", "refreshToken": "refresh-token", "quota": 10},
+	})
+	if msg != "" {
+		t.Fatalf("internal codex account with refreshToken rejected: %s", msg)
+	}
+	if added != 1 || skipped != 0 {
+		t.Fatalf("added=%d skipped=%d, want 1/0", added, skipped)
+	}
+	accounts := s.store.LoadAccounts()
+	if len(accounts) != 1 {
+		t.Fatalf("accounts len=%d, want 1", len(accounts))
+	}
+	if accounts[0].SourceType != "codex" {
+		t.Fatalf("source type = %q, want codex", accounts[0].SourceType)
+	}
+	if accounts[0].RefreshToken == nil || *accounts[0].RefreshToken != "refresh-token" {
+		t.Fatalf("refresh token not preserved: %#v", accounts[0].RefreshToken)
+	}
+}
+
 func TestMergeRefreshedAccountInfoOverridesStaleKnownQuota(t *testing.T) {
-	account := Account{AccessToken: "tok", Status: accountStatusNormal, Quota: 100, ImageQuotaUnknown: false}
+	account := Account{AccessToken: "tok", SourceType: "codex", Status: accountStatusNormal, Quota: 100, ImageQuotaUnknown: false}
 	mergeRefreshedAccountInfo(&account, Account{
 		AccessToken:       "new-token-ignored",
+		SourceType:        "web",
 		Status:            accountStatusNormal,
 		Quota:             0,
 		ImageQuotaUnknown: true,
 	})
 	if account.AccessToken != "tok" {
 		t.Fatalf("refresh merge should keep stored token, got %q", account.AccessToken)
+	}
+	if account.SourceType != "codex" {
+		t.Fatalf("refresh merge should keep codex source type, got %q", account.SourceType)
 	}
 	if !account.ImageQuotaUnknown || account.Quota != 0 {
 		t.Fatalf("refresh merge should overwrite stale quota with unknown state: %#v", account)

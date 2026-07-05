@@ -41,7 +41,11 @@ func (s *Server) handleInternalRegisterAccounts(w http.ResponseWriter, r *http.R
 		if !readBody(w, r, &body) {
 			return
 		}
-		added, skipped := s.addAccountRecords(body.AccountRecords)
+		added, skipped, msg := s.addAccountRecords(body.AccountRecords)
+		if msg != "" {
+			writeErr(w, 400, msg)
+			return
+		}
 		if s.logSvc != nil {
 			s.logSvc.add("account", "注册机写入账号", map[string]any{"added": added, "skipped": skipped})
 		}
@@ -51,13 +55,16 @@ func (s *Server) handleInternalRegisterAccounts(w http.ResponseWriter, r *http.R
 	}
 }
 
-func (s *Server) addAccountRecords(records []map[string]any) (int, int) {
+func (s *Server) addAccountRecords(records []map[string]any) (int, int, string) {
 	tokset := map[string]map[string]any{}
 	for _, rec := range records {
 		t := strings.TrimSpace(strAny(rec["access_token"], strAny(rec["accessToken"], "")))
 		if t != "" {
 			tokset[t] = rec
 		}
+	}
+	if msg := validateAccountRecordsForSource(tokset, "web", s.store.LoadAccounts()); msg != "" {
+		return 0, 0, msg
 	}
 	added, skipped := 0, 0
 	_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
@@ -66,10 +73,7 @@ func (s *Server) addAccountRecords(records []map[string]any) (int, int) {
 			existing[a.AccessToken] = i
 		}
 		for token, rec := range tokset {
-			source := strings.ToLower(strings.TrimSpace(strAny(rec["source_type"], "web")))
-			if source != "web" && source != "codex" {
-				source = "web"
-			}
+			source := accountRecordSource("web", rec)
 			a := accountFromRecord(token, source, rec)
 			if idx, ok := existing[token]; ok {
 				cur := accounts[idx]
@@ -83,7 +87,7 @@ func (s *Server) addAccountRecords(records []map[string]any) (int, int) {
 		}
 		return accounts
 	})
-	return added, skipped
+	return added, skipped, ""
 }
 
 func (s *Server) handleInternalRegisterAccountsRefresh(w http.ResponseWriter, r *http.Request) {

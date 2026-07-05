@@ -128,8 +128,10 @@ func (s *Server) generateImageWithPoolScoped(ctx context.Context, prompt, model,
 				lastErr = err
 				continue
 			}
-			if lastErr != nil {
-				return nil, lastErr
+			lastErr = err
+			if shouldRetryImageAccount(err) {
+				traceLogf(ctx, "│  ├─ retry with another image account after setup error")
+				continue
 			}
 			return nil, err
 		}

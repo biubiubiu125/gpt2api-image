@@ -228,6 +228,29 @@ func TestCodexImageStreamReadErrorIsRetryable(t *testing.T) {
 	}
 }
 
+func TestCodexImageNestedResponseFailureKeepsRetryableCode(t *testing.T) {
+	client := &UpstreamClient{
+		token:           "access-token",
+		userAgent:       "test-agent",
+		secCHUA:         `"Microsoft Edge";v="143"`,
+		secCHUAMobile:   "?0",
+		secCHUAPlatform: `"Windows"`,
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			return upstreamTestResponse(200, `data: {"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"usage limit reached"}}}`+"\n\n"), nil
+		}),
+	}
+	_, err := client.GenerateCodexImage(context.Background(), "prompt", "codex-gpt-image-2", "1024x1024", nil, time.Second)
+	if err == nil {
+		t.Fatal("expected nested response failure")
+	}
+	if !strings.Contains(err.Error(), "rate_limit_exceeded") || !strings.Contains(err.Error(), "usage limit reached") {
+		t.Fatalf("error = %q, want nested code and message", err.Error())
+	}
+	if !shouldRetryImageAccount(err) {
+		t.Fatalf("nested codex response failure should be retryable: %v", err)
+	}
+}
+
 func TestAuthenticatedChatRequirementsSolvesTurnstileWithEmptySourceP(t *testing.T) {
 	dx := base64.StdEncoding.EncodeToString([]byte(`[[3,"ok"]]`))
 	client := &UpstreamClient{

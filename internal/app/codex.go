@@ -165,8 +165,7 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 		}
 		typ := strAny(event["type"], "")
 		if typ == "response.failed" || typ == "error" {
-			errObj, _ := event["error"].(map[string]any)
-			return nil, fmt.Errorf("codex image generation failed: %s", firstNonEmpty(strAny(errObj["message"], ""), strAny(event["message"], "")))
+			return nil, fmt.Errorf("codex image generation failed: %s", codexImageFailureMessage(event))
 		}
 		if typ == "response.output_item.done" {
 			if item, ok := event["item"].(map[string]any); ok && strAny(item["type"], "") == "image_generation_call" && strAny(item["result"], "") != "" {
@@ -221,6 +220,39 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 		return nil, errors.New("Codex image generation returned no image")
 	}
 	return results, nil
+}
+
+func codexImageFailureMessage(event map[string]any) string {
+	parts := []string{}
+	appendValue := func(key, value string) {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			parts = append(parts, key+"="+value)
+		}
+	}
+	appendError := func(errObj map[string]any) {
+		appendValue("code", strAny(errObj["code"], ""))
+		appendValue("type", strAny(errObj["type"], ""))
+		appendValue("message", strAny(errObj["message"], ""))
+	}
+	if errObj, ok := event["error"].(map[string]any); ok {
+		appendError(errObj)
+	} else {
+		appendValue("error", strAny(event["error"], ""))
+	}
+	if respObj, ok := event["response"].(map[string]any); ok {
+		appendValue("status", strAny(respObj["status"], ""))
+		if errObj, ok := respObj["error"].(map[string]any); ok {
+			appendError(errObj)
+		} else {
+			appendValue("response_error", strAny(respObj["error"], ""))
+		}
+	}
+	appendValue("message", strAny(event["message"], ""))
+	if len(parts) == 0 {
+		return "unknown codex image error"
+	}
+	return strings.Join(parts, " ")
 }
 
 func imageGenerationModelForTool(model string) string {

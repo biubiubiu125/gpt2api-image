@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const registerSecretPlaceholder = "********"
+
 type RegisterConfig struct {
 	Enabled                 bool                   `json:"enabled"`
 	Mail                    RegisterMailConfig     `json:"mail"`
@@ -199,8 +201,12 @@ func (s *Server) registerPoolMetrics() (int, int) {
 }
 
 func redactRegisterSecrets(cfg RegisterConfig) RegisterConfig {
+	if strings.TrimSpace(cfg.FixedPassword) != "" {
+		cfg.FixedPassword = registerSecretPlaceholder
+	}
 	for i := range cfg.Mail.Providers {
 		provider := cfg.Mail.Providers[i]
+		redactRegisterProviderSecrets(provider)
 		if strings.EqualFold(strAny(provider["type"], ""), "outlook_token") {
 			text := strAny(provider["mailboxes"], "")
 			provider["mailboxes"] = ""
@@ -209,6 +215,27 @@ func redactRegisterSecrets(cfg RegisterConfig) RegisterConfig {
 		}
 	}
 	return cfg
+}
+
+func redactRegisterProviderSecrets(provider map[string]any) {
+	for key, value := range provider {
+		if isRegisterSecretKey(key) && strings.TrimSpace(strAny(value, "")) != "" {
+			provider[key] = registerSecretPlaceholder
+		}
+	}
+}
+
+func isRegisterSecretKey(key string) bool {
+	k := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "-", "_"))
+	switch k {
+	case "api_key", "admin_password", "password", "token", "access_token", "refresh_token", "id_token",
+		"ddg_token", "cf_api_key", "client_secret", "private_key", "secret", "authorization":
+		return true
+	}
+	return strings.HasSuffix(k, "_token") ||
+		strings.HasSuffix(k, "_password") ||
+		strings.HasSuffix(k, "_api_key") ||
+		strings.Contains(k, "secret")
 }
 
 func countNonEmptyLines(text string) int {
@@ -285,6 +312,7 @@ func applyRegisterUpdates(cfg *RegisterConfig, body map[string]any) {
 			oldMail := cfg.Mail
 			var nextMail RegisterMailConfig
 			if json.Unmarshal(raw, &nextMail) == nil {
+				preserveRegisterProviderSecrets(oldMail, &nextMail)
 				mergeRegisterOutlookMailboxes(oldMail, &nextMail)
 				cfg.Mail = nextMail
 			}
@@ -312,7 +340,10 @@ func applyRegisterUpdates(cfg *RegisterConfig, body map[string]any) {
 		cfg.CheckInterval = intAny(v, cfg.CheckInterval)
 	}
 	if v, ok := body["fixed_password"]; ok {
-		cfg.FixedPassword = strAny(v, "")
+		next := strAny(v, "")
+		if strings.TrimSpace(next) != registerSecretPlaceholder {
+			cfg.FixedPassword = next
+		}
 	}
 	if v, ok := body["auto_refill"]; ok {
 		if raw, err := json.Marshal(v); err == nil {
@@ -327,6 +358,35 @@ func applyRegisterUpdates(cfg *RegisterConfig, body map[string]any) {
 	}
 	if v, ok := body["task_stall_timeout_seconds"]; ok {
 		cfg.TaskStallTimeoutSeconds = intAny(v, cfg.TaskStallTimeoutSeconds)
+	}
+}
+
+func preserveRegisterProviderSecrets(oldMail RegisterMailConfig, nextMail *RegisterMailConfig) {
+	oldByID := map[string]map[string]any{}
+	for _, provider := range oldMail.Providers {
+		if id := strings.TrimSpace(strAny(provider["provider_id"], strAny(provider["id"], ""))); id != "" {
+			oldByID[id] = provider
+		}
+	}
+	for index, provider := range nextMail.Providers {
+		id := strings.TrimSpace(strAny(provider["provider_id"], strAny(provider["id"], "")))
+		old := oldByID[id]
+		if old == nil && index < len(oldMail.Providers) {
+			old = oldMail.Providers[index]
+		}
+		if old == nil {
+			continue
+		}
+		for key, value := range provider {
+			if !isRegisterSecretKey(key) || strings.TrimSpace(strAny(value, "")) != registerSecretPlaceholder {
+				continue
+			}
+			if oldValue, ok := old[key]; ok {
+				provider[key] = oldValue
+			} else {
+				provider[key] = ""
+			}
+		}
 	}
 }
 

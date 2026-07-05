@@ -17,6 +17,33 @@ from services.register.proxy_pool import register_proxy_pool
 
 REGISTER_FILE = DATA_DIR / "register.json"
 REGISTER_STALL_FAILURE_REASON = "register_task_stalled"
+SECRET_PLACEHOLDER = "********"
+
+
+def _is_secret_key(key: object) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    if normalized in {
+        "api_key",
+        "admin_password",
+        "password",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "ddg_token",
+        "cf_api_key",
+        "client_secret",
+        "private_key",
+        "secret",
+        "authorization",
+    }:
+        return True
+    return (
+        normalized.endswith("_token")
+        or normalized.endswith("_password")
+        or normalized.endswith("_api_key")
+        or "secret" in normalized
+    )
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -206,7 +233,7 @@ class RegisterService:
             self._refresh_proxy_pool_state_locked(force=False)
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
         if redact:
-            self._redact_outlook_pools(snapshot)
+            self._redact_secrets(snapshot)
         return snapshot
 
     @staticmethod
@@ -217,11 +244,13 @@ class RegisterService:
         masked = (local[:2] + "***" + local[-1:]) if len(local) > 2 else (local[:1] + "***")
         return f"{masked}@{domain}"
 
-    def _redact_outlook_pools(self, snapshot: dict) -> None:
-        """把 outlook_token 邮箱池里的密码/refresh_token 从对外输出中抹掉，仅保留脱敏预览与统计。
+    def _redact_secrets(self, snapshot: dict) -> None:
+        """把注册配置里的密钥从对外输出中抹掉，仅保留占位和必要统计。
 
         mailboxes 改为只写导入框（输出为空），避免把密码与 refresh_token 通过 GET/SSE 反复广播。
         """
+        if str(snapshot.get("fixed_password") or "").strip():
+            snapshot["fixed_password"] = SECRET_PLACEHOLDER
         mail = snapshot.get("mail")
         if not isinstance(mail, dict):
             return
@@ -229,13 +258,17 @@ class RegisterService:
         if not isinstance(providers, list):
             return
         for provider in providers:
-            if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
+            if not isinstance(provider, dict):
                 continue
-            credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
-            provider["mailboxes"] = ""
-            provider["mailboxes_count"] = len(credentials)
-            provider["mailboxes_preview"] = [self._mask_email(c["email"]) for c in credentials]
-            provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
+            for key, value in list(provider.items()):
+                if _is_secret_key(key) and str(value or "").strip():
+                    provider[key] = SECRET_PLACEHOLDER
+            if provider.get("type") == "outlook_token":
+                credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
+                provider["mailboxes"] = ""
+                provider["mailboxes_count"] = len(credentials)
+                provider["mailboxes_preview"] = [self._mask_email(c["email"]) for c in credentials]
+                provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
 
     def _drop_mail_proxy(self) -> None:
         if isinstance(self._config.get("mail"), dict):
@@ -276,6 +309,31 @@ class RegisterService:
             for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats"):
                 provider.pop(key, None)
 
+    def _preserve_redacted_secrets(self, updates: dict) -> None:
+        if str(updates.get("fixed_password") or "").strip() == SECRET_PLACEHOLDER:
+            updates["fixed_password"] = self._config.get("fixed_password", "")
+        mail = updates.get("mail")
+        if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
+            return
+        old_mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+        old_providers = old_mail.get("providers") if isinstance(old_mail.get("providers"), list) else []
+        old_by_id = {
+            str(item.get("provider_id") or item.get("id") or "").strip(): item
+            for item in old_providers
+            if isinstance(item, dict) and str(item.get("provider_id") or item.get("id") or "").strip()
+        }
+        for index, provider in enumerate(mail["providers"]):
+            if not isinstance(provider, dict):
+                continue
+            provider_id = str(provider.get("provider_id") or provider.get("id") or "").strip()
+            old = old_by_id.get(provider_id) or {}
+            if not old and index < len(old_providers) and isinstance(old_providers[index], dict):
+                old = old_providers[index]
+            for key, value in list(provider.items()):
+                if not _is_secret_key(key) or str(value or "").strip() != SECRET_PLACEHOLDER:
+                    continue
+                provider[key] = old.get(key, "")
+
     def _prune_unused_outlook_pools(self) -> int:
         mail = self._config.get("mail")
         if not isinstance(mail, dict):
@@ -298,6 +356,7 @@ class RegisterService:
 
     def update(self, updates: dict) -> dict:
         with self._lock:
+            self._preserve_redacted_secrets(updates)
             self._merge_outlook_pools(updates)
             next_config = _normalize({**self._config, **updates})
             _validate_mail_providers(next_config)

@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"crypto/md5"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -448,11 +449,15 @@ func (s *Server) handleImageDownload(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		data, err := os.ReadFile(path)
-		if err == nil {
-			f, _ := zw.Create(filepath.Base(rel))
-			_, _ = f.Write(data)
+		src, err := os.Open(path)
+		if err != nil {
+			continue
 		}
+		f, err := zw.Create(filepath.Base(rel))
+		if err == nil {
+			_, _ = io.Copy(f, src)
+		}
+		_ = src.Close()
 	}
 }
 func (s *Server) handleImageDownloadSingle(w http.ResponseWriter, r *http.Request) {

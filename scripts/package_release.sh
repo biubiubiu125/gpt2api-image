@@ -91,7 +91,7 @@ fi
 
 require_path "web_dist" "frontend build output"
 require_path "start.sh" "start script"
-require_path "config.json" "config example"
+require_path "config.example.json" "config example"
 require_path "README.md" "README"
 require_path "GO_MIGRATION.md" "GO_MIGRATION.md"
 require_path "LICENSE" "LICENSE"
@@ -120,7 +120,7 @@ if [[ -z "$(find "$RELEASE_DIR/data/bin/curl-impersonate" -type f \( -name 'curl
 fi
 
 cp start.sh "$RELEASE_DIR/start.sh"
-cp config.json "$RELEASE_DIR/config.example.json"
+cp config.example.json "$RELEASE_DIR/config.example.json"
 for file in README.md GO_MIGRATION.md LICENSE THIRD_PARTY_NOTICES.md VERSION; do
   if [[ -f "$file" ]]; then
     cp "$file" "$RELEASE_DIR/"

@@ -222,8 +222,8 @@ install_from_source() {
   cp bin/gpt2api-image "$INSTALL_DIR/gpt2api-image"
   cp start.sh README.md LICENSE VERSION "$INSTALL_DIR"/ 2>/dev/null || true
   [[ -d web_dist ]] && cp -a web_dist "$INSTALL_DIR/web_dist"
-  if [[ -f config.json ]]; then
-    cp config.json "$INSTALL_DIR/config.example.json"
+  if [[ -f config.example.json ]]; then
+    cp config.example.json "$INSTALL_DIR/config.example.json"
   fi
   restore_existing_state "$backup_dir"
   chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/gpt2api-image" "$INSTALL_DIR/bin/gpt2api-image" 2>/dev/null || true

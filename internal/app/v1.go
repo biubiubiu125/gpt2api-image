@@ -583,18 +583,16 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := s.checkImageAccess(id, model, strAny(b["resolution"], "")); err != nil {
+	refs := extractResponseImages(b["input"])
+	size, resolution := responseImageOptions(b, len(refs) > 0)
+	if err := s.checkImageAccess(id, model, resolution); err != nil {
 		s.logCallFailure(callID, "/v1/responses", model, "Responses", err, nil)
 		writeErr(w, 403, err.Error())
 		return
 	}
 	if s.taskStore != nil {
-		refs := extractResponseImages(b["input"])
-		size := ""
 		mode := "generate"
-		if len(refs) == 0 {
-			size = "1:1"
-		} else {
+		if len(refs) > 0 {
 			mode = "edit"
 		}
 		task, _, err := s.createDBImageTask(r.Context(), id, imageTaskCreateRequest{
@@ -603,6 +601,7 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 			Prompt:         prompt,
 			Model:          model,
 			Size:           size,
+			Resolution:     resolution,
 			ResponseFormat: "b64_json",
 			N:              1,
 			Inputs:         refs,
@@ -620,14 +619,9 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 		writeErr(w, 402, "画图额度不足")
 		return
 	}
-	refs := extractResponseImages(b["input"])
-	size := ""
-	if len(refs) == 0 {
-		size = "1:1"
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.imageRequestTimeout())
 	defer cancel()
-	items, err := s.generateImageWithPool(ctx, prompt, model, size, "", refs)
+	items, err := s.generateImageWithPool(ctx, prompt, model, size, resolution, refs)
 	if err != nil {
 		s.refundImage(id, 1)
 		s.logCallFailure(callID, "/v1/responses", model, "Responses", err, nil)
@@ -1375,17 +1369,41 @@ func responseBase(id, model string, created int64, status string, output any, er
 }
 
 func hasResponseImageGenerationTool(b map[string]any) bool {
-	if tools, ok := b["tools"].([]any); ok {
-		for _, tool := range tools {
-			if m, ok := tool.(map[string]any); ok && strings.TrimSpace(strAny(m["type"], "")) == "image_generation" {
-				return true
-			}
-		}
+	if responseImageGenerationTool(b) != nil {
+		return true
 	}
 	if m, ok := b["tool_choice"].(map[string]any); ok && strings.TrimSpace(strAny(m["type"], "")) == "image_generation" {
 		return true
 	}
 	return false
+}
+
+func responseImageGenerationTool(b map[string]any) map[string]any {
+	if tools, ok := b["tools"].([]any); ok {
+		for _, tool := range tools {
+			if m, ok := tool.(map[string]any); ok && strings.TrimSpace(strAny(m["type"], "")) == "image_generation" {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+func responseImageOptions(b map[string]any, hasReferenceImages bool) (string, string) {
+	size := strings.TrimSpace(strAny(b["size"], ""))
+	resolution := strings.TrimSpace(strAny(b["resolution"], ""))
+	if tool := responseImageGenerationTool(b); tool != nil {
+		if size == "" {
+			size = strings.TrimSpace(strAny(tool["size"], ""))
+		}
+		if resolution == "" {
+			resolution = strings.TrimSpace(strAny(tool["resolution"], ""))
+		}
+	}
+	if size == "" && !hasReferenceImages {
+		size = "1:1"
+	}
+	return size, resolution
 }
 
 func extractResponsePrompt(input any) string {

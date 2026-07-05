@@ -63,6 +63,44 @@ func TestBuildEnhancedImagePromptAddsUltraClearAndReferenceGuidance(t *testing.T
 	}
 }
 
+func TestResponseImageOptionsPreserveSizeAndResolution(t *testing.T) {
+	topLevel := map[string]any{
+		"size":       "16:9",
+		"resolution": "4k",
+		"tools": []any{map[string]any{
+			"type":       "image_generation",
+			"size":       "1:1",
+			"resolution": "2k",
+		}},
+	}
+	size, resolution := responseImageOptions(topLevel, false)
+	if size != "16:9" || resolution != "4k" {
+		t.Fatalf("top-level response image options = size %q resolution %q, want 16:9 4k", size, resolution)
+	}
+
+	toolLevel := map[string]any{
+		"tools": []any{map[string]any{
+			"type":       "image_generation",
+			"size":       "9:16",
+			"resolution": "2k",
+		}},
+	}
+	size, resolution = responseImageOptions(toolLevel, true)
+	if size != "9:16" || resolution != "2k" {
+		t.Fatalf("tool-level response image options = size %q resolution %q, want 9:16 2k", size, resolution)
+	}
+
+	size, resolution = responseImageOptions(map[string]any{}, false)
+	if size != "1:1" || resolution != "" {
+		t.Fatalf("default generation response image options = size %q resolution %q, want 1:1 empty", size, resolution)
+	}
+
+	size, resolution = responseImageOptions(map[string]any{}, true)
+	if size != "" || resolution != "" {
+		t.Fatalf("default edit response image options = size %q resolution %q, want empty empty", size, resolution)
+	}
+}
+
 func TestPublicImageModelListOnlyExposesGPTImage2(t *testing.T) {
 	s := &Server{store: NewStore(t.TempDir())}
 	if err := s.store.SaveAccounts([]Account{

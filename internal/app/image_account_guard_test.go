@@ -104,6 +104,30 @@ func TestImageFailureMarksPendingDeleteWhenAccountIsActive(t *testing.T) {
 	}
 }
 
+func TestRateLimitedAutoRemoveMarksPendingDeleteWhenAccountIsActive(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	s.cfg.AutoRemoveRateLimitedAccounts = true
+	if err := s.store.SaveAccounts([]Account{{AccessToken: "tok", Status: accountStatusNormal, Quota: 5}}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+	s.accountPool.inflight["tok"] = 1
+
+	s.markAccountFailure("tok", errors.New("image generation failed: status=429 body=too many requests"), true)
+
+	accounts := s.store.LoadAccounts()
+	if len(accounts) != 1 {
+		t.Fatalf("active rate-limited account should be kept pending, accounts=%#v", accounts)
+	}
+	if !accounts[0].PendingDelete || accounts[0].Quota != 0 || accounts[0].Status != accountStatusInvalid {
+		t.Fatalf("rate-limited active account not marked pending delete: %#v", accounts[0])
+	}
+	s.accountPool.releaseToken("tok")
+	s.cleanupPendingDeletedAccounts()
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("pending rate-limited account should be removed after release, got %#v", got)
+	}
+}
+
 func TestImageFailureDeletesInactiveInvalidAccounts(t *testing.T) {
 	for _, tc := range []struct {
 		name string

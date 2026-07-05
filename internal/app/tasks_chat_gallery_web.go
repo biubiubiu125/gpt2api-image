@@ -58,21 +58,25 @@ func (s *Server) handleImageTasks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"items": items, "missing_ids": missing})
 		return
 	}
-	wantMap := map[string]bool{}
-	for _, taskID := range wanted {
-		wantMap[taskID] = true
-	}
 	items := []ImageTask{}
 	seen := map[string]bool{}
 	for _, task := range s.store.LoadTasks() {
-		if task.OwnerID != "" && task.OwnerID != id.ID && id.Role != "admin" {
+		if task.OwnerID != "" && task.OwnerID != lookupIdentity.ID && lookupIdentity.Role != "admin" {
 			continue
 		}
-		if len(wantMap) > 0 && !wantMap[task.ID] {
-			continue
+		if len(wanted) > 0 {
+			matched := false
+			for _, taskID := range wanted {
+				if imageTaskMatchesLookup(task, lookupIdentity, taskID) {
+					seen[taskID] = true
+					matched = true
+				}
+			}
+			if !matched {
+				continue
+			}
 		}
 		items = append(items, task)
-		seen[task.ID] = true
 	}
 	missing := []string{}
 	for _, taskID := range wanted {
@@ -300,6 +304,14 @@ func imageTaskID(ownerID, clientTaskID string) string {
 	return "usr_" + sum + "_" + safeFileName(clientTaskID)
 }
 
+func newImageTaskID(ownerID, clientTaskID string) string {
+	clientTaskID = strings.TrimSpace(clientTaskID)
+	if clientTaskID == "" {
+		return randID(8)
+	}
+	return imageTaskID(ownerID, clientTaskID)
+}
+
 func possibleImageTaskIDs(ownerID, id string) []string {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -311,6 +323,22 @@ func possibleImageTaskIDs(ownerID, id string) []string {
 		out = append(out, derived)
 	}
 	return out
+}
+
+func imageTaskMatchesLookup(task ImageTask, identity Identity, lookup string) bool {
+	lookup = strings.TrimSpace(lookup)
+	if lookup == "" {
+		return false
+	}
+	if task.ID == lookup || task.ClientTaskID == lookup {
+		return true
+	}
+	for _, candidate := range possibleImageTaskIDs(identity.ID, lookup) {
+		if task.ID == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 type imageTaskCreateRequest struct {
@@ -558,7 +586,8 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, 200, task)
 		return
 	}
-	t := ImageTask{ID: firstNonEmpty(strings.TrimSpace(b.ClientTaskID), randID(8)), OwnerID: id.ID, Status: "running", Mode: "generate", Model: b.Model, Size: b.Size, Resolution: b.Resolution, CreatedAt: nowISO(), UpdatedAt: nowISO()}
+	clientTaskID := strings.TrimSpace(b.ClientTaskID)
+	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, Status: "running", Mode: "generate", Model: b.Model, Size: b.Size, Resolution: b.Resolution, CreatedAt: nowISO(), UpdatedAt: nowISO()}
 	callID := s.logCallStart(id, "/api/image-tasks/generations", b.Model, "文生图任务", b.Prompt)
 	if err := s.checkContent(b.Prompt); err != nil {
 		t.Status = "error"
@@ -629,7 +658,11 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 	if !parseMultipartFormLimited(w, r) {
 		return
 	}
-	prompt := r.FormValue("prompt")
+	prompt := strings.TrimSpace(r.FormValue("prompt"))
+	if prompt == "" {
+		writeErr(w, http.StatusBadRequest, "prompt is required")
+		return
+	}
 	model := r.FormValue("model")
 	if model == "" {
 		model = "gpt-image-2"
@@ -658,7 +691,8 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, task)
 		return
 	}
-	t := ImageTask{ID: firstNonEmpty(strings.TrimSpace(r.FormValue("client_task_id")), randID(8)), OwnerID: id.ID, Status: "running", Mode: "edit", Model: model, Size: r.FormValue("size"), Resolution: r.FormValue("resolution"), CreatedAt: nowISO(), UpdatedAt: nowISO()}
+	clientTaskID := strings.TrimSpace(r.FormValue("client_task_id"))
+	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, Status: "running", Mode: "edit", Model: model, Size: r.FormValue("size"), Resolution: r.FormValue("resolution"), CreatedAt: nowISO(), UpdatedAt: nowISO()}
 	callID := s.logCallStart(id, "/api/image-tasks/edits", model, "图生图任务", prompt)
 	if err := s.checkContent(prompt); err != nil {
 		t.Status = "error"
@@ -808,17 +842,19 @@ func (s *Server) handleImageTaskCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tasks := s.store.LoadTasks()
-	byID := map[string]int{}
-	for i, t := range tasks {
-		byID[t.ID] = i
-	}
 	for _, id := range ids {
-		idx, ok := byID[id]
-		if !ok {
+		idx := -1
+		for i, task := range tasks {
+			if imageTaskMatchesLookup(task, lookupIdentity, id) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
 			missing = append(missing, id)
 			continue
 		}
-		if tasks[idx].OwnerID != "" && tasks[idx].OwnerID != identity.ID && identity.Role != "admin" {
+		if tasks[idx].OwnerID != "" && tasks[idx].OwnerID != lookupIdentity.ID && lookupIdentity.Role != "admin" {
 			skipped = append(skipped, id)
 			continue
 		}
@@ -826,13 +862,13 @@ func (s *Server) handleImageTaskCancel(w http.ResponseWriter, r *http.Request) {
 			skipped = append(skipped, id)
 			continue
 		}
-		if cancel := s.popTaskCancel(id); cancel != nil {
+		if cancel := s.popTaskCancel(tasks[idx].ID); cancel != nil {
 			cancel()
 		}
 		tasks[idx].Status = "canceled"
 		tasks[idx].Error = "canceled"
 		tasks[idx].UpdatedAt = nowISO()
-		canceled = append(canceled, id)
+		canceled = append(canceled, tasks[idx].ID)
 	}
 	_ = s.store.SaveTasks(tasks)
 	writeJSON(w, 200, map[string]any{"canceled": canceled, "skipped": skipped, "missing_ids": missing})

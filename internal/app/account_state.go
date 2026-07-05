@@ -169,7 +169,7 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 				accounts[i].RateLimitResetAt = &reset
 				accounts[i].RateLimitedAt = &now
 				if s.cfg.AutoRemoveRateLimitedAccounts {
-					accounts = append(accounts[:i], accounts[i+1:]...)
+					removeReason = "image_account_rate_limited"
 				}
 			} else if isInvalidTokenErrorText(err) {
 				accounts[i].Status = accountStatusInvalid

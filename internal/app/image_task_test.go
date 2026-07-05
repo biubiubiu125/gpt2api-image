@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -47,6 +49,46 @@ func TestPossibleImageTaskIDsIncludesClientAndDerivedID(t *testing.T) {
 	}
 	if ids[1] != imageTaskID("user-a", "client-task-1") {
 		t.Fatalf("derived id = %q, want %q", ids[1], imageTaskID("user-a", "client-task-1"))
+	}
+}
+
+func TestNonDBImageTasksLookupAcceptsOriginalClientTaskID(t *testing.T) {
+	store := NewStore(t.TempDir())
+	clientTaskID := "client-task-1"
+	taskID := newImageTaskID("user-a", clientTaskID)
+	if err := store.SaveTasks([]ImageTask{{
+		ID:           taskID,
+		ClientTaskID: clientTaskID,
+		OwnerID:      "user-a",
+		Status:       "running",
+		Mode:         "generate",
+		CreatedAt:    nowISO(),
+		UpdatedAt:    nowISO(),
+	}}); err != nil {
+		t.Fatalf("save tasks: %v", err)
+	}
+	s := &Server{cfg: Config{AuthKey: "root-key"}, store: store}
+	req := httptest.NewRequest(http.MethodGet, "/api/image-tasks?ids="+clientTaskID+"&owner_id=user-a", nil)
+	req.Header.Set("Authorization", "Bearer root-key")
+	rr := httptest.NewRecorder()
+
+	s.handleImageTasks(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Items      []ImageTask `json:"items"`
+		MissingIDs []string    `json:"missing_ids"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Items) != 1 || body.Items[0].ID != taskID {
+		t.Fatalf("items = %#v, want task %s", body.Items, taskID)
+	}
+	if len(body.MissingIDs) != 0 {
+		t.Fatalf("missing_ids = %#v, want empty", body.MissingIDs)
 	}
 }
 
@@ -408,6 +450,31 @@ func TestEnqueueV1ImageTaskRequiresClientTaskID(t *testing.T) {
 	})
 	if ok {
 		t.Fatalf("v1 image request without client_task_id should stay synchronous")
+	}
+}
+
+func TestImageTaskEditRejectsEmptyPromptBeforeReadingInputs(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("prompt", "   "); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	s := &Server{cfg: Config{AuthKey: "root-key"}, store: NewStore(t.TempDir())}
+	req := httptest.NewRequest(http.MethodPost, "/api/image-tasks/edits", &body)
+	req.Header.Set("Authorization", "Bearer root-key")
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rr := httptest.NewRecorder()
+
+	s.handleImageTaskEdit(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s, want 400", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "prompt is required") {
+		t.Fatalf("body = %s, want prompt error", rr.Body.String())
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	http "github.com/bogdanfinn/fhttp"
 )
@@ -107,10 +108,15 @@ func (c *UpstreamClient) codexHeaders(path, installationID string) map[string]st
 	return h
 }
 
-func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, size string, refs [][]byte) ([]upstreamImageResult, error) {
+func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, size string, refs [][]byte, timeout time.Duration) ([]upstreamImageResult, error) {
 	if strings.TrimSpace(c.token) == "" {
 		return nil, errors.New("access token is required for codex image generation")
 	}
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	streamCtx, streamCancel := context.WithTimeout(ctx, timeout)
+	defer streamCancel()
 	path := "/backend-api/codex/responses"
 	installationID := randID(16)
 	content := []map[string]any{{"type": "input_text", "text": prompt}}
@@ -138,16 +144,20 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 		"store":           false,
 		"client_metadata": map[string]any{"x-codex-installation-id": installationID},
 	}
-	resp, err := c.do(ctx, http.MethodPost, path, c.codexHeaders(path, installationID), body, true)
+	resp, err := c.do(streamCtx, http.MethodPost, path, c.codexHeaders(path, installationID), body, true)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	items := []map[string]any{}
 	completed := []map[string]any{}
-	for payload := range parseSSE(resp.Body) {
+	sawDone := false
+	sawCompleted := false
+	events, streamErrs := parseSSEWithError(resp.Body)
+	for payload := range events {
 		if payload == "[DONE]" {
-			break
+			sawDone = true
+			continue
 		}
 		var event map[string]any
 		if json.Unmarshal([]byte(payload), &event) != nil {
@@ -164,6 +174,7 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 			}
 		}
 		if typ == "response.completed" {
+			sawCompleted = true
 			if respObj, ok := event["response"].(map[string]any); ok {
 				if out, ok := respObj["output"].([]any); ok {
 					for _, raw := range out {
@@ -174,6 +185,18 @@ func (c *UpstreamClient) GenerateCodexImage(ctx context.Context, prompt, model, 
 				}
 			}
 		}
+	}
+	if err := <-streamErrs; err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || streamCtx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("codex image generation SSE timed out (%ds)", int(timeout/time.Second))
+		}
+		return nil, fmt.Errorf("codex image generation stream failed: %w", err)
+	}
+	if streamCtx.Err() == context.DeadlineExceeded && !sawDone {
+		return nil, fmt.Errorf("codex image generation SSE timed out (%ds)", int(timeout/time.Second))
+	}
+	if len(items) == 0 && !sawDone && !sawCompleted {
+		return nil, errors.New("codex image generation stream ended before image result")
 	}
 	if len(items) == 0 {
 		for _, item := range completed {

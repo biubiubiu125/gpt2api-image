@@ -489,7 +489,7 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 	}
 	if isCodexImageRequest(model, resolution) {
 		traceLogf(ctx, "│  ├─ route to Codex image path")
-		return c.GenerateCodexImage(ctx, buildImagePrompt(prompt, size), model, codexImageSize(size, resolution), refs)
+		return c.GenerateCodexImage(ctx, buildImagePrompt(prompt, size), model, codexImageSize(size, resolution), refs, opts.Timeout)
 	}
 	finalPrompt := buildImagePromptWithOptions(prompt, size, resolution)
 	if err := c.bootstrap(ctx); err != nil {
@@ -956,9 +956,16 @@ func (c *UpstreamClient) getJSON(ctx context.Context, method, path string, heade
 }
 
 func parseSSE(r io.Reader) <-chan string {
+	ch, _ := parseSSEWithError(r)
+	return ch
+}
+
+func parseSSEWithError(r io.Reader) (<-chan string, <-chan error) {
 	ch := make(chan string)
+	errCh := make(chan error, 1)
 	go func() {
 		defer close(ch)
+		defer close(errCh)
 		scanner := bufio.NewScanner(r)
 		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 		var lines []string
@@ -986,8 +993,11 @@ func parseSSE(r io.Reader) <-chan string {
 			lines = append(lines, line)
 		}
 		flush()
+		if err := scanner.Err(); err != nil {
+			errCh <- err
+		}
 	}()
-	return ch
+	return ch, errCh
 }
 func normalizeChatGPTInternalMarkup(text string) string {
 	if !strings.ContainsRune(text, '') {

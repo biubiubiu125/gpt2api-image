@@ -20,6 +20,18 @@ func (f upstreamDoerFunc) Do(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+type upstreamErrorReadCloser struct {
+	err error
+}
+
+func (r upstreamErrorReadCloser) Read(_ []byte) (int, error) {
+	return 0, r.err
+}
+
+func (r upstreamErrorReadCloser) Close() error {
+	return nil
+}
+
 func upstreamTestResponse(status int, body string) *http.Response {
 	return upstreamTestResponseWithHeader(status, body, http.Header{})
 }
@@ -164,6 +176,55 @@ func TestPollImageIDsReturnsRetryableConversation5xx(t *testing.T) {
 	}
 	if !shouldRetryImageAccount(err) {
 		t.Fatalf("conversation 503 should be retryable: %v", err)
+	}
+}
+
+func TestCodexImageEarlyStreamEndIsRetryable(t *testing.T) {
+	client := &UpstreamClient{
+		token:           "access-token",
+		userAgent:       "test-agent",
+		secCHUA:         `"Microsoft Edge";v="143"`,
+		secCHUAMobile:   "?0",
+		secCHUAPlatform: `"Windows"`,
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/backend-api/codex/responses" {
+				t.Fatalf("path = %q, want /backend-api/codex/responses", req.URL.Path)
+			}
+			return upstreamTestResponse(200, `data: {"type":"response.created"}`+"\n\n"), nil
+		}),
+	}
+	_, err := client.GenerateCodexImage(context.Background(), "prompt", "codex-gpt-image-2", "1024x1024", nil, time.Second)
+	if err == nil {
+		t.Fatal("expected early stream end error")
+	}
+	if !strings.Contains(err.Error(), "stream ended before image result") {
+		t.Fatalf("error = %q, want stream ended before image result", err.Error())
+	}
+	if !shouldRetryImageAccount(err) {
+		t.Fatalf("codex early stream end should be retryable: %v", err)
+	}
+}
+
+func TestCodexImageStreamReadErrorIsRetryable(t *testing.T) {
+	client := &UpstreamClient{
+		token:           "access-token",
+		userAgent:       "test-agent",
+		secCHUA:         `"Microsoft Edge";v="143"`,
+		secCHUAMobile:   "?0",
+		secCHUAPlatform: `"Windows"`,
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: upstreamErrorReadCloser{err: io.ErrUnexpectedEOF}, Header: http.Header{}}, nil
+		}),
+	}
+	_, err := client.GenerateCodexImage(context.Background(), "prompt", "codex-gpt-image-2", "1024x1024", nil, time.Second)
+	if err == nil {
+		t.Fatal("expected stream read error")
+	}
+	if !strings.Contains(err.Error(), "stream failed") {
+		t.Fatalf("error = %q, want stream failed", err.Error())
+	}
+	if !shouldRetryImageAccount(err) {
+		t.Fatalf("codex stream read error should be retryable: %v", err)
 	}
 }
 

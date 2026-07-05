@@ -61,6 +61,11 @@ func isTemporaryUpstreamErrorText(err error) bool {
 	if strings.Contains(text, "timed out") || strings.Contains(text, "timeout") || strings.Contains(text, "deadline exceeded") {
 		return true
 	}
+	if strings.Contains(text, "stream ended before image result") ||
+		strings.Contains(text, "stream failed") ||
+		strings.Contains(text, "unexpected eof") {
+		return true
+	}
 	for _, marker := range []string{"status=500", "status=502", "status=503", "status=504", "http 500", "http 502", "http 503", "http 504"} {
 		if strings.Contains(text, marker) {
 			return true

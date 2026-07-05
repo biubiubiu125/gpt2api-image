@@ -35,6 +35,7 @@ const defaultClientVersion = "prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad"
 const defaultClientBuild = "5955942"
 const defaultPowScript = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 const bootstrapMaxAttempts = 3
+const maxImageDownloadBytes int64 = 80 << 20
 
 type UpstreamClient struct {
 	token           string
@@ -856,9 +857,76 @@ func (c *UpstreamClient) download(ctx context.Context, u string) ([]byte, error)
 		traceLogf(ctx, "│  └─ download response status=%d duration=%s body=%s", resp.StatusCode, traceHTTPDuration(start), truncateText(string(b), 200))
 		return nil, fmt.Errorf("download failed: status=%d body=%.100s", resp.StatusCode, string(b))
 	}
-	data, err := io.ReadAll(resp.Body)
+	if resp.ContentLength > maxImageDownloadBytes {
+		traceLogf(ctx, "│  └─ download rejected status=%d content_length=%d limit=%d duration=%s", resp.StatusCode, resp.ContentLength, maxImageDownloadBytes, traceHTTPDuration(start))
+		return nil, fmt.Errorf("downloaded image too large: content_length=%d limit=%d", resp.ContentLength, maxImageDownloadBytes)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "" && !allowedImageDownloadContentType(ct) {
+		traceLogf(ctx, "│  └─ download rejected status=%d content_type=%q duration=%s", resp.StatusCode, ct, traceHTTPDuration(start))
+		return nil, fmt.Errorf("downloaded image has unexpected content-type: %s", ct)
+	}
+	data, err := readAllLimited(resp.Body, maxImageDownloadBytes)
+	if err != nil {
+		traceLogf(ctx, "│  └─ download failed duration=%s error=%v", traceHTTPDuration(start), err)
+		return nil, fmt.Errorf("download failed: %v", err)
+	}
+	if !looksLikeDownloadedImage(data) {
+		traceLogf(ctx, "│  └─ download rejected status=%d bytes=%d sniff=%q duration=%s", resp.StatusCode, len(data), downloadedImageMIME(data), traceHTTPDuration(start))
+		return nil, errors.New("downloaded payload is not a supported image")
+	}
 	traceLogf(ctx, "│  └─ download ok status=%d bytes=%d duration=%s", resp.StatusCode, len(data), traceHTTPDuration(start))
-	return data, err
+	return data, nil
+}
+
+func allowedImageDownloadContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(value))
+	if err != nil {
+		mediaType = strings.ToLower(strings.TrimSpace(strings.Split(value, ";")[0]))
+	}
+	switch strings.ToLower(mediaType) {
+	case "", "application/octet-stream", "binary/octet-stream", "application/x-binary":
+		return true
+	default:
+		return strings.HasPrefix(strings.ToLower(mediaType), "image/")
+	}
+}
+
+func looksLikeDownloadedImage(data []byte) bool {
+	return strings.HasPrefix(downloadedImageMIME(data), "image/")
+}
+
+func downloadedImageMIME(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	if bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
+		return "image/png"
+	}
+	if bytes.HasPrefix(data, []byte("\xff\xd8\xff")) {
+		return "image/jpeg"
+	}
+	if bytes.HasPrefix(data, []byte("GIF87a")) || bytes.HasPrefix(data, []byte("GIF89a")) {
+		return "image/gif"
+	}
+	if len(data) >= 12 && bytes.HasPrefix(data, []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")) {
+		return "image/webp"
+	}
+	probe := data
+	if len(probe) > 64 {
+		probe = probe[:64]
+	}
+	if len(probe) >= 12 && bytes.Equal(probe[4:8], []byte("ftyp")) && (bytes.Contains(probe[8:], []byte("avif")) || bytes.Contains(probe[8:], []byte("avis"))) {
+		return "image/avif"
+	}
+	sniff := data
+	if len(sniff) > 512 {
+		sniff = sniff[:512]
+	}
+	detected := stdhttp.DetectContentType(sniff)
+	if strings.HasPrefix(detected, "image/") {
+		return detected
+	}
+	return detected
 }
 func (c *UpstreamClient) DeleteConversation(ctx context.Context, cid string) {
 	cid = strings.TrimSpace(cid)

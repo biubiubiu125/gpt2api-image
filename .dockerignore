@@ -1,16 +1,33 @@
 .git
 .gitignore
+.dockerignore
 .idea
 .venv
 __pycache__
 *.pyc
 *.pyo
 *.pyd
+*.log
+*.tmp
+*.patch
 
 web/.next
 web/node_modules
 web/out
 web_dist
+bin
+build
+dist
+release
+git_cache
+
+data
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+config.json
 
 assets
 README.md

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -44,6 +45,68 @@ func upstreamTestResponseWithHeader(status int, body string, header http.Header)
 		StatusCode: status,
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Header:     header,
+	}
+}
+
+func tinyPNGBytes(t *testing.T) []byte {
+	t.Helper()
+	data, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
+	if err != nil {
+		t.Fatalf("decode tiny png: %v", err)
+	}
+	return data
+}
+
+func TestDownloadRejectsOversizedContentLength(t *testing.T) {
+	client := &UpstreamClient{
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode:    200,
+				ContentLength: maxImageDownloadBytes + 1,
+				Header:        http.Header{"Content-Type": []string{"image/png"}},
+				Body:          io.NopCloser(strings.NewReader("")),
+			}, nil
+		}),
+	}
+	_, err := client.download(context.Background(), "https://example.test/image.png")
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("download err = %v, want too large", err)
+	}
+}
+
+func TestDownloadRejectsNonImagePayload(t *testing.T) {
+	client := &UpstreamClient{
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			return upstreamTestResponseWithHeader(200, "<html>not an image</html>", http.Header{"Content-Type": []string{"text/html; charset=utf-8"}}), nil
+		}),
+	}
+	_, err := client.download(context.Background(), "https://example.test/image.png")
+	if err == nil || !strings.Contains(err.Error(), "unexpected content-type") {
+		t.Fatalf("download err = %v, want unexpected content-type", err)
+	}
+}
+
+func TestDownloadAcceptsImagePayload(t *testing.T) {
+	want := tinyPNGBytes(t)
+	client := &UpstreamClient{
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode:    200,
+				ContentLength: int64(len(want)),
+				Header:        http.Header{"Content-Type": []string{"application/octet-stream"}},
+				Body:          io.NopCloser(bytes.NewReader(want)),
+			}, nil
+		}),
+	}
+	got, err := client.download(context.Background(), "https://example.test/image.bin")
+	if err != nil {
+		t.Fatalf("download err = %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("download bytes mismatch")
 	}
 }
 

@@ -202,7 +202,7 @@ jobs:
             cp start.sh "${package_dir}/"
           fi
 
-          cp config.json "${package_dir}/config.example.json"
+          cp config.example.json "${package_dir}/config.example.json"
 
           cat > "${package_dir}/README_RELEASE.md" <<EOF
           # ${package_name}

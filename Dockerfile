@@ -23,7 +23,8 @@ WORKDIR /app
 RUN adduser -D -H app && mkdir -p /app/data /app/web_dist && chown -R app:app /app
 COPY --from=go-build /out/gpt2api-image /app/gpt2api-image
 COPY --from=web-build /app/web/out /app/web_dist
-COPY config.json VERSION ./
+COPY config.example.json /app/config.example.json
+COPY VERSION /app/VERSION
 USER app
 EXPOSE 80
 ENV GPT2API_IMAGE_ADDR=:80

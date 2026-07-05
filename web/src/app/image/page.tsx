@@ -1242,6 +1242,44 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           };
         });
       };
+      const markTaskCreationFailures = async (failures: Array<{ taskId: string; message: string }>) => {
+        if (failures.length === 0) {
+          return;
+        }
+        const failedByTaskId = new Map(failures.map((failure) => [failure.taskId, failure.message]));
+        await updateConversation(conversationId, (current) => {
+          const conversation = current ?? snapshot;
+          const turns = conversation.turns.map((turn) => {
+            if (turn.id !== activeTurn.id) {
+              return turn;
+            }
+            const images = turn.images.map((image) => {
+              const taskId = image.taskId || image.id;
+              const message = failedByTaskId.get(taskId);
+              if (!message || image.status !== "loading") {
+                return image;
+              }
+              return {
+                ...image,
+                taskId,
+                status: "error" as const,
+                error: message,
+              };
+            });
+            const derived = deriveTurnStatus({ ...turn, images });
+            return {
+              ...turn,
+              ...derived,
+              images,
+            };
+          });
+          return {
+            ...conversation,
+            updatedAt: new Date().toISOString(),
+            turns,
+          };
+        });
+      };
 
       try {
         await updateConversation(conversationId, (current) => {
@@ -1290,15 +1328,39 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         })();
 
         const pendingImages = activeTurn.images.filter((image) => image.status === "loading");
-        const submitted = await Promise.all(
-          pendingImages.map((image) => {
+        const submittedResults = await Promise.all(
+          pendingImages.map(async (image) => {
             const taskId = image.taskId || image.id;
-            return activeTurn.mode === "edit"
-              ? createImageEditTask(taskId, referenceFiles, apiPrompt, activeTurn.model, activeTurn.size, activeTurn.resolution)
-              : createImageGenerationTask(taskId, apiPrompt, activeTurn.model, activeTurn.size, activeTurn.resolution);
+            try {
+              const task = activeTurn.mode === "edit"
+                ? await createImageEditTask(taskId, referenceFiles, apiPrompt, activeTurn.model, activeTurn.size, activeTurn.resolution)
+                : await createImageGenerationTask(taskId, apiPrompt, activeTurn.model, activeTurn.size, activeTurn.resolution);
+              return { taskId, task };
+            } catch (error) {
+              return { taskId, message: error instanceof Error ? error.message : "创建图片任务失败" };
+            }
           }),
         );
-        await applyTasks(submitted);
+        const submitted: ImageTask[] = [];
+        const submitFailures: Array<{ taskId: string; message: string }> = [];
+        for (const result of submittedResults) {
+          if ("task" in result && result.task) {
+            submitted.push(result.task);
+          } else if ("message" in result) {
+            submitFailures.push({ taskId: result.taskId, message: result.message || "创建图片任务失败" });
+          }
+        }
+        if (submitted.length > 0) {
+          await applyTasks(submitted);
+        }
+        if (submitFailures.length > 0) {
+          await markTaskCreationFailures(submitFailures);
+          const firstMessage = submitFailures[0]?.message || "创建图片任务失败";
+          if (submitted.length === 0) {
+            throw new Error(firstMessage);
+          }
+          toast.error(`${submitFailures.length} 个任务创建失败：${firstMessage}`);
+        }
 
         while (true) {
           const latestConversation = conversationsRef.current.find((conversation) => conversation.id === conversationId);
@@ -1320,15 +1382,34 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             const missingImages = latestTurn.images.filter(
               (image) => image.status === "loading" && image.taskId && taskList.missing_ids.includes(image.taskId),
             );
-            const resubmitted = await Promise.all(
-              missingImages.map((image) =>
-                activeTurn.mode === "edit"
-                  ? createImageEditTask(image.taskId || image.id, referenceFiles, apiPrompt, activeTurn.model, activeTurn.size, activeTurn.resolution)
-                  : createImageGenerationTask(image.taskId || image.id, apiPrompt, activeTurn.model, activeTurn.size, activeTurn.resolution),
-              ),
+            const resubmittedResults = await Promise.all(
+              missingImages.map(async (image) => {
+                const taskId = image.taskId || image.id;
+                try {
+                  const task = activeTurn.mode === "edit"
+                    ? await createImageEditTask(taskId, referenceFiles, apiPrompt, activeTurn.model, activeTurn.size, activeTurn.resolution)
+                    : await createImageGenerationTask(taskId, apiPrompt, activeTurn.model, activeTurn.size, activeTurn.resolution);
+                  return { taskId, task };
+                } catch (error) {
+                  return { taskId, message: error instanceof Error ? error.message : "重新创建图片任务失败" };
+                }
+              }),
             );
+            const resubmitted: ImageTask[] = [];
+            const resubmitFailures: Array<{ taskId: string; message: string }> = [];
+            for (const result of resubmittedResults) {
+              if ("task" in result && result.task) {
+                resubmitted.push(result.task);
+              } else if ("message" in result) {
+                resubmitFailures.push({ taskId: result.taskId, message: result.message || "重新创建图片任务失败" });
+              }
+            }
             if (resubmitted.length > 0) {
               await applyTasks(resubmitted);
+            }
+            if (resubmitFailures.length > 0) {
+              await markTaskCreationFailures(resubmitFailures);
+              toast.error(`${resubmitFailures.length} 个任务重试失败：${resubmitFailures[0]?.message || "重新创建图片任务失败"}`);
             }
           }
         }

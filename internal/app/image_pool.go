@@ -255,7 +255,6 @@ func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size
 	if n <= 1 {
 		return s.generateImageWithPool(ctx, prompt, model, size, resolution, refs)
 	}
-	scope := newImageAccountAttemptScope(maxImageAccountFallbackAttempts)
 	limit := s.cfg.ImageAccountConcurrency
 	if limit <= 0 {
 		limit = 1
@@ -279,6 +278,7 @@ func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size
 			case sem <- struct{}{}:
 			}
 			defer func() { <-sem }()
+			scope := newImageAccountAttemptScope(maxImageAccountFallbackAttempts)
 			items, err := s.generateImageWithPoolScoped(ctx, prompt, model, size, resolution, refs, scope)
 			if err != nil {
 				errs[i] = err

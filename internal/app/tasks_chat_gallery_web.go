@@ -1202,9 +1202,16 @@ func (s *Server) handleChatConversationID(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleWeb(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
-		path := filepath.Join(s.webDist, filepath.Clean(r.URL.Path))
-		if st, err := os.Stat(path); err == nil && !st.IsDir() {
-			http.ServeFile(w, r, path)
+		path, ok := webDistPath(s.webDist, r.URL.Path)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if serveWebDistPath(w, r, path) {
+			return
+		}
+		if filepath.Ext(path) != "" {
+			http.NotFound(w, r)
 			return
 		}
 	}
@@ -1214,4 +1221,38 @@ func (s *Server) handleWeb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "service": "gpt2api-image", "hint": "web_dist/index.html not found; build frontend to enable SPA"})
+}
+
+func webDistPath(webDist, urlPath string) (string, bool) {
+	rel := strings.TrimLeft(filepath.ToSlash(strings.TrimSpace(urlPath)), "/")
+	if rel == "" {
+		return filepath.Join(webDist, "index.html"), true
+	}
+	nativeRel := filepath.Clean(filepath.FromSlash(rel))
+	if nativeRel == "." || nativeRel == ".." || filepath.IsAbs(nativeRel) || strings.HasPrefix(nativeRel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	base := filepath.Clean(webDist)
+	target := filepath.Clean(filepath.Join(base, nativeRel))
+	if target != base && !strings.HasPrefix(target, base+string(os.PathSeparator)) {
+		return "", false
+	}
+	return target, true
+}
+
+func serveWebDistPath(w http.ResponseWriter, r *http.Request, path string) bool {
+	st, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if st.IsDir() {
+		index := filepath.Join(path, "index.html")
+		if st, err := os.Stat(index); err == nil && !st.IsDir() {
+			http.ServeFile(w, r, index)
+			return true
+		}
+		return false
+	}
+	http.ServeFile(w, r, path)
+	return true
 }

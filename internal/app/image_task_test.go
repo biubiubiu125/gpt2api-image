@@ -292,6 +292,57 @@ func TestSaveImageWithBaseURLUniqueForSameBytes(t *testing.T) {
 	}
 }
 
+func TestHandleWebServesStaticExportRouteIndex(t *testing.T) {
+	root := t.TempDir()
+	webDist := filepath.Join(root, "web_dist")
+	if err := os.MkdirAll(filepath.Join(webDist, "image"), 0755); err != nil {
+		t.Fatalf("make image route dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(webDist, "_next", "static"), 0755); err != nil {
+		t.Fatalf("make static dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(webDist, "index.html"), []byte("root index"), 0644); err != nil {
+		t.Fatalf("write root index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(webDist, "image", "index.html"), []byte("image route"), 0644); err != nil {
+		t.Fatalf("write route index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(webDist, "_next", "static", "app.js"), []byte("asset"), 0644); err != nil {
+		t.Fatalf("write static asset: %v", err)
+	}
+	s := &Server{webDist: webDist}
+
+	for _, path := range []string{"/image", "/image/"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		s.handleWeb(rr, req)
+		if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "image route") {
+			t.Fatalf("%s response status=%d body=%q, want route index", path, rr.Code, rr.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/_next/static/app.js", nil)
+	rr := httptest.NewRecorder()
+	s.handleWeb(rr, req)
+	if rr.Code != http.StatusOK || rr.Body.String() != "asset" {
+		t.Fatalf("static asset response status=%d body=%q, want asset", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/missing.js", nil)
+	rr = httptest.NewRecorder()
+	s.handleWeb(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("missing asset status = %d, want 404", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/../config.json", nil)
+	rr = httptest.NewRecorder()
+	s.handleWeb(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("path traversal status = %d, want 404", rr.Code)
+	}
+}
+
 func TestImageTaskCancelRejectsOversizedBody(t *testing.T) {
 	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "")
 	t.Setenv("GPT2API_IMAGE_DATABASE_URL", "")

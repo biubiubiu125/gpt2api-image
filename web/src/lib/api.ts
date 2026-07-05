@@ -484,7 +484,7 @@ export async function fetchImageOwners() {
   return httpRequest<{ items: ImageOwner[] }>("/api/images/owners");
 }
 
-export async function deleteManagedImages(body: { paths?: string[]; start_date?: string; end_date?: string; owner?: string; all_matching?: boolean }) {
+export async function deleteManagedImages(body: { paths?: string[]; start_date?: string; end_date?: string; owner?: string; tags?: string[]; all_matching?: boolean }) {
   return httpRequest<{ removed: number }>("/api/images/delete", { method: "POST", body });
 }
 

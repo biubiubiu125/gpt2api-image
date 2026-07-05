@@ -334,6 +334,7 @@ function ImageManagerContent() {
   const filteredItems = selectedTags.length > 0
     ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
     : items;
+  const hasActiveBulkFilter = Boolean(startDate || endDate || owner || selectedTags.length > 0);
 
   const lightboxImages = filteredItems.map((item) => ({
     id: item.name,
@@ -356,7 +357,7 @@ function ImageManagerContent() {
     }
     return map;
   }, [owners]);
-  const selectedCount = deleteMode === "filtered" ? items.length : selectedPaths.length;
+  const selectedCount = deleteMode === "filtered" ? filteredItems.length : selectedPaths.length;
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(imageKey(item)));
   const allSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedSet.has(imageKey(item)));
 
@@ -491,7 +492,7 @@ function ImageManagerContent() {
     try {
       const data = await deleteManagedImages(
         deleteMode === "filtered"
-          ? { start_date: startDate, end_date: endDate, owner, all_matching: true }
+          ? { start_date: startDate, end_date: endDate, owner, tags: selectedTags, all_matching: true }
           : { paths: selectedPaths },
       );
       toast.success(`已删除 ${data.removed} 张图片`);
@@ -506,7 +507,7 @@ function ImageManagerContent() {
   };
 
   const handleBatchDownload = async () => {
-    const paths = deleteMode === "filtered" ? items.map((item) => item.rel) : selectedPaths;
+    const paths = deleteMode === "filtered" ? filteredItems.map((item) => item.rel) : selectedPaths;
     if (paths.length === 0) return;
     setIsDownloading(true);
     try {
@@ -563,7 +564,7 @@ function ImageManagerContent() {
             {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
             查询
           </Button>
-          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || items.length === 0 || (!startDate && !endDate && !owner)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
+          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || filteredItems.length === 0 || !hasActiveBulkFilter} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
             <Trash2 className="size-4" />
             删除匹配结果
           </Button>

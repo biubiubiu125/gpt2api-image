@@ -314,6 +314,7 @@ func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 		StartDate   string   `json:"start_date"`
 		EndDate     string   `json:"end_date"`
 		Owner       string   `json:"owner"`
+		Tags        []string `json:"tags"`
 		AllMatching bool     `json:"all_matching"`
 	}
 	if !readBody(w, r, &b) {
@@ -326,16 +327,17 @@ func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 		if id.Role != "admin" {
 			owner = id.ID
 		}
+		requiredTags := normalizeImageFilterTags(b.Tags)
 		filter, err := newImageFilter(owner, b.StartDate, b.EndDate)
 		if err != nil {
 			writeErr(w, 400, err.Error())
 			return
 		}
-		if filter.empty() {
+		if filter.empty() && len(requiredTags) == 0 {
 			writeErr(w, 400, "at least one image filter is required")
 			return
 		}
-		paths = s.matchingImagePaths(owners, filter)
+		paths = s.matchingImagePaths(owners, s.store.LoadTags(), filter, requiredTags)
 	}
 	removed := 0
 	removedOwners := map[string]bool{}
@@ -362,10 +364,40 @@ func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"removed": removed})
 }
 
-func (s *Server) matchingImagePaths(owners map[string]string, filter imageFilter) []string {
+func normalizeImageFilterTags(values []string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func imageTagsMatch(actual []string, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	have := map[string]bool{}
+	for _, tag := range actual {
+		have[tag] = true
+	}
+	for _, tag := range required {
+		if !have[tag] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) matchingImagePaths(owners map[string]string, tags map[string][]string, filter imageFilter, requiredTags []string) []string {
 	paths := []string{}
 	_ = s.walkStoredImages(func(_ string, rel string, st os.FileInfo) error {
-		if filter.matches(owners[rel], st.ModTime()) {
+		if filter.matches(owners[rel], st.ModTime()) && imageTagsMatch(tags[rel], requiredTags) {
 			paths = append(paths, rel)
 		}
 		return nil
@@ -434,6 +466,29 @@ func (s *Server) handleImageDownloadSingle(w http.ResponseWriter, r *http.Reques
 	}
 	path, err := s.imagePath(rel)
 	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, path)
+}
+func (s *Server) handleStoredImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	rel, err := safeImageRel(strings.TrimPrefix(r.URL.Path, "/images/"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	path, err := s.imagePath(rel)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	st, err := os.Stat(path)
+	if err != nil || st.IsDir() || !isStoredImageFile(path) {
 		http.NotFound(w, r)
 		return
 	}

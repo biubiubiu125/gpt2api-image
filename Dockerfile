@@ -8,6 +8,7 @@ COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN corepack enable && pnpm install --frozen-lockfile
 COPY VERSION /app/VERSION
 COPY web ./
+RUN pnpm run typecheck
 RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" pnpm run build
 
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS go-build

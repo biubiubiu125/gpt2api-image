@@ -297,7 +297,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/chat/completions", s.handleV1ChatCompletionsImageOnly)
 	s.mux.HandleFunc("/v1/responses", s.handleV1ResponsesImageOnly)
 	s.mux.HandleFunc("/v1/messages", s.handleV1MessagesDisabled)
-	s.mux.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir(s.imagesDir))))
+	s.mux.HandleFunc("/images/", s.handleStoredImage)
 	s.mux.HandleFunc("/", s.handleWeb)
 }
 

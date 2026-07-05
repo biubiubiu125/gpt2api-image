@@ -60,6 +60,12 @@ jobs:
         working-directory: web
         run: pnpm install --frozen-lockfile
 
+      - name: Type-check frontend
+        working-directory: web
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+        run: pnpm run typecheck
+
       - name: Build frontend
         working-directory: web
         env:

@@ -264,6 +264,102 @@ func TestImageManagementFiltersOwnersAndBulkDelete(t *testing.T) {
 	}
 }
 
+func TestStoredImagesDoNotExposeDirectoryListing(t *testing.T) {
+	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "")
+	t.Setenv("GPT2API_IMAGE_DATABASE_URL", "")
+	t.Setenv("GPT2API_IMAGE_BASE_URL", "")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"auth-key":"root-key","image_retention_days":15}`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	s, err := newServer(root, false)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	rel := "2026/07/05/image.png"
+	path := filepath.Join(s.imagesDir, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("make image dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("image-data"), 0644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	for _, target := range []string{"/images/", "/images/2026/", "/images/2026/07/05/"} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d body=%q, want 404", target, rr.Code, rr.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/images/"+rel, nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || rr.Body.String() != "image-data" {
+		t.Fatalf("stored image response status=%d body=%q, want image data", rr.Code, rr.Body.String())
+	}
+}
+
+func TestImageBulkDeleteHonorsTagFilter(t *testing.T) {
+	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "")
+	t.Setenv("GPT2API_IMAGE_DATABASE_URL", "")
+	t.Setenv("GPT2API_IMAGE_BASE_URL", "")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"auth-key":"root-key","image_retention_days":15}`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	s, err := newServer(root, false)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	writeImage := func(rel string) {
+		path := filepath.Join(s.imagesDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("make image dir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("image"), 0644); err != nil {
+			t.Fatalf("write image %s: %v", rel, err)
+		}
+	}
+	taggedRel := "2026/07/05/tagged.png"
+	otherRel := "2026/07/05/other.png"
+	writeImage(taggedRel)
+	writeImage(otherRel)
+	if err := s.store.UpdateTags(func(tags map[string][]string) map[string][]string {
+		tags[taggedRel] = []string{"delete-me"}
+		tags[otherRel] = []string{"keep-me"}
+		return tags
+	}); err != nil {
+		t.Fatalf("save tags: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/images/delete", strings.NewReader(`{"tags":["delete-me"],"all_matching":true}`))
+	req.Header.Set("Authorization", "Bearer root-key")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("tag filtered delete status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var deleted struct {
+		Removed int `json:"removed"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if deleted.Removed != 1 {
+		t.Fatalf("removed = %d, want 1", deleted.Removed)
+	}
+	if _, err := os.Stat(filepath.Join(s.imagesDir, filepath.FromSlash(taggedRel))); !os.IsNotExist(err) {
+		t.Fatalf("tagged image should be deleted, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.imagesDir, filepath.FromSlash(otherRel))); err != nil {
+		t.Fatalf("non-matching tagged image should remain: %v", err)
+	}
+}
+
 func TestAdminClientTaskFallbackRequiresOwner(t *testing.T) {
 	store := &PGTaskStore{}
 	admin := Identity{ID: "admin", Role: "admin"}

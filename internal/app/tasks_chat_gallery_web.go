@@ -939,7 +939,10 @@ func (s *Server) resolveChatStreamImages(ctx context.Context, r *http.Request, i
 	}
 	if len(fileIDs) == 0 && len(sedimentIDs) == 0 && conversationID != "" {
 		opts := s.imageGenerationOptions()
-		f, sed := client.pollImageIDs(ctx, conversationID, opts.Timeout, opts.PollInterval, opts.PollInitialWait)
+		f, sed, err := client.pollImageIDs(ctx, conversationID, opts.Timeout, opts.PollInterval, opts.PollInitialWait)
+		if err != nil {
+			return fallbackText, false
+		}
 		fileIDs = append(fileIDs, f...)
 		sedimentIDs = append(sedimentIDs, sed...)
 	}

@@ -563,7 +563,10 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 	}
 	if cid != "" && len(fileIDs) == 0 && len(sedimentIDs) == 0 && !isImageQuotaMessage(message) {
 		traceLogf(ctx, "│  ├─ step poll final image tool records conversation=%s timeout=%s interval=%s", maskedValue(cid), opts.Timeout, opts.PollInterval)
-		f, s := c.pollImageIDs(ctx, cid, opts.Timeout, opts.PollInterval, opts.PollInitialWait)
+		f, s, err := c.pollImageIDs(ctx, cid, opts.Timeout, opts.PollInterval, opts.PollInitialWait)
+		if err != nil {
+			return nil, err
+		}
 		fileIDs = append(fileIDs, f...)
 		sedimentIDs = append(sedimentIDs, s...)
 	}
@@ -696,7 +699,7 @@ func (c *UpstreamClient) uploadImage(ctx context.Context, data []byte, name stri
 	traceLogf(ctx, "│  └─ upload image done file_id=%s", maskedValue(fileID))
 	return map[string]any{"file_id": fileID, "file_name": name, "file_size": len(data), "mime_type": mimeType, "width": cfg.Width, "height": cfg.Height}, nil
 }
-func (c *UpstreamClient) pollImageIDs(ctx context.Context, cid string, timeout, interval, initialWait time.Duration) ([]string, []string) {
+func (c *UpstreamClient) pollImageIDs(ctx context.Context, cid string, timeout, interval, initialWait time.Duration) ([]string, []string, error) {
 	if timeout <= 0 {
 		timeout = 120 * time.Second
 	}
@@ -708,7 +711,7 @@ func (c *UpstreamClient) pollImageIDs(ctx context.Context, cid string, timeout, 
 		traceLogf(ctx, "│  │  image poll initial wait %s", initialWait)
 		select {
 		case <-ctx.Done():
-			return nil, nil
+			return nil, nil, ctx.Err()
 		case <-time.After(initialWait):
 		}
 	}
@@ -720,13 +723,11 @@ func (c *UpstreamClient) pollImageIDs(ctx context.Context, cid string, timeout, 
 			f, s := extractToolIDs(conv)
 			traceLogf(ctx, "│  │  image poll extracted file_ids=%d sediment_ids=%d", len(f), len(s))
 			if len(f) > 0 || len(s) > 0 {
-				return f, s
+				return f, s, nil
 			}
 		} else {
 			traceLogf(ctx, "│  │  image poll conversation failed: %v", err)
-			if isTemporaryUpstreamErrorText(err) && backoff < interval*3 {
-				backoff += interval
-			}
+			return nil, nil, err
 		}
 		remaining := time.Until(deadline)
 		sleep := backoff
@@ -738,12 +739,12 @@ func (c *UpstreamClient) pollImageIDs(ctx context.Context, cid string, timeout, 
 		}
 		select {
 		case <-ctx.Done():
-			return nil, nil
+			return nil, nil, ctx.Err()
 		case <-time.After(sleep):
 		}
 	}
 	traceLogf(ctx, "│  └─ image poll timed out conversation=%s timeout=%s", maskedValue(cid), timeout)
-	return nil, nil
+	return nil, nil, fmt.Errorf("image poll timed out after %s", timeout)
 }
 func (c *UpstreamClient) getConversation(ctx context.Context, cid string) (map[string]any, error) {
 	path := "/backend-api/conversation/" + cid

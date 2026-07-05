@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	http "github.com/bogdanfinn/fhttp"
 )
@@ -123,6 +124,46 @@ func TestBootstrapRedirectErrorIncludesLocation(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bootstrap redirect: status=302") || !strings.Contains(err.Error(), "/auth/login") {
 		t.Fatalf("error = %q, want redirect status and location", err.Error())
+	}
+}
+
+func TestPollImageIDsReturnsRetryableTimeout(t *testing.T) {
+	client := &UpstreamClient{}
+	_, _, err := client.pollImageIDs(context.Background(), "conv-timeout", time.Nanosecond, time.Nanosecond, 0)
+	if err == nil {
+		t.Fatal("expected poll timeout error")
+	}
+	if !strings.Contains(err.Error(), "image poll timed out") {
+		t.Fatalf("error = %q, want image poll timeout", err.Error())
+	}
+	if !shouldRetryImageAccount(err) {
+		t.Fatalf("poll timeout should be retryable: %v", err)
+	}
+}
+
+func TestPollImageIDsReturnsRetryableConversation5xx(t *testing.T) {
+	client := &UpstreamClient{
+		token:           "access-token",
+		userAgent:       "test-agent",
+		secCHUA:         `"Microsoft Edge";v="143"`,
+		secCHUAMobile:   "?0",
+		secCHUAPlatform: `"Windows"`,
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/backend-api/conversation/conv-503" {
+				t.Fatalf("path = %q, want /backend-api/conversation/conv-503", req.URL.Path)
+			}
+			return upstreamTestResponse(503, "busy"), nil
+		}),
+	}
+	_, _, err := client.pollImageIDs(context.Background(), "conv-503", time.Second, time.Millisecond, 0)
+	if err == nil {
+		t.Fatal("expected conversation 503 error")
+	}
+	if !strings.Contains(err.Error(), "status=503") {
+		t.Fatalf("error = %q, want status=503", err.Error())
+	}
+	if !shouldRetryImageAccount(err) {
+		t.Fatalf("conversation 503 should be retryable: %v", err)
 	}
 }
 

@@ -154,36 +154,107 @@ func (s *Server) imagePath(rel string) (string, error) {
 	return target, nil
 }
 
-func (s *Server) listImages(r *http.Request, ownerFilter string) map[string]any {
+type imageFilter struct {
+	Owner     string
+	StartDate string
+	EndDate   string
+}
+
+func newImageFilter(owner, startDate, endDate string) (imageFilter, error) {
+	start, err := normalizeImageFilterDate(startDate)
+	if err != nil {
+		return imageFilter{}, err
+	}
+	end, err := normalizeImageFilterDate(endDate)
+	if err != nil {
+		return imageFilter{}, err
+	}
+	if start != "" && end != "" && start > end {
+		return imageFilter{}, fmt.Errorf("start_date cannot be after end_date")
+	}
+	return imageFilter{Owner: strings.TrimSpace(owner), StartDate: start, EndDate: end}, nil
+}
+
+func normalizeImageFilterDate(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	t, err := time.Parse("2006-01-02", value)
+	if err != nil {
+		return "", fmt.Errorf("invalid image date %q", value)
+	}
+	return t.Format("2006-01-02"), nil
+}
+
+func (f imageFilter) empty() bool {
+	return f.Owner == "" && f.StartDate == "" && f.EndDate == ""
+}
+
+func (f imageFilter) matches(owner string, modTime time.Time) bool {
+	if f.Owner != "" {
+		switch f.Owner {
+		case "__unowned__":
+			if owner != "" {
+				return false
+			}
+		case "__admin__":
+			if owner != "admin" {
+				return false
+			}
+		default:
+			if owner != f.Owner {
+				return false
+			}
+		}
+	}
+	date := modTime.Format("2006-01-02")
+	if f.StartDate != "" && date < f.StartDate {
+		return false
+	}
+	if f.EndDate != "" && date > f.EndDate {
+		return false
+	}
+	return true
+}
+
+func isStoredImageFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp"
+}
+
+func (s *Server) walkStoredImages(fn func(path, rel string, st os.FileInfo) error) error {
+	return filepath.WalkDir(s.imagesDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !isStoredImageFile(path) {
+			return nil
+		}
+		st, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		rel, err := filepath.Rel(s.imagesDir, path)
+		if err != nil {
+			return nil
+		}
+		return fn(path, filepath.ToSlash(rel), st)
+	})
+}
+
+func (s *Server) listImages(r *http.Request, filter imageFilter) map[string]any {
 	owners := s.store.LoadOwners()
 	prompts := s.store.LoadPrompts()
 	tags := s.store.LoadTags()
 	items := []map[string]any{}
-	filepath.WalkDir(s.imagesDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" {
-			return nil
-		}
-		rel, _ := filepath.Rel(s.imagesDir, path)
-		rel = filepath.ToSlash(rel)
+	_ = s.walkStoredImages(func(path string, rel string, st os.FileInfo) error {
 		owner := owners[rel]
-		if ownerFilter != "" {
-			if ownerFilter == "__unowned__" && owner != "" {
-				return nil
-			}
-			if ownerFilter == "__admin__" && owner != "admin" {
-				return nil
-			}
-			if ownerFilter != "__unowned__" && ownerFilter != "__admin__" && owner != ownerFilter {
-				return nil
-			}
+		if !filter.matches(owner, st.ModTime()) {
+			return nil
 		}
-		st, _ := d.Info()
 		pr := prompts[rel]
-		items = append(items, map[string]any{"rel": rel, "path": rel, "name": d.Name(), "date": st.ModTime().Format("2006-01-02"), "size": st.Size(), "url": s.baseURL(r) + "/images/" + rel, "thumbnail_url": s.baseURL(r) + "/image-thumbnails/" + rel, "created_at": st.ModTime().Format(time.RFC3339), "tags": tags[rel], "owner_id": owner, "is_admin_owner": owner == "admin", "prompt": strAny(pr["prompt"], "")})
+		items = append(items, map[string]any{"rel": rel, "path": rel, "name": filepath.Base(path), "date": st.ModTime().Format("2006-01-02"), "size": st.Size(), "url": s.baseURL(r) + "/images/" + rel, "thumbnail_url": s.baseURL(r) + "/image-thumbnails/" + rel, "created_at": st.ModTime().Format(time.RFC3339), "tags": tags[rel], "owner_id": owner, "is_admin_owner": owner == "admin", "prompt": strAny(pr["prompt"], "")})
 		return nil
 	})
 	sort.Slice(items, func(i, j int) bool { return strAny(items[i]["created_at"], "") > strAny(items[j]["created_at"], "") })
@@ -193,15 +264,24 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
-	writeJSON(w, 200, s.listImages(r, r.URL.Query().Get("owner")))
+	filter, err := newImageFilter(r.URL.Query().Get("owner"), r.URL.Query().Get("start_date"), r.URL.Query().Get("end_date"))
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, s.listImages(r, filter))
 }
 func (s *Server) handleMyImages(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
 	}
-	owner := id.ID
-	writeJSON(w, 200, s.listImages(r, owner))
+	filter, err := newImageFilter(id.ID, r.URL.Query().Get("start_date"), r.URL.Query().Get("end_date"))
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, s.listImages(r, filter))
 }
 func (s *Server) handleImageOwners(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
@@ -209,10 +289,16 @@ func (s *Server) handleImageOwners(w http.ResponseWriter, r *http.Request) {
 	}
 	owners := s.store.LoadOwners()
 	counts := map[string]int{}
-	for _, o := range owners {
-		counts[o]++
-	}
-	items := []map[string]any{{"id": "__admin__", "name": "主密钥", "deleted": false, "count": counts["admin"]}, {"id": "__unowned__", "name": "未归属", "deleted": false, "count": 0}}
+	_ = s.walkStoredImages(func(_ string, rel string, _ os.FileInfo) error {
+		owner := owners[rel]
+		if owner == "" {
+			counts["__unowned__"]++
+		} else {
+			counts[owner]++
+		}
+		return nil
+	})
+	items := []map[string]any{{"id": "__admin__", "name": "主密钥", "deleted": false, "count": counts["admin"]}, {"id": "__unowned__", "name": "未归属", "deleted": false, "count": counts["__unowned__"]}}
 	for _, k := range s.store.LoadAuthKeys() {
 		items = append(items, map[string]any{"id": k.ID, "name": k.Name, "deleted": false, "count": counts[k.ID]})
 	}
@@ -224,15 +310,36 @@ func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b struct {
-		Paths []string `json:"paths"`
+		Paths       []string `json:"paths"`
+		StartDate   string   `json:"start_date"`
+		EndDate     string   `json:"end_date"`
+		Owner       string   `json:"owner"`
+		AllMatching bool     `json:"all_matching"`
 	}
 	if !readBody(w, r, &b) {
 		return
 	}
 	owners := s.store.LoadOwners()
+	paths := append([]string{}, b.Paths...)
+	if b.AllMatching {
+		owner := strings.TrimSpace(b.Owner)
+		if id.Role != "admin" {
+			owner = id.ID
+		}
+		filter, err := newImageFilter(owner, b.StartDate, b.EndDate)
+		if err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		if filter.empty() {
+			writeErr(w, 400, "at least one image filter is required")
+			return
+		}
+		paths = s.matchingImagePaths(owners, filter)
+	}
 	removed := 0
 	removedOwners := map[string]bool{}
-	for _, p := range b.Paths {
+	for _, p := range paths {
 		rel, err := safeImageRel(p)
 		if err != nil {
 			continue
@@ -250,14 +357,41 @@ func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(removedOwners) > 0 {
-		_ = s.store.UpdateOwners(func(owners map[string]string) map[string]string {
-			for rel := range removedOwners {
-				delete(owners, rel)
-			}
-			return owners
-		})
+		s.deleteImageMetadata(removedOwners)
 	}
 	writeJSON(w, 200, map[string]any{"removed": removed})
+}
+
+func (s *Server) matchingImagePaths(owners map[string]string, filter imageFilter) []string {
+	paths := []string{}
+	_ = s.walkStoredImages(func(_ string, rel string, st os.FileInfo) error {
+		if filter.matches(owners[rel], st.ModTime()) {
+			paths = append(paths, rel)
+		}
+		return nil
+	})
+	return paths
+}
+
+func (s *Server) deleteImageMetadata(rels map[string]bool) {
+	_ = s.store.UpdateOwners(func(owners map[string]string) map[string]string {
+		for rel := range rels {
+			delete(owners, rel)
+		}
+		return owners
+	})
+	_ = s.store.UpdatePrompts(func(prompts map[string]map[string]any) map[string]map[string]any {
+		for rel := range rels {
+			delete(prompts, rel)
+		}
+		return prompts
+	})
+	_ = s.store.UpdateTags(func(tags map[string][]string) map[string][]string {
+		for rel := range rels {
+			delete(tags, rel)
+		}
+		return tags
+	})
 }
 func (s *Server) handleImageDownload(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {

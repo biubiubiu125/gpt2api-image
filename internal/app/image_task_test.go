@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeImageResponseFormat(t *testing.T) {
@@ -128,6 +129,138 @@ func TestCleanupTaskInputPathsStaysUnderTaskInputs(t *testing.T) {
 	}
 	if _, err := os.Stat(base); err != nil {
 		t.Fatalf("task input root should not be touched: %v", err)
+	}
+}
+
+func TestImageManagementFiltersOwnersAndBulkDelete(t *testing.T) {
+	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "")
+	t.Setenv("GPT2API_IMAGE_DATABASE_URL", "")
+	t.Setenv("GPT2API_IMAGE_BASE_URL", "")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"auth-key":"root-key","image_retention_days":15}`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	s, err := newServer(root, false)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := s.store.SaveAuthKeys([]UserKey{{ID: "user-a", Name: "User A", Enabled: true}}); err != nil {
+		t.Fatalf("save auth keys: %v", err)
+	}
+
+	writeImage := func(rel string, mod time.Time) {
+		path := filepath.Join(s.imagesDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("make image dir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("image"), 0644); err != nil {
+			t.Fatalf("write image %s: %v", rel, err)
+		}
+		if err := os.Chtimes(path, mod, mod); err != nil {
+			t.Fatalf("set image time %s: %v", rel, err)
+		}
+	}
+	adminRel := "2026/07/01/admin.png"
+	userRel := "2026/07/02/user.png"
+	unownedRel := "2026/07/03/unowned.png"
+	writeImage(adminRel, time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	writeImage(userRel, time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC))
+	writeImage(unownedRel, time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+	if err := s.store.UpdateOwners(func(owners map[string]string) map[string]string {
+		owners[adminRel] = "admin"
+		owners[userRel] = "user-a"
+		return owners
+	}); err != nil {
+		t.Fatalf("save owners: %v", err)
+	}
+	if err := s.store.UpdatePrompts(func(prompts map[string]map[string]any) map[string]map[string]any {
+		prompts[userRel] = map[string]any{"prompt": "user prompt"}
+		return prompts
+	}); err != nil {
+		t.Fatalf("save prompts: %v", err)
+	}
+	if err := s.store.UpdateTags(func(tags map[string][]string) map[string][]string {
+		tags[userRel] = []string{"tag-a"}
+		return tags
+	}); err != nil {
+		t.Fatalf("save tags: %v", err)
+	}
+
+	do := func(method, target, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer root-key")
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	rr := do(http.MethodGet, "/api/images?start_date=2026-07-02&end_date=2026-07-02&owner=user-a", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list filtered images status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var listed struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	if len(listed.Items) != 1 || listed.Items[0]["rel"] != userRel {
+		t.Fatalf("filtered items = %#v, want only %s", listed.Items, userRel)
+	}
+
+	rr = do(http.MethodGet, "/api/images/owners", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("owners status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var ownersResp struct {
+		Items []struct {
+			ID    string `json:"id"`
+			Count int    `json:"count"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&ownersResp); err != nil {
+		t.Fatalf("decode owners response: %v", err)
+	}
+	counts := map[string]int{}
+	for _, item := range ownersResp.Items {
+		counts[item.ID] = item.Count
+	}
+	if counts["__admin__"] != 1 || counts["user-a"] != 1 || counts["__unowned__"] != 1 {
+		t.Fatalf("owner counts = %#v, want admin/user/unowned = 1", counts)
+	}
+
+	rr = do(http.MethodPost, "/api/images/delete", `{"start_date":"2026-07-02","end_date":"2026-07-02","owner":"user-a","all_matching":true}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("bulk delete status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var deleted struct {
+		Removed int `json:"removed"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&deleted); err != nil {
+		t.Fatalf("decode delete response: %v", err)
+	}
+	if deleted.Removed != 1 {
+		t.Fatalf("removed = %d, want 1", deleted.Removed)
+	}
+	if _, err := os.Stat(filepath.Join(s.imagesDir, filepath.FromSlash(userRel))); !os.IsNotExist(err) {
+		t.Fatalf("matching user image should be deleted, stat err=%v", err)
+	}
+	for _, rel := range []string{adminRel, unownedRel} {
+		if _, err := os.Stat(filepath.Join(s.imagesDir, filepath.FromSlash(rel))); err != nil {
+			t.Fatalf("non-matching image %s should remain: %v", rel, err)
+		}
+	}
+	if _, ok := s.store.LoadOwners()[userRel]; ok {
+		t.Fatalf("deleted image owner metadata should be removed")
+	}
+	if _, ok := s.store.LoadPrompts()[userRel]; ok {
+		t.Fatalf("deleted image prompt metadata should be removed")
+	}
+	if _, ok := s.store.LoadTags()[userRel]; ok {
+		t.Fatalf("deleted image tag metadata should be removed")
 	}
 }
 

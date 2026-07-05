@@ -20,12 +20,17 @@ func (s *Server) serveThumbnail(w http.ResponseWriter, r *http.Request, rel stri
 		return
 	}
 	thumb := s.thumbnailPath(rel)
-	if _, err := os.Stat(thumb); err == nil {
+	if st, err := os.Stat(thumb); err == nil && !st.IsDir() && isStoredImageFile(thumb) {
 		http.ServeFile(w, r, thumb)
 		return
 	}
 	src, err := s.imagePath(rel)
 	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	st, err := os.Stat(src)
+	if err != nil || st.IsDir() || !isStoredImageFile(src) {
 		http.NotFound(w, r)
 		return
 	}

@@ -529,6 +529,11 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 	if !readBody(w, r, &b) {
 		return
 	}
+	b.Prompt = strings.TrimSpace(b.Prompt)
+	if b.Prompt == "" {
+		writeErr(w, http.StatusBadRequest, "prompt is required")
+		return
+	}
 	if b.N < 1 {
 		b.N = 1
 	}

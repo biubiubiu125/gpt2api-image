@@ -88,7 +88,7 @@ func TestImageFailureMarksPendingDeleteWhenAccountIsActive(t *testing.T) {
 	}
 	s.accountPool.inflight["tok"] = 1
 
-	s.markAccountFailure("tok", errors.New("GET /backend-api/conversation failed: status=503 body=busy"), true)
+	s.markAccountFailure("tok", errors.New(`oauth refresh failed: status=400 body={"error":"invalid_grant"}`), true)
 
 	accounts := s.store.LoadAccounts()
 	if len(accounts) != 1 {
@@ -104,17 +104,14 @@ func TestImageFailureMarksPendingDeleteWhenAccountIsActive(t *testing.T) {
 	}
 }
 
-func TestImageFailureDeletesInactiveTemporaryAndTurnstileAccounts(t *testing.T) {
+func TestImageFailureDeletesInactiveInvalidAccounts(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
 	}{
-		{name: "temporary", err: errors.New("image generation SSE timed out (600s)")},
-		{name: "turnstile", err: errors.New("turnstile required")},
-		{name: "cloudflare", err: errors.New("GET failed: status=403 body=<html>something seems to have gone wrong</html>")},
-		{name: "cloudflare marker", err: errors.New("GET failed: status=403 body=cloudflare cf-chl just a moment")},
 		{name: "oauth invalid grant", err: errors.New(`oauth refresh failed: status=400 body={"error":"invalid_grant"}`)},
 		{name: "oauth missing refresh token", err: errors.New("refresh_token not found")},
+		{name: "token invalidated", err: errors.New("authentication token has been invalidated")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newImageAccountGuardTestServer(t)
@@ -124,6 +121,37 @@ func TestImageFailureDeletesInactiveTemporaryAndTurnstileAccounts(t *testing.T) 
 			s.markAccountFailure("tok", tc.err, true)
 			if got := s.store.LoadAccounts(); len(got) != 0 {
 				t.Fatalf("inactive abnormal account should be removed, got %#v", got)
+			}
+		})
+	}
+}
+
+func TestRetryableNonCredentialImageFailuresKeepAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "temporary", err: errors.New("image generation SSE timed out (600s)")},
+		{name: "upstream 503", err: errors.New("GET /backend-api/conversation failed: status=503 body=busy")},
+		{name: "turnstile", err: errors.New("turnstile required")},
+		{name: "cloudflare", err: errors.New("GET failed: status=403 body=<html>something seems to have gone wrong</html>")},
+		{name: "bootstrap", err: errors.New("bootstrap redirect: status=302 location=/auth/login")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newImageAccountGuardTestServer(t)
+			if err := s.store.SaveAccounts([]Account{{AccessToken: "tok", Status: accountStatusNormal, Quota: 5}}); err != nil {
+				t.Fatalf("save accounts: %v", err)
+			}
+			if !shouldRetryImageAccount(tc.err) {
+				t.Fatalf("%s should stay retryable", tc.name)
+			}
+			s.markAccountFailure("tok", tc.err, true)
+			got := s.store.LoadAccounts()
+			if len(got) != 1 {
+				t.Fatalf("retryable non-credential error should keep account, got %#v", got)
+			}
+			if got[0].PendingDelete || got[0].Status != accountStatusNormal || got[0].Quota != 5 || got[0].Fail != 1 {
+				t.Fatalf("account state after %s = %#v, want kept normal with one failure", tc.name, got[0])
 			}
 		})
 	}

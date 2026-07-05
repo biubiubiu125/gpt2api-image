@@ -521,6 +521,24 @@ func TestSaveImageWithBaseURLUniqueForSameBytes(t *testing.T) {
 	}
 }
 
+func TestHandleThumbnailRejectsImageDirectories(t *testing.T) {
+	root := t.TempDir()
+	s := &Server{
+		dataDir:   filepath.Join(root, "data"),
+		imagesDir: filepath.Join(root, "data", "images"),
+	}
+	if err := os.MkdirAll(filepath.Join(s.imagesDir, "2026", "07", "05"), 0755); err != nil {
+		t.Fatalf("make image date dir: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/image-thumbnails/2026/07/05/", nil)
+	rr := httptest.NewRecorder()
+	s.handleThumbnail(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("thumbnail directory status = %d body=%q, want 404", rr.Code, rr.Body.String())
+	}
+}
+
 func TestHandleWebServesStaticExportRouteIndex(t *testing.T) {
 	root := t.TempDir()
 	webDist := filepath.Join(root, "web_dist")
@@ -592,6 +610,36 @@ func TestImageTaskCancelRejectsOversizedBody(t *testing.T) {
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("cancel status = %d body=%s, want 413", rr.Code, rr.Body.String())
+	}
+}
+
+func TestImageTaskGenerationRejectsEmptyPromptWithoutDB(t *testing.T) {
+	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "")
+	t.Setenv("GPT2API_IMAGE_DATABASE_URL", "")
+	t.Setenv("GPT2API_IMAGE_BASE_URL", "")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"auth-key":"test","image_retention_days":15}`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	s, err := newServer(root, false)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	s.imageGenerator = func(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+		t.Fatalf("empty prompt should be rejected before image generation")
+		return nil, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/image-tasks/generations", strings.NewReader(`{"client_task_id":"empty-prompt","prompt":"   "}`))
+	req.Header.Set("Authorization", "Bearer test")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("generation status = %d body=%s, want 400", rr.Code, rr.Body.String())
+	}
+	if got := s.store.LoadTasks(); len(got) != 0 {
+		t.Fatalf("empty prompt should not create a task, got %#v", got)
 	}
 }
 

@@ -54,16 +54,6 @@ func imageAccountErrorRemovalReason(err error) (string, bool) {
 		return "", false
 	case isInvalidTokenErrorText(err):
 		return "invalid_token", true
-	case isRateLimitErrorText(err):
-		return "image_rate_limited_or_quota_empty", true
-	case isUpstreamBlockErrorText(err):
-		return "upstream_block", true
-	case isTurnstileRequirementErrorText(err):
-		return "turnstile_required", true
-	case isRetryableBootstrapError(err):
-		return "bootstrap_failed", true
-	case isTemporaryUpstreamErrorText(err):
-		return "temporary_upstream_error", true
 	default:
 		return "", false
 	}

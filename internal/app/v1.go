@@ -875,18 +875,24 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 		sseDone(w)
 		return
 	}
-	for i, result := range items {
-		data := []map[string]any{}
+	savedRels := make([]string, 0, len(items))
+	streamItems := make([][]map[string]any, 0, len(items))
+	for _, result := range items {
 		rel, url, err := s.saveImage(r, result.Bytes)
 		if err != nil {
-			s.refundImage(id, n-i)
+			s.cleanupSavedImages(savedRels)
+			s.refundImage(id, n)
 			sse(w, map[string]any{"error": err.Error()})
 			sseDone(w)
 			return
 		}
-		s.recordOwner(id, rel)
-		s.recordPrompt(rel, prompt, isEdit)
-		data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt)})
+		savedRels = append(savedRels, rel)
+		revisedPrompt := firstNonEmpty(result.RevisedPrompt, prompt)
+		streamItems = append(streamItems, []map[string]any{{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": revisedPrompt}})
+	}
+	for i, data := range streamItems {
+		s.recordOwner(id, savedRels[i])
+		s.recordPrompt(savedRels[i], prompt, isEdit)
 		sse(w, map[string]any{"object": "image.generation.result", "created": created, "model": model, "index": i, "total": n, "data": data})
 	}
 	if len(items) < n {

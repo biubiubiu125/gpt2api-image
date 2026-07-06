@@ -53,7 +53,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		added, skipped := 0, 0
-		_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
+		if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 			existing := map[string]int{}
 			for i, a := range accounts {
 				existing[a.AccessToken] = i
@@ -71,7 +71,10 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			return accounts
-		})
+		}); err != nil {
+			writeErr(w, 500, "failed to save accounts: "+err.Error())
+			return
+		}
 		refreshed, errs := s.refreshAccountInfos(r.Context(), keysOf(tokset))
 		accounts := s.store.LoadAccounts()
 		s.logSvc.add("account", "新增账号", map[string]any{"added": added, "skipped": skipped, "refreshed": refreshed})
@@ -92,7 +95,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		removed := 0
 		out := []Account{}
-		_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
+		if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 			out = []Account{}
 			for _, a := range accounts {
 				if targets[a.AccessToken] {
@@ -102,7 +105,10 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			return out
-		})
+		}); err != nil {
+			writeErr(w, 500, "failed to save accounts: "+err.Error())
+			return
+		}
 		writeJSON(w, 200, map[string]any{"removed": removed, "mailboxes_removed": 0, "mailbox_errors": []any{}, "items": out})
 	default:
 		writeErr(w, 405, "method not allowed")
@@ -355,7 +361,6 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (i
 			if err == nil {
 				mergeRefreshedAccountInfo(&account, info)
 				updates[account.AccessToken] = account
-				refreshed++
 			}
 		}
 		cancel()
@@ -364,14 +369,18 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (i
 		}
 	}
 	if len(updates) > 0 {
-		_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
+		if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 			for i, a := range accounts {
 				if next, ok := updates[a.AccessToken]; ok {
 					accounts[i] = next
 				}
 			}
 			return accounts
-		})
+		}); err != nil {
+			errs = append(errs, map[string]any{"error": "failed to save refreshed accounts: " + err.Error()})
+		} else {
+			refreshed = len(updates)
+		}
 	}
 	s.cleanupUnusableImageAccounts()
 	return refreshed, errs
@@ -421,7 +430,7 @@ func (s *Server) handleAccountsUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var item Account
 	found := false
-	_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
+	if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 		for i, a := range accounts {
 			if a.AccessToken != token {
 				continue
@@ -441,7 +450,10 @@ func (s *Server) handleAccountsUpdate(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		return accounts
-	})
+	}); err != nil {
+		writeErr(w, 500, "failed to save accounts: "+err.Error())
+		return
+	}
 	if found {
 		writeJSON(w, 200, map[string]any{"item": item, "items": s.store.LoadAccounts()})
 		return

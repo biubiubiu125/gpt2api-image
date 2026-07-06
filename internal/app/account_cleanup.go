@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"log"
 	"strings"
 	"time"
 )
@@ -79,10 +80,10 @@ func (s *Server) imageAccountHasActiveWork(token string) bool {
 	return active > 0
 }
 
-func (s *Server) removeOrMarkImageAccount(token, reason string) bool {
+func (s *Server) removeOrMarkImageAccount(token, reason string) (bool, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return false
+		return false, nil
 	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -92,7 +93,7 @@ func (s *Server) removeOrMarkImageAccount(token, reason string) bool {
 	hasActiveWork := s.imageAccountHasActiveWork(token)
 	changed := false
 	removed := false
-	_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
+	if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 		out := accounts[:0]
 		for _, a := range accounts {
 			if a.AccessToken != token {
@@ -112,7 +113,10 @@ func (s *Server) removeOrMarkImageAccount(token, reason string) bool {
 			removed = true
 		}
 		return out
-	})
+	}); err != nil {
+		log.Printf("[account-cleanup] failed to save account cleanup state: %v", err)
+		return false, err
+	}
 	if changed && s.logSvc != nil {
 		action := "清退生图账号"
 		if !removed {
@@ -120,7 +124,7 @@ func (s *Server) removeOrMarkImageAccount(token, reason string) bool {
 		}
 		s.logSvc.add("account", action, map[string]any{"reason": reason, "removed": removed})
 	}
-	return changed
+	return changed, nil
 }
 
 func (s *Server) cleanupPendingDeletedAccounts() int {
@@ -130,7 +134,9 @@ func (s *Server) cleanupPendingDeletedAccounts() int {
 			continue
 		}
 		before := len(s.store.LoadAccounts())
-		s.removeOrMarkImageAccount(account.AccessToken, firstNonEmpty(ptrString(account.DeleteReason), "pending_delete"))
+		if _, err := s.removeOrMarkImageAccount(account.AccessToken, firstNonEmpty(ptrString(account.DeleteReason), "pending_delete")); err != nil {
+			continue
+		}
 		after := len(s.store.LoadAccounts())
 		if after < before {
 			removed += before - after
@@ -147,7 +153,9 @@ func (s *Server) cleanupUnusableImageAccounts() int {
 			continue
 		}
 		before := len(s.store.LoadAccounts())
-		s.removeOrMarkImageAccount(account.AccessToken, reason)
+		if _, err := s.removeOrMarkImageAccount(account.AccessToken, reason); err != nil {
+			continue
+		}
 		after := len(s.store.LoadAccounts())
 		if after < before {
 			removed += before - after

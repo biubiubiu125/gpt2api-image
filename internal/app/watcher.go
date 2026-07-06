@@ -37,7 +37,7 @@ func (s *Server) startLimitedAccountWatcher() {
 				if err != nil {
 					continue
 				}
-				_ = s.store.UpdateAccounts(func(updated []Account) []Account {
+				if err := s.store.UpdateAccounts(func(updated []Account) []Account {
 					for i := range updated {
 						if updated[i].AccessToken != token {
 							continue
@@ -52,7 +52,10 @@ func (s *Server) startLimitedAccountWatcher() {
 						break
 					}
 					return updated
-				})
+				}); err != nil {
+					log.Printf("[account-limited-watcher] failed to save refreshed account: %v", err)
+					continue
+				}
 				s.cleanupUnusableImageAccounts()
 			}
 		}

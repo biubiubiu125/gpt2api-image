@@ -87,7 +87,7 @@ func (s *Server) refreshOAuthAccount(ctx context.Context, oldToken string) (Acco
 			account.AccountID = &accountID
 		}
 	}
-	_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
+	if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 		for i, a := range accounts {
 			if a.AccessToken == oldToken || sameAccountID(a, account) || sameRefreshToken(a, oldRefreshToken) {
 				accounts[i] = account
@@ -96,7 +96,9 @@ func (s *Server) refreshOAuthAccount(ctx context.Context, oldToken string) (Acco
 		}
 		accounts = append(accounts, account)
 		return accounts
-	})
+	}); err != nil {
+		return Account{}, fmt.Errorf("save refreshed oauth account: %w", err)
+	}
 	return account, nil
 }
 

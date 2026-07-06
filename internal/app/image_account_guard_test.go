@@ -249,9 +249,12 @@ func TestCodexAccountImportRequiresRefreshToken(t *testing.T) {
 
 func TestInternalRegisterAccountRecordsUseSharedCodexValidation(t *testing.T) {
 	s := newImageAccountGuardTestServer(t)
-	added, skipped, msg := s.addAccountRecords([]map[string]any{
+	added, skipped, msg, err := s.addAccountRecords([]map[string]any{
 		{"accessToken": "tok", "sourceType": "codex", "quota": 10},
 	})
+	if err != nil {
+		t.Fatalf("addAccountRecords error: %v", err)
+	}
 	if msg == "" {
 		t.Fatal("expected internal codex account without refresh token to be rejected")
 	}
@@ -262,9 +265,12 @@ func TestInternalRegisterAccountRecordsUseSharedCodexValidation(t *testing.T) {
 		t.Fatalf("rejected codex account should not be stored, got %#v", got)
 	}
 
-	added, skipped, msg = s.addAccountRecords([]map[string]any{
+	added, skipped, msg, err = s.addAccountRecords([]map[string]any{
 		{"accessToken": "tok", "sourceType": "codex", "refreshToken": "refresh-token", "quota": 10},
 	})
+	if err != nil {
+		t.Fatalf("addAccountRecords error: %v", err)
+	}
 	if msg != "" {
 		t.Fatalf("internal codex account with refreshToken rejected: %s", msg)
 	}

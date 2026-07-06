@@ -1,6 +1,7 @@
 package app
 
 import (
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -111,7 +112,7 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 	}
 	now := nowISO()
 	removeReason := ""
-	_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
+	if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 		for i := range accounts {
 			if accounts[i].AccessToken != token {
 				continue
@@ -133,9 +134,14 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 			return accounts
 		}
 		return accounts
-	})
+	}); err != nil {
+		log.Printf("[account-state] failed to save account success state: %v", err)
+		return
+	}
 	if image && removeReason != "" {
-		s.removeOrMarkImageAccount(token, removeReason)
+		if _, err := s.removeOrMarkImageAccount(token, removeReason); err != nil {
+			log.Printf("[account-state] failed to remove exhausted image account: %v", err)
+		}
 	}
 }
 
@@ -150,7 +156,7 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 			removeReason = reason
 		}
 	}
-	_ = s.store.UpdateAccounts(func(accounts []Account) []Account {
+	if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 		for i := range accounts {
 			if accounts[i].AccessToken != token {
 				continue
@@ -181,8 +187,13 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 			return accounts
 		}
 		return accounts
-	})
+	}); err != nil {
+		log.Printf("[account-state] failed to save account failure state: %v", err)
+		return
+	}
 	if removeReason != "" {
-		s.removeOrMarkImageAccount(token, removeReason)
+		if _, err := s.removeOrMarkImageAccount(token, removeReason); err != nil {
+			log.Printf("[account-state] failed to remove failed image account: %v", err)
+		}
 	}
 }

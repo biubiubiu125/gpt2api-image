@@ -13,6 +13,10 @@ import (
 )
 
 func (s *Server) handleV1Models(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
 	if _, ok := s.requireIdentity(w, r); !ok {
 		return
 	}
@@ -107,6 +111,10 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 	writeJSON(w, 200, map[string]any{"created": time.Now().Unix(), "data": data})
 }
 func (s *Server) handleV1ImagesGenerations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -148,6 +156,10 @@ func (s *Server) handleV1ImagesGenerations(w http.ResponseWriter, r *http.Reques
 	s.imageResult(w, r, id, b.Prompt, b.Model, b.Size, b.Resolution, b.ResponseFormat, b.N, false, nil)
 }
 func (s *Server) handleV1ImagesEdits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -202,6 +214,10 @@ func (s *Server) handleV1ImagesEdits(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleV1ChatCompletionsImageOnly(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -218,6 +234,10 @@ func (s *Server) handleV1ChatCompletionsImageOnly(w http.ResponseWriter, r *http
 }
 
 func (s *Server) handleV1ResponsesImageOnly(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -238,10 +258,18 @@ func (s *Server) handleV1ResponsesImageOnly(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleV1MessagesDisabled(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	writeErr(w, 404, "messages API is disabled in gpt2api-image")
 }
 
 func (s *Server) handleV1ChatCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -382,14 +410,15 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 		writeErr(w, 403, err.Error())
 		return
 	}
-	if s.taskStore != nil {
+	clientTaskID := strings.TrimSpace(strAny(b["client_task_id"], strAny(b["task_id"], "")))
+	if s.taskStore != nil && clientTaskID != "" {
 		refs := extractChatImages(b)
 		mode := "generate"
 		if len(refs) > 0 {
 			mode = "edit"
 		}
 		task, _, err := s.createDBImageTask(r.Context(), id, imageTaskCreateRequest{
-			ClientTaskID:   strAny(b["client_task_id"], strAny(b["task_id"], "")),
+			ClientTaskID:   clientTaskID,
 			Mode:           mode,
 			Prompt:         prompt,
 			Model:          model,
@@ -460,6 +489,10 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *Server) handleV1Responses(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -529,6 +562,10 @@ func (s *Server) handleV1Responses(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"id": "resp_" + randID(8), "object": "response", "created_at": time.Now().Unix(), "status": "completed", "model": model, "output": out, "parallel_tool_calls": false, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": inputTokens + outputTokens}})
 }
 func (s *Server) handleV1Messages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	if r.Header.Get("Authorization") == "" && r.Header.Get("x-api-key") != "" {
 		r.Header.Set("Authorization", "Bearer "+r.Header.Get("x-api-key"))
 	}
@@ -605,13 +642,14 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 		writeErr(w, 403, err.Error())
 		return
 	}
-	if s.taskStore != nil {
+	clientTaskID := strings.TrimSpace(strAny(b["client_task_id"], strAny(b["task_id"], "")))
+	if s.taskStore != nil && clientTaskID != "" {
 		mode := "generate"
 		if len(refs) > 0 {
 			mode = "edit"
 		}
 		task, _, err := s.createDBImageTask(r.Context(), id, imageTaskCreateRequest{
-			ClientTaskID:   strAny(b["client_task_id"], strAny(b["task_id"], "")),
+			ClientTaskID:   clientTaskID,
 			Mode:           mode,
 			Prompt:         prompt,
 			Model:          model,
@@ -636,7 +674,7 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.imageRequestTimeout())
 	defer cancel()
-	items, err := s.generateImageWithPool(ctx, prompt, model, size, resolution, refs)
+	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, 1)
 	if err != nil {
 		s.refundImage(id, 1)
 		s.logCallFailure(callID, "/v1/responses", model, "Responses", err, nil)

@@ -146,6 +146,75 @@ func TestImageTaskEndpointsRejectWrongMethods(t *testing.T) {
 	}
 }
 
+func TestV1EndpointsRejectWrongMethods(t *testing.T) {
+	s := &Server{cfg: Config{AuthKey: "root-key"}, store: NewStore(t.TempDir())}
+	cases := []struct {
+		name   string
+		method string
+		target string
+		allow  string
+		call   func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "models", method: http.MethodPost, target: "/v1/models", allow: http.MethodGet, call: s.handleV1Models},
+		{name: "generations", method: http.MethodGet, target: "/v1/images/generations", allow: http.MethodPost, call: s.handleV1ImagesGenerations},
+		{name: "edits", method: http.MethodGet, target: "/v1/images/edits", allow: http.MethodPost, call: s.handleV1ImagesEdits},
+		{name: "chat completions", method: http.MethodGet, target: "/v1/chat/completions", allow: http.MethodPost, call: s.handleV1ChatCompletionsImageOnly},
+		{name: "responses", method: http.MethodGet, target: "/v1/responses", allow: http.MethodPost, call: s.handleV1ResponsesImageOnly},
+		{name: "messages disabled", method: http.MethodGet, target: "/v1/messages", allow: http.MethodPost, call: s.handleV1MessagesDisabled},
+		{name: "messages full", method: http.MethodGet, target: "/v1/messages", allow: http.MethodPost, call: s.handleV1Messages},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.target, nil)
+			rr := httptest.NewRecorder()
+
+			tc.call(rr, req)
+
+			if rr.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d body=%s, want 405", rr.Code, rr.Body.String())
+			}
+			if got := rr.Header().Get("Allow"); got != tc.allow {
+				t.Fatalf("Allow = %q, want %q", got, tc.allow)
+			}
+		})
+	}
+}
+
+func TestImageManagementEndpointsRejectWrongMethods(t *testing.T) {
+	s := &Server{cfg: Config{AuthKey: "root-key"}, store: NewStore(t.TempDir())}
+	cases := []struct {
+		name   string
+		method string
+		target string
+		allow  string
+		call   func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "admin images", method: http.MethodPost, target: "/api/images", allow: http.MethodGet, call: s.handleImages},
+		{name: "my images", method: http.MethodPost, target: "/api/me/images", allow: http.MethodGet, call: s.handleMyImages},
+		{name: "image owners", method: http.MethodPost, target: "/api/images/owners", allow: http.MethodGet, call: s.handleImageOwners},
+		{name: "delete images", method: http.MethodGet, target: "/api/images/delete", allow: http.MethodPost, call: s.handleImageDelete},
+		{name: "download images", method: http.MethodGet, target: "/api/images/download", allow: http.MethodPost, call: s.handleImageDownload},
+		{name: "download single image", method: http.MethodPost, target: "/api/images/download/2026/07/05/a.png", allow: "GET, HEAD", call: s.handleImageDownloadSingle},
+		{name: "thumbnail", method: http.MethodPost, target: "/image-thumbnails/2026/07/05/a.png", allow: "GET, HEAD", call: s.handleThumbnail},
+		{name: "image tags", method: http.MethodPut, target: "/api/images/tags", allow: "GET, POST", call: s.handleImageTags},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.target, nil)
+			rr := httptest.NewRecorder()
+
+			tc.call(rr, req)
+
+			if rr.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d body=%s, want 405", rr.Code, rr.Body.String())
+			}
+			if got := rr.Header().Get("Allow"); got != tc.allow {
+				t.Fatalf("Allow = %q, want %q", got, tc.allow)
+			}
+		})
+	}
+}
+
 func TestUpdateTaskStatusDoesNotOverrideCanceledTask(t *testing.T) {
 	store := NewStore(t.TempDir())
 	if err := store.SaveTasks([]ImageTask{{
@@ -857,6 +926,66 @@ func TestEnqueueV1ImageTaskRequiresClientTaskID(t *testing.T) {
 	})
 	if ok {
 		t.Fatalf("v1 image request without client_task_id should stay synchronous")
+	}
+}
+
+func TestV1ChatAndResponsesWithoutClientTaskIDStaySynchronousWithDB(t *testing.T) {
+	s, _ := newV1ImageCleanupTestServer(t)
+	s.taskStore = &PGTaskStore{}
+	generateCalls := 0
+	s.imageGenerator = func(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+		generateCalls++
+		return []upstreamImageResult{{Bytes: []byte("generated-image"), RevisedPrompt: prompt}}, nil
+	}
+
+	cases := []struct {
+		name       string
+		path       string
+		body       string
+		wantObject string
+	}{
+		{
+			name:       "chat completions",
+			path:       "/v1/chat/completions",
+			body:       `{"model":"gpt-image-2","prompt":"draw a cat"}`,
+			wantObject: "chat.completion",
+		},
+		{
+			name:       "responses",
+			path:       "/v1/responses",
+			body:       `{"model":"gpt-image-2","input":"draw a cat","tools":[{"type":"image_generation"}]}`,
+			wantObject: "response",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer test")
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+
+			s.Handler().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s, want 200", rr.Code, rr.Body.String())
+			}
+			var got map[string]any
+			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if got["object"] != tc.wantObject {
+				t.Fatalf("object = %#v, want %q; body=%s", got["object"], tc.wantObject, rr.Body.String())
+			}
+			if _, ok := got["task"]; ok {
+				t.Fatalf("response should be synchronous without client_task_id, got task body=%s", rr.Body.String())
+			}
+			if got["status"] == "queued" {
+				t.Fatalf("response should not be queued without client_task_id, body=%s", rr.Body.String())
+			}
+		})
+	}
+	if generateCalls != len(cases) {
+		t.Fatalf("image generation calls = %d, want %d", generateCalls, len(cases))
 	}
 }
 

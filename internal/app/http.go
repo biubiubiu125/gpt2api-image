@@ -27,6 +27,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"detail": map[string]any{"error": msg}})
 }
+func methodNotAllowed(w http.ResponseWriter, allow string) {
+	if strings.TrimSpace(allow) != "" {
+		w.Header().Set("Allow", allow)
+	}
+	writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+}
 func readBody[T any](w http.ResponseWriter, r *http.Request, dst *T) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {

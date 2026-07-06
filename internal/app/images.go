@@ -342,6 +342,10 @@ func (s *Server) listImages(r *http.Request, filter imageFilter) map[string]any 
 	return map[string]any{"items": items}
 }
 func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
@@ -353,6 +357,10 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.listImages(r, filter))
 }
 func (s *Server) handleMyImages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -365,6 +373,10 @@ func (s *Server) handleMyImages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.listImages(r, filter))
 }
 func (s *Server) handleImageOwners(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
@@ -386,6 +398,10 @@ func (s *Server) handleImageOwners(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": items})
 }
 func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -507,6 +523,10 @@ func (s *Server) deleteImageMetadata(rels map[string]bool) {
 	})
 }
 func (s *Server) handleImageDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
@@ -541,6 +561,10 @@ func (s *Server) handleImageDownload(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (s *Server) handleImageDownloadSingle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w, "GET, HEAD")
+		return
+	}
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
@@ -558,8 +582,7 @@ func (s *Server) handleImageDownloadSingle(w http.ResponseWriter, r *http.Reques
 }
 func (s *Server) handleStoredImage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		methodNotAllowed(w, "GET, HEAD")
 		return
 	}
 	rel, err := safeImageRel(strings.TrimPrefix(r.URL.Path, "/images/"))
@@ -580,10 +603,18 @@ func (s *Server) handleStoredImage(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w, "GET, HEAD")
+		return
+	}
 	rel := strings.TrimPrefix(r.URL.Path, "/image-thumbnails/")
 	s.serveThumbnail(w, r, rel)
 }
 func (s *Server) handleImageTags(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		methodNotAllowed(w, "GET, POST")
+		return
+	}
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
@@ -621,11 +652,10 @@ func (s *Server) handleImageTags(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "tags": b.Tags})
 		return
 	}
-	writeErr(w, 405, "method not allowed")
 }
 func (s *Server) handleImageTagDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		methodNotAllowed(w, http.MethodDelete)
 		return
 	}
 	if _, ok := s.requireAdmin(w, r); !ok {

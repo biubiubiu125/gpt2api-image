@@ -186,48 +186,65 @@ func loadConfig(path string) (Config, error) {
 }
 
 func (s *Server) saveConfig() error {
-	m := s.configMap(true)
+	return s.saveConfigValue(s.cfg)
+}
+
+func (s *Server) saveConfigValue(cfg Config) error {
+	m := configMapFrom(cfg, true)
 	return writeJSONFile(filepath.Join(s.root, "config.json"), m)
 }
 
 func (s *Server) configMap(includeAuth bool) map[string]any {
+	return configMapFrom(s.cfg, includeAuth)
+}
+
+func cloneConfig(cfg Config) Config {
+	next := cfg
+	next.Extra = map[string]any{}
+	for k, v := range cfg.Extra {
+		next.Extra[k] = v
+	}
+	return next
+}
+
+func configMapFrom(cfg Config, includeAuth bool) map[string]any {
 	m := map[string]any{}
-	for k, v := range s.cfg.Extra {
+	for k, v := range cfg.Extra {
 		if isLegacyConfigKey(k) || k == "ai_review" {
 			continue
 		}
 		m[k] = v
 	}
 	if includeAuth {
-		m["auth-key"] = s.cfg.AuthKey
+		m["auth-key"] = cfg.AuthKey
 	} else {
 		delete(m, "auth-key")
 		delete(m, "register_internal_key")
 	}
-	m["refresh_account_interval_minute"] = s.cfg.RefreshAccountIntervalMinute
-	m["image_retention_days"] = s.cfg.ImageRetentionDays
-	m["image_poll_timeout_secs"] = s.cfg.ImagePollTimeoutSecs
-	m["image_poll_interval_secs"] = s.cfg.ImagePollIntervalSecs
-	m["image_poll_initial_wait_secs"] = s.cfg.ImagePollInitialWaitSecs
-	m["image_task_timeout_secs"] = s.cfg.ImageTaskTimeoutSecs
-	m["image_task_claim_ttl_secs"] = s.cfg.ImageTaskClaimTTLSecs
-	m["image_worker_poll_interval_secs"] = s.cfg.ImageWorkerPollIntervalSecs
-	m["auto_remove_rate_limited_accounts"] = s.cfg.AutoRemoveRateLimitedAccounts
-	m["auto_remove_invalid_accounts"] = s.cfg.AutoRemoveInvalidAccounts
-	m["log_levels"] = s.cfg.LogLevels
-	m["log_request_text"] = s.cfg.LogRequestText
-	m["cors_allowed_origins"] = s.cfg.CORSAllowedOrigins
-	m["proxy"] = s.cfg.Proxy
-	m["upstream_transport"] = s.cfg.UpstreamTransport
-	m["image_route_strategy"] = s.cfg.ImageRouteStrategy
-	m["base_url"] = s.cfg.BaseURL
-	m["sensitive_words"] = s.cfg.SensitiveWords
-	m["global_system_prompt"] = s.cfg.GlobalSystemPrompt
-	m["image_account_concurrency"] = s.cfg.ImageAccountConcurrency
-	m["cleanup_protect_user_images"] = s.cfg.CleanupProtectUserImages
-	m["register_executor_url"] = s.cfg.RegisterExecutorURL
+	m["refresh_account_interval_minute"] = cfg.RefreshAccountIntervalMinute
+	m["image_retention_days"] = cfg.ImageRetentionDays
+	m["image_poll_timeout_secs"] = cfg.ImagePollTimeoutSecs
+	m["image_poll_interval_secs"] = cfg.ImagePollIntervalSecs
+	m["image_poll_initial_wait_secs"] = cfg.ImagePollInitialWaitSecs
+	m["image_task_timeout_secs"] = cfg.ImageTaskTimeoutSecs
+	m["image_task_claim_ttl_secs"] = cfg.ImageTaskClaimTTLSecs
+	m["image_worker_poll_interval_secs"] = cfg.ImageWorkerPollIntervalSecs
+	m["auto_remove_rate_limited_accounts"] = cfg.AutoRemoveRateLimitedAccounts
+	m["auto_remove_invalid_accounts"] = cfg.AutoRemoveInvalidAccounts
+	m["log_levels"] = cfg.LogLevels
+	m["log_request_text"] = cfg.LogRequestText
+	m["cors_allowed_origins"] = cfg.CORSAllowedOrigins
+	m["proxy"] = cfg.Proxy
+	m["upstream_transport"] = cfg.UpstreamTransport
+	m["image_route_strategy"] = cfg.ImageRouteStrategy
+	m["base_url"] = cfg.BaseURL
+	m["sensitive_words"] = cfg.SensitiveWords
+	m["global_system_prompt"] = cfg.GlobalSystemPrompt
+	m["image_account_concurrency"] = cfg.ImageAccountConcurrency
+	m["cleanup_protect_user_images"] = cfg.CleanupProtectUserImages
+	m["register_executor_url"] = cfg.RegisterExecutorURL
 	if includeAuth {
-		m["register_internal_key"] = s.cfg.RegisterInternalKey
+		m["register_internal_key"] = cfg.RegisterInternalKey
 	} else {
 		delete(m, "register_internal_key")
 	}

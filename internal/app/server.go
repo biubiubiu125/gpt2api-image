@@ -40,6 +40,7 @@ type Server struct {
 	logSvc           *logService
 	taskStore        *PGTaskStore
 	imageGenerator   imageGeneratorFunc
+	imageSaver       func(r *http.Request, data []byte) (string, string, error)
 }
 
 func NewServer(root string) (*Server, error) {

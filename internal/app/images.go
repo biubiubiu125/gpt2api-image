@@ -16,6 +16,9 @@ import (
 )
 
 func (s *Server) saveImage(r *http.Request, data []byte) (string, string, error) {
+	if s.imageSaver != nil {
+		return s.imageSaver(r, data)
+	}
 	return s.saveImageWithBaseURL(s.baseURL(r), data)
 }
 
@@ -43,6 +46,34 @@ func (s *Server) cleanupSavedImages(rels []string) {
 			_ = os.Remove(path)
 		}
 	}
+}
+
+func (s *Server) cleanupSavedImageResults(rels []string) {
+	s.cleanupSavedImages(rels)
+	if len(rels) == 0 || s.store == nil {
+		return
+	}
+	set := map[string]bool{}
+	for _, rel := range rels {
+		if cleaned := relClean(rel); cleaned != "" {
+			set[cleaned] = true
+		}
+	}
+	if len(set) == 0 {
+		return
+	}
+	_ = s.store.UpdateOwners(func(owners map[string]string) map[string]string {
+		for rel := range set {
+			delete(owners, rel)
+		}
+		return owners
+	})
+	_ = s.store.UpdatePrompts(func(prompts map[string]map[string]any) map[string]map[string]any {
+		for rel := range set {
+			delete(prompts, rel)
+		}
+		return prompts
+	})
 }
 
 func (s *Server) recordOwner(id *Identity, rel string) {

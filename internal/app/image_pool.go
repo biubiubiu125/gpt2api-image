@@ -252,6 +252,9 @@ func (s *Server) releaseImageAccountLease(ctx context.Context, leaseID string) {
 }
 
 func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+	if s.imageGenerator != nil {
+		return s.imageGenerator(ctx, prompt, model, size, resolution, refs, n)
+	}
 	if n <= 1 {
 		return s.generateImageWithPool(ctx, prompt, model, size, resolution, refs)
 	}
@@ -308,9 +311,6 @@ func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size
 }
 
 func (s *Server) generateTaskImages(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
-	if s.imageGenerator != nil {
-		return s.imageGenerator(ctx, prompt, model, size, resolution, refs, n)
-	}
 	return s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
 }
 

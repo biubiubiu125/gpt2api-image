@@ -66,6 +66,7 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 	ctx, cancel := context.WithTimeout(r.Context(), s.imageRequestTimeout())
 	defer cancel()
 	data := []map[string]any{}
+	savedRels := []string{}
 	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
 	if err != nil {
 		s.refundImage(id, n)
@@ -76,11 +77,13 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 	for _, result := range items {
 		rel, url, err := s.saveImage(r, result.Bytes)
 		if err != nil {
-			s.refundImage(id, n-len(data))
+			s.cleanupSavedImageResults(savedRels)
+			s.refundImage(id, n)
 			s.logCallFailure(callID, endpoint, model, action, err, nil)
 			writeErr(w, 500, err.Error())
 			return
 		}
+		savedRels = append(savedRels, rel)
 		s.recordOwner(id, rel)
 		s.recordPrompt(rel, prompt, isEdit)
 		item := map[string]any{"url": url, "revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt)}
@@ -408,6 +411,7 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 	defer cancel()
 	refs := extractChatImages(b)
 	data := []map[string]any{}
+	savedRels := []string{}
 	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
 	if err != nil {
 		s.refundImage(id, n)
@@ -417,10 +421,12 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 	for _, result := range items {
 		rel, url, err := s.saveImage(r, result.Bytes)
 		if err != nil {
-			s.refundImage(id, n-len(data))
+			s.cleanupSavedImageResults(savedRels)
+			s.refundImage(id, n)
 			writeErr(w, 500, err.Error())
 			return
 		}
+		savedRels = append(savedRels, rel)
 		s.recordOwner(id, rel)
 		s.recordPrompt(rel, prompt, len(refs) > 0)
 		data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt)})

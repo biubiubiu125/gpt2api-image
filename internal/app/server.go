@@ -163,13 +163,23 @@ func loadConfig(path string) (Config, error) {
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			return Config{}, err
+		}
 		raw = map[string]any{}
 	} else {
-		_ = json.Unmarshal(b, &raw)
+		if err := json.Unmarshal(b, &raw); err != nil {
+			return Config{}, fmt.Errorf("invalid config file %s: %w", path, err)
+		}
+		if raw == nil {
+			return Config{}, fmt.Errorf("invalid config file %s: expected JSON object", path)
+		}
 	}
 	var cfg Config
-	if b, _ := json.Marshal(raw); len(b) > 0 {
-		_ = json.Unmarshal(b, &cfg)
+	if b, err := json.Marshal(raw); err == nil && len(b) > 0 {
+		if err := json.Unmarshal(b, &cfg); err != nil {
+			return Config{}, fmt.Errorf("invalid config values in %s: %w", path, err)
+		}
 	}
 	cfg.Extra = raw
 	return cfg, nil

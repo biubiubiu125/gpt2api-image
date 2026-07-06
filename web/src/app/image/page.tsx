@@ -1480,6 +1480,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         referenceImages: sourceTurn.referenceImages,
         count,
         size: sourceTurn.size,
+        resolution: sourceTurn.resolution,
         images: createLoadingImages(nextTurnId, count),
         createdAt: now,
         status: "queued",

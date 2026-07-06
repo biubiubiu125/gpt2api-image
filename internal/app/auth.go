@@ -205,9 +205,12 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			raw = "sk-" + randID(24)
 		}
 		k := normalizeServiceKey(UserKey{ID: randID(6), Name: strings.TrimSpace(strAny(body["name"], "API 密钥")), KeyHash: hashKey(raw), Key: raw, Enabled: true, CreatedAt: nowISO()})
-		_ = s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
+		if err := s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
 			return append(keys, k)
-		})
+		}); err != nil {
+			writeErr(w, http.StatusInternalServerError, "save auth keys failed")
+			return
+		}
 		writeJSON(w, 200, map[string]any{"item": publicKey(k), "key": raw, "items": s.publicUserKeys()})
 	default:
 		writeErr(w, 405, "method not allowed")
@@ -253,7 +256,7 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		var item UserKey
-		_ = s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
+		if err := s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
 			for i := range keys {
 				if keys[i].ID == id {
 					keys[i].Key = raw
@@ -264,13 +267,16 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			return keys
-		})
+		}); err != nil {
+			writeErr(w, http.StatusInternalServerError, "save auth keys failed")
+			return
+		}
 		writeJSON(w, 200, map[string]any{"item": publicKey(item), "key": raw, "items": s.publicUserKeys()})
 		return
 	}
 	switch r.Method {
 	case http.MethodDelete:
-		_ = s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
+		if err := s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
 			out := keys[:0]
 			for _, k := range keys {
 				if k.ID == id {
@@ -279,7 +285,10 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 				out = append(out, k)
 			}
 			return out
-		})
+		}); err != nil {
+			writeErr(w, http.StatusInternalServerError, "save auth keys failed")
+			return
+		}
 		writeJSON(w, 200, map[string]any{"items": s.publicUserKeys()})
 	case http.MethodPost:
 		var b map[string]any
@@ -287,7 +296,7 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var k UserKey
-		_ = s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
+		if err := s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
 			for i := range keys {
 				if keys[i].ID != id {
 					continue
@@ -308,7 +317,10 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			return keys
-		})
+		}); err != nil {
+			writeErr(w, http.StatusInternalServerError, "save auth keys failed")
+			return
+		}
 		writeJSON(w, 200, map[string]any{"item": publicKey(k), "items": s.publicUserKeys()})
 	default:
 		writeErr(w, 405, "method not allowed")

@@ -717,6 +717,74 @@ func TestCreateAuthUserEndpointCreatesServiceKey(t *testing.T) {
 	}
 }
 
+func TestAuthUserEndpointWriteFailuresReturnServerError(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		target string
+		body   string
+		call   func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:   "create",
+			method: http.MethodPost,
+			target: "/api/auth/users",
+			body:   `{"name":"newapi","key":"sk-service"}`,
+			call:   (*Server).handleAuthUsers,
+		},
+		{
+			name:   "regenerate",
+			method: http.MethodPost,
+			target: "/api/auth/users/user-a/regenerate",
+			body:   `{"key":"sk-rotated"}`,
+			call:   (*Server).handleAuthUserID,
+		},
+		{
+			name:   "delete",
+			method: http.MethodDelete,
+			target: "/api/auth/users/user-a",
+			call:   (*Server).handleAuthUserID,
+		},
+		{
+			name:   "update",
+			method: http.MethodPost,
+			target: "/api/auth/users/user-a",
+			body:   `{"name":"renamed"}`,
+			call:   (*Server).handleAuthUserID,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{
+				cfg:   Config{AuthKey: "root-key"},
+				store: NewStore(t.TempDir()),
+			}
+			initial := UserKey{ID: "user-a", Name: "User A", Key: "sk-user-a", KeyHash: hashKey("sk-user-a"), Enabled: true}
+			if err := s.store.SaveAuthKeys([]UserKey{initial}); err != nil {
+				t.Fatalf("save auth keys: %v", err)
+			}
+			if err := os.Mkdir(s.store.path("auth_keys.json.tmp"), 0755); err != nil {
+				t.Fatalf("block auth key temp write: %v", err)
+			}
+
+			req := httptest.NewRequest(tc.method, tc.target, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer root-key")
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			tc.call(s, rr, req)
+
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d body=%s, want 500", rr.Code, rr.Body.String())
+			}
+			keys := s.store.LoadAuthKeys()
+			if len(keys) != 1 || keys[0].ID != initial.ID || keys[0].Name != initial.Name || keys[0].KeyHash != initial.KeyHash {
+				t.Fatalf("auth keys changed after failed write: %#v", keys)
+			}
+		})
+	}
+}
+
 func TestSaveImageWithBaseURLUniqueForSameBytes(t *testing.T) {
 	root := t.TempDir()
 	s := &Server{

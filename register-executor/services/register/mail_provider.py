@@ -30,6 +30,9 @@ OUTLOOK_IN_USE_STALE_SECONDS = 3600
 OUTLOOK_RECORDED_STATES = {"used", "in_use", "token_invalid", "failed"}
 OUTLOOK_UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
 
+YYDS_DOMAIN_BLACKLIST_FILE = DATA_DIR / "yyds_domain_blacklist.json"
+_yyds_domain_blacklist_lock = Lock()
+
 
 def _load_ddg_aliases() -> set[str]:
     try:
@@ -202,6 +205,108 @@ def outlook_token_pool_stats(pool: list[dict[str, str]] | None = None) -> dict[s
             if state in counts:
                 counts[state] += 1
     return counts
+
+
+def _normalize_domain(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if "@" in text:
+        text = text.rsplit("@", 1)[1]
+    return text.lstrip("@").strip().strip(".")
+
+
+def _load_yyds_domain_blacklist() -> set[str]:
+    try:
+        if not YYDS_DOMAIN_BLACKLIST_FILE.exists():
+            return set()
+        data = json.loads(YYDS_DOMAIN_BLACKLIST_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    values: list[Any] = []
+    if isinstance(data, list):
+        values = data
+    elif isinstance(data, dict):
+        if isinstance(data.get("domains"), list):
+            values = data["domains"]
+        else:
+            values = list(data.keys())
+    return {domain for item in values if (domain := _normalize_domain(item))}
+
+
+def _save_yyds_domain_blacklist(domains: set[str]) -> None:
+    YYDS_DOMAIN_BLACKLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    YYDS_DOMAIN_BLACKLIST_FILE.write_text(json.dumps(sorted(domains), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def yyds_domain_blacklist_items() -> list[str]:
+    with _yyds_domain_blacklist_lock:
+        return sorted(_load_yyds_domain_blacklist())
+
+
+def add_yyds_domain_blacklist(domain: Any) -> bool:
+    target = _normalize_domain(domain)
+    if not target:
+        return False
+    with _yyds_domain_blacklist_lock:
+        domains = _load_yyds_domain_blacklist()
+        if target in domains:
+            return False
+        domains.add(target)
+        _save_yyds_domain_blacklist(domains)
+        return True
+
+
+def remove_yyds_domain_blacklist(domain: Any) -> bool:
+    target = _normalize_domain(domain)
+    if not target:
+        return False
+    with _yyds_domain_blacklist_lock:
+        domains = _load_yyds_domain_blacklist()
+        if target not in domains:
+            return False
+        domains.remove(target)
+        _save_yyds_domain_blacklist(domains)
+        return True
+
+
+def replace_yyds_domain_blacklist(values: list[Any]) -> list[str]:
+    domains = {_normalize_domain(item) for item in values}
+    domains.discard("")
+    with _yyds_domain_blacklist_lock:
+        _save_yyds_domain_blacklist(domains)
+        return sorted(domains)
+
+
+def reset_yyds_domain_blacklist() -> int:
+    with _yyds_domain_blacklist_lock:
+        domains = _load_yyds_domain_blacklist()
+        _save_yyds_domain_blacklist(set())
+        return len(domains)
+
+
+def is_yyds_domain_blacklisted(domain: Any) -> bool:
+    target = _normalize_domain(domain)
+    if not target:
+        return False
+    with _yyds_domain_blacklist_lock:
+        return target in _load_yyds_domain_blacklist()
+
+
+def _is_yyds_register_domain_error(error: Exception | str | None) -> bool:
+    return "user_register_http_400" in str(error or "").lower()
+
+
+def _is_http_400_error(error: Exception | str | None) -> bool:
+    text = str(error or "").lower()
+    return "http 400" in text or "_http_400" in text
+
+
+def mark_yyds_mailbox_error(mailbox: dict, error: Exception | str | None = None) -> bool:
+    if str(mailbox.get("provider") or "") != YydsMailProvider.name:
+        return False
+    if not _is_yyds_register_domain_error(error):
+        return False
+    domain = _normalize_domain(mailbox.get("source_domain") or mailbox.get("domain") or mailbox.get("address"))
+    return add_yyds_domain_blacklist(domain)
 
 
 ResultT = TypeVar("ResultT")
@@ -1166,7 +1271,15 @@ class YydsMailProvider(BaseMailProvider):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.api_base = str(entry.get("api_base") or "https://maliapi.215.im/v1").rstrip("/")
         self.api_key = str(entry["api_key"]).strip()
-        self.domain = [str(item).strip() for item in (entry.get("domain") or []) if str(item).strip()]
+        manual_blacklist = {_normalize_domain(item) for item in _normalize_string_list(entry.get("domain_blacklist"))}
+        manual_blacklist.discard("")
+        configured_domains = [_normalize_domain(item) for item in _normalize_string_list(entry.get("domain")) if _normalize_domain(item)]
+        self.configured_domain_count = len(configured_domains)
+        self.domain = [
+            domain
+            for domain in configured_domains
+            if domain not in manual_blacklist and not is_yyds_domain_blacklisted(domain)
+        ]
         self.subdomain = str(entry.get("subdomain") or "").strip()
         self.wildcard = bool(entry.get("wildcard"))
         self.session = _create_session(conf)
@@ -1189,17 +1302,61 @@ class YydsMailProvider(BaseMailProvider):
         return data if isinstance(data, list) else data.get("items") or data.get("messages") or data.get("data") or []
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        payload = {"localPart": username or _random_mailbox_name()}
-        if self.domain:
-            payload["domain"] = _next_domain(self.domain)
-        if self.subdomain:
-            payload["subdomain"] = self.subdomain
-        data = self._request("POST", "/accounts/wildcard" if self.wildcard else "/accounts", payload=payload)
+        if self.configured_domain_count > 0 and not self.domain:
+            raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
+        attempts = max(1, len(self.domain))
+        last_error: RuntimeError | None = None
+        source_domain = ""
+        data: dict[str, Any] = {}
+        for _ in range(attempts):
+            payload = {"localPart": username or _random_mailbox_name()}
+            source_domain = ""
+            if self.domain:
+                self.domain = [domain for domain in self.domain if not is_yyds_domain_blacklisted(domain)]
+                if not self.domain:
+                    break
+                source_domain = _next_domain(self.domain)
+                payload["domain"] = source_domain
+            if self.subdomain:
+                payload["subdomain"] = self.subdomain
+            try:
+                result = self._request("POST", "/accounts/wildcard" if self.wildcard else "/accounts", payload=payload)
+                if not isinstance(result, dict):
+                    raise RuntimeError("YYDSMail 返回数据格式异常")
+                data = result
+                break
+            except RuntimeError as error:
+                last_error = error
+                if source_domain and _is_http_400_error(error):
+                    add_yyds_domain_blacklist(source_domain)
+                    self.domain = [domain for domain in self.domain if domain != source_domain]
+                    continue
+                raise
+        else:
+            if last_error:
+                raise last_error
+        if not data:
+            if last_error:
+                raise last_error
+            raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
         address = str(data.get("address") or data.get("email") or "").strip()
         token = str(data.get("token") or data.get("temp_token") or data.get("tempToken") or data.get("access_token") or "").strip()
         if not address or not token:
             raise RuntimeError("YYDSMail 缺少 address 或 token")
-        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token, "account_id": str(data.get("id") or "")}
+        address_domain = _normalize_domain(address)
+        if source_domain and is_yyds_domain_blacklisted(source_domain):
+            raise RuntimeError(f"YYDSMail 域名已被黑名单过滤: {source_domain}")
+        if not source_domain and address_domain and is_yyds_domain_blacklisted(address_domain):
+            raise RuntimeError(f"YYDSMail 域名已被黑名单过滤: {address_domain}")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "domain": address_domain,
+            "source_domain": source_domain or address_domain,
+            "token": token,
+            "account_id": str(data.get("id") or ""),
+        }
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         data = self._request("GET", "/messages", token=str(mailbox.get("token") or ""), params={"address": mailbox["address"]})
@@ -1215,6 +1372,25 @@ class YydsMailProvider(BaseMailProvider):
         if isinstance(sender, dict):
             sender = sender.get("address") or sender.get("email") or sender.get("name") or ""
         return {"provider": self.name, "mailbox": mailbox["address"], "message_id": message_id, "subject": str(item.get("subject") or ""), "sender": str(sender), "text_content": text_content, "html_content": html_content, "received_at": _parse_received_at(item.get("createdAt") or item.get("created_at") or item.get("receivedAt") or item.get("date") or item.get("timestamp")), "raw": item}
+
+    def release_mailbox(self, mailbox: dict[str, Any]) -> tuple[bool, str]:
+        account_id = str(mailbox.get("account_id") or "").strip()
+        if not account_id:
+            return False, "missing account_id"
+        errors: list[str] = []
+        token = str(mailbox.get("token") or "").strip()
+        if token:
+            try:
+                self._request("DELETE", f"/accounts/{account_id}", token=token, expected=(200, 202, 204, 404))
+                return True, ""
+            except Exception as error:
+                errors.append(f"token: {error}")
+        try:
+            self._request("DELETE", f"/accounts/{account_id}", expected=(200, 202, 204, 404))
+            return True, ""
+        except Exception as error:
+            errors.append(f"api_key: {error}")
+        return False, "; ".join(errors)
 
     def close(self) -> None:
         self.session.close()
@@ -1650,6 +1826,8 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     仅对 outlook_token 邮箱生效：成功标记 used；失败时若是 token 失效标记 token_invalid，
     其余失败标记 failed（保留邮箱占用以便排查，可通过重置释放）。
     """
+    if not success:
+        mark_yyds_mailbox_error(mailbox, error)
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         return
     address = str(mailbox.get("address") or "").strip()
@@ -1665,11 +1843,26 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
         _set_outlook_token_state(address, "failed", reason[:300])
 
 
-def release_mailbox(mailbox: dict) -> None:
+def release_mailbox(mailbox: dict, mail_config: dict | None = None) -> tuple[bool, str]:
     """把 outlook_token 邮箱从 in_use 释放回未使用（用于流程主动放弃且未消费验证码时）。"""
-    if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
-        return
+    provider = str(mailbox.get("provider") or "")
+    if provider == YydsMailProvider.name:
+        if not mail_config:
+            return False, "missing mail_config"
+        try:
+            provider_instance = _create_provider(mail_config, provider, str(mailbox.get("provider_ref") or ""))
+            try:
+                if isinstance(provider_instance, YydsMailProvider):
+                    return provider_instance.release_mailbox(mailbox)
+            finally:
+                provider_instance.close()
+        except Exception as error:
+            return False, str(error)
+        return False, "yyds provider not available"
+    if provider != OutlookTokenProvider.name:
+        return True, ""
     _release_outlook_token_state(str(mailbox.get("address") or ""))
+    return True, ""
 
 
 def get_existing_mailbox(mail_config: dict, email: str) -> dict:

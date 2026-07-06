@@ -143,6 +143,7 @@ export function ImageSection() {
   const setBaseUrl = useSettingsStore((s) => s.setBaseUrl);
   const setImageRouteStrategy = useSettingsStore((s) => s.setImageRouteStrategy);
   const setImageRetentionDays = useSettingsStore((s) => s.setImageRetentionDays);
+  const setImageMaxStorageMB = useSettingsStore((s) => s.setImageMaxStorageMB);
   const setCleanupProtectUserImages = useSettingsStore((s) => s.setCleanupProtectUserImages);
   const setImagePollTimeoutSecs = useSettingsStore((s) => s.setImagePollTimeoutSecs);
   const setImagePollIntervalSecs = useSettingsStore((s) => s.setImagePollIntervalSecs);
@@ -221,17 +222,31 @@ export function ImageSection() {
       </div>
 
       <div className="space-y-3 rounded-xl border border-stone-200 bg-stone-50/60 p-4">
-        <div className="space-y-2">
-          <label className={LABEL_CLASS}>本地保留天数</label>
-          <Input
-            value={String(config?.image_retention_days || "")}
-            onChange={(e) => setImageRetentionDays(e.target.value)}
-            placeholder="30"
-            className={INPUT_CLASS + " md:max-w-xs"}
-          />
-          <p className={HELP_CLASS}>
-            自动删除多少天前的本地图片。用户图片保护默认开启，避免清理把下游仍在引用的图片删掉。
-          </p>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <label className={LABEL_CLASS}>本地保留天数</label>
+            <Input
+              value={String(config?.image_retention_days || "")}
+              onChange={(e) => setImageRetentionDays(e.target.value)}
+              placeholder="30"
+              className={INPUT_CLASS}
+            />
+            <p className={HELP_CLASS}>
+              自动删除多少天前的本地图片。用户图片保护默认开启，避免清理把下游仍在引用的图片删掉。
+            </p>
+          </div>
+          <div className="space-y-2">
+            <label className={LABEL_CLASS}>最大占用容量（MB）</label>
+            <Input
+              value={String(config?.image_max_storage_mb ?? "")}
+              onChange={(e) => setImageMaxStorageMB(e.target.value)}
+              placeholder="1024"
+              className={INPUT_CLASS}
+            />
+            <p className={HELP_CLASS}>
+              超过该容量后，从图片管理中最旧的本地图片开始删除；填 0 表示不按容量清理。
+            </p>
+          </div>
         </div>
         <label className={`flex items-start gap-3 ${TILE_CLASS} text-sm text-stone-700`}>
           <Checkbox

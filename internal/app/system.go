@@ -45,6 +45,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if v, ok := body["image_retention_days"]; ok {
 			next.ImageRetentionDays = intAny(v, next.ImageRetentionDays)
 		}
+		if v, ok := body["image_max_storage_mb"]; ok {
+			next.ImageMaxStorageMB = intAny(v, next.ImageMaxStorageMB)
+			if next.ImageMaxStorageMB < 0 {
+				next.ImageMaxStorageMB = 0
+			}
+		}
 		if v, ok := body["image_poll_timeout_secs"]; ok {
 			next.ImagePollTimeoutSecs = intAny(v, next.ImagePollTimeoutSecs)
 		}

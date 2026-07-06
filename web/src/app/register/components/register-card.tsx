@@ -18,12 +18,14 @@ import {
   UserPlus,
   Wrench,
 } from "lucide-react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { fetchYYDSDomainBlacklist, replaceYYDSDomainBlacklist, resetYYDSDomainBlacklist } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 import { useSettingsStore } from "../../settings/store";
@@ -57,7 +59,12 @@ export function RegisterCard() {
   const [configOpen, setConfigOpen] = useState(false);
   const configSectionRef = useRef<HTMLElement | null>(null);
   const logViewportRef = useRef<HTMLDivElement | null>(null);
+  const [yydsDomainBlacklistText, setYydsDomainBlacklistText] = useState("");
+  const [isYydsDomainBlacklistLoading, setIsYydsDomainBlacklistLoading] = useState(false);
   const logs = config?.logs || [];
+  const hasYYDSProvider = Boolean(
+    config?.mail?.providers?.some((provider) => String((provider as Record<string, unknown>).type || "") === "yyds_mail"),
+  );
 
   // 展开后把整个配置面板的底部滚到视口里。等一帧让 DOM 先渲染完，
   // 否则 scrollIntoView 拿到的是没展开前的位置。
@@ -74,6 +81,25 @@ export function RegisterCard() {
     if (!viewport) return;
     viewport.scrollTop = viewport.scrollHeight;
   }, [logs.length]);
+
+  useEffect(() => {
+    if (!hasYYDSProvider) return;
+    let cancelled = false;
+    setIsYydsDomainBlacklistLoading(true);
+    fetchYYDSDomainBlacklist()
+      .then((data) => {
+        if (!cancelled) setYydsDomainBlacklistText((data.items || []).join("\n"));
+      })
+      .catch(() => {
+        if (!cancelled) setYydsDomainBlacklistText("");
+      })
+      .finally(() => {
+        if (!cancelled) setIsYydsDomainBlacklistLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hasYYDSProvider]);
 
   if (isLoading) {
     return (
@@ -128,6 +154,36 @@ export function RegisterCard() {
       ...(type === "cloudmail" ? { api_base: "", admin_email: "", admin_password: "", domain: [] } : {}),
       ...(type === "outlook_token" ? { mailboxes: "", mode: "auto", imap_host: "outlook.office365.com" } : {}),
     });
+  };
+
+  const saveYYDSDomainBlacklist = async () => {
+    const domains = yydsDomainBlacklistText
+      .split(/[\n,]/)
+      .map((item) => item.trim().toLowerCase().replace(/^@+/, ""))
+      .filter(Boolean);
+    setIsYydsDomainBlacklistLoading(true);
+    try {
+      const data = await replaceYYDSDomainBlacklist(domains);
+      setYydsDomainBlacklistText((data.items || []).join("\n"));
+      toast.success("yyds 禁用域名已保存");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "保存 yyds 禁用域名失败");
+    } finally {
+      setIsYydsDomainBlacklistLoading(false);
+    }
+  };
+
+  const clearYYDSDomainBlacklist = async () => {
+    setIsYydsDomainBlacklistLoading(true);
+    try {
+      const data = await resetYYDSDomainBlacklist();
+      setYydsDomainBlacklistText((data.items || []).join("\n"));
+      toast.success("yyds 禁用域名已清空");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "清空 yyds 禁用域名失败");
+    } finally {
+      setIsYydsDomainBlacklistLoading(false);
+    }
   };
 
   return (
@@ -494,6 +550,7 @@ export function RegisterCard() {
               {providers.map((provider, index) => {
                 const type = String(provider.type || "tempmail_lol");
                 const domains = Array.isArray(provider.domain) ? provider.domain.map(String).join("\n") : "";
+                const yydsManualDomainBlacklist = Array.isArray(provider.domain_blacklist) ? provider.domain_blacklist.map(String).join("\n") : "";
                 const outlookMailboxes = Array.isArray(provider.mailboxes) ? provider.mailboxes.map(String).join("\n") : String(provider.mailboxes || "");
                 return (
                   <div key={index} className="space-y-3 rounded-lg border border-border bg-secondary/30 p-3">
@@ -610,6 +667,44 @@ export function RegisterCard() {
                       <div className="space-y-1.5">
                         <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">{type === "inbucket" ? "基础域名列表" : "Domain"}</label>
                         <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) })} placeholder={type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : type === "cloudmail" ? "每行一个域名，支持多域名轮询，可加 @ 前缀" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-lg border-border bg-background font-data text-[12px]" disabled={config.enabled} />
+                      </div>
+                    ) : null}
+                    {type === "yyds_mail" ? (
+                      <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50/60 p-3">
+                        <div className="space-y-1.5">
+                          <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-amber-700 uppercase">手动禁用域名后缀</label>
+                          <Textarea
+                            value={yydsManualDomainBlacklist}
+                            onChange={(event) => updateProvider(index, { domain_blacklist: event.target.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) })}
+                            placeholder="每行一个域名后缀，会和自动黑名单一起跳过"
+                            className="min-h-16 rounded-lg border-amber-200 bg-white font-data text-[12px]"
+                            disabled={config.enabled}
+                          />
+                        </div>
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-amber-700 uppercase">YYDS 禁用域名后缀</label>
+                            <div className="mt-1 text-xs leading-5 text-amber-700/80">
+                              注册阶段返回 user_register_http_400 后会自动加入这里，后续生成邮箱会跳过这些域名。
+                            </div>
+                          </div>
+                          {isYydsDomainBlacklistLoading ? <LoaderCircle className="size-4 animate-spin text-amber-700" /> : null}
+                        </div>
+                        <Textarea
+                          value={yydsDomainBlacklistText}
+                          onChange={(event) => setYydsDomainBlacklistText(event.target.value)}
+                          placeholder="每行一个域名后缀，例如 example.com"
+                          className="min-h-20 rounded-lg border-amber-200 bg-white font-data text-[12px]"
+                          disabled={config.enabled || isYydsDomainBlacklistLoading}
+                        />
+                        <div className="flex items-center gap-2">
+                          <Button type="button" variant="outline" className="h-8 cursor-pointer rounded-lg border-amber-200 bg-white px-3 text-xs text-amber-800" onClick={() => void saveYYDSDomainBlacklist()} disabled={config.enabled || isYydsDomainBlacklistLoading}>
+                            保存禁用域名
+                          </Button>
+                          <Button type="button" variant="outline" className="h-8 cursor-pointer rounded-lg border-border bg-white px-3 text-xs text-muted-foreground" onClick={() => void clearYYDSDomainBlacklist()} disabled={config.enabled || isYydsDomainBlacklistLoading || !yydsDomainBlacklistText.trim()}>
+                            清空
+                          </Button>
+                        </div>
                       </div>
                     ) : null}
                     {type === "outlook_token" ? (

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestV1ImageResultSaveFailureCleansSavedImagesAndRefunds(t *testing.T) {
@@ -75,6 +76,30 @@ func TestV1ImageResultStreamSaveFailureCleansSavedImagesAndRefunds(t *testing.T)
 	assertStreamSaveFailureCleaned(t, s, rr, saved, id.ID)
 }
 
+func TestV1ImageResultStreamWritesCallLogWithURLs(t *testing.T) {
+	s, id := newV1ImageCleanupTestServer(t)
+	s.imageGenerator = func(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+		return []upstreamImageResult{{Bytes: []byte("image data"), RevisedPrompt: prompt}}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	rr := httptest.NewRecorder()
+	s.imageResultStream(rr, req, id, "draw a cat", "gpt-image-2", "", "", 1, false, nil)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	logs := s.logSvc.listFiltered("call", "", "", "success", "/v1/images/generations", "gpt-image-2", "", 20)
+	if len(logs) == 0 {
+		t.Fatal("missing stream call success log")
+	}
+	detail, _ := logs[0]["detail"].(map[string]any)
+	urls, _ := detail["urls"].([]any)
+	if len(urls) != 1 {
+		t.Fatalf("logged urls = %#v, want one url", detail["urls"])
+	}
+}
+
 func newV1ImageCleanupTestServer(t *testing.T) (*Server, *Identity) {
 	t.Helper()
 	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "")
@@ -93,6 +118,118 @@ func newV1ImageCleanupTestServer(t *testing.T) (*Server, *Identity) {
 		t.Fatalf("save auth keys: %v", err)
 	}
 	return s, id
+}
+
+func TestImageStorageLimitDeletesOldestManagedImages(t *testing.T) {
+	s, _ := newV1ImageCleanupTestServer(t)
+	s.cfg.ImageMaxStorageMB = 1
+	base := time.Now().Add(-3 * time.Hour)
+	rels := []string{
+		"2026/07/01/oldest.png",
+		"2026/07/01/middle.png",
+		"2026/07/01/newest.png",
+	}
+	for i, rel := range rels {
+		path, err := s.imagePath(rel)
+		if err != nil {
+			t.Fatalf("image path: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("mkdir image dir: %v", err)
+		}
+		if err := os.WriteFile(path, make([]byte, 600*1024), 0644); err != nil {
+			t.Fatalf("write image: %v", err)
+		}
+		createdAt := base.Add(time.Duration(i) * time.Hour)
+		if err := os.Chtimes(path, createdAt, createdAt); err != nil {
+			t.Fatalf("chtimes image: %v", err)
+		}
+		if err := s.store.UpdateOwners(func(owners map[string]string) map[string]string {
+			owners[rel] = "admin"
+			return owners
+		}); err != nil {
+			t.Fatalf("update owners: %v", err)
+		}
+		if err := s.store.UpdatePrompts(func(prompts map[string]map[string]any) map[string]map[string]any {
+			prompts[rel] = map[string]any{"prompt": rel, "created_at": createdAt.Unix()}
+			return prompts
+		}); err != nil {
+			t.Fatalf("update prompts: %v", err)
+		}
+	}
+
+	removed := s.cleanupImageStorageLimit()
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	for _, rel := range rels[:2] {
+		path, _ := s.imagePath(rel)
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("old image %s still exists, stat err=%v", rel, err)
+		}
+		if _, ok := s.store.LoadOwners()[rel]; ok {
+			t.Fatalf("owner metadata still exists for %s", rel)
+		}
+		if _, ok := s.store.LoadPrompts()[rel]; ok {
+			t.Fatalf("prompt metadata still exists for %s", rel)
+		}
+	}
+	path, _ := s.imagePath(rels[2])
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("newest image should remain: %v", err)
+	}
+}
+
+func TestImageStorageLimitProtectsCurrentSavedImages(t *testing.T) {
+	s, _ := newV1ImageCleanupTestServer(t)
+	s.cfg.ImageMaxStorageMB = 1
+	oldRel := "2026/07/01/old.png"
+	currentRel := "2026/07/01/current.png"
+	oldPath, err := s.imagePath(oldRel)
+	if err != nil {
+		t.Fatalf("old image path: %v", err)
+	}
+	currentPath, err := s.imagePath(currentRel)
+	if err != nil {
+		t.Fatalf("current image path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(oldPath), 0755); err != nil {
+		t.Fatalf("mkdir old dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(currentPath), 0755); err != nil {
+		t.Fatalf("mkdir current dir: %v", err)
+	}
+	if err := os.WriteFile(oldPath, make([]byte, 700*1024), 0644); err != nil {
+		t.Fatalf("write old image: %v", err)
+	}
+	if err := os.WriteFile(currentPath, make([]byte, 1200*1024), 0644); err != nil {
+		t.Fatalf("write current image: %v", err)
+	}
+	base := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(oldPath, base, base); err != nil {
+		t.Fatalf("chtimes old image: %v", err)
+	}
+	if err := os.Chtimes(currentPath, time.Now(), time.Now()); err != nil {
+		t.Fatalf("chtimes current image: %v", err)
+	}
+	if err := s.store.UpdatePrompts(func(prompts map[string]map[string]any) map[string]map[string]any {
+		prompts[oldRel] = map[string]any{"prompt": "old", "created_at": base.Unix()}
+		prompts[currentRel] = map[string]any{"prompt": "current", "created_at": time.Now().Unix()}
+		return prompts
+	}); err != nil {
+		t.Fatalf("update prompts: %v", err)
+	}
+
+	removed := s.cleanupImageStorageLimitExcept(currentRel)
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old image still exists, stat err=%v", err)
+	}
+	if _, err := os.Stat(currentPath); err != nil {
+		t.Fatalf("current image should remain even when over limit: %v", err)
+	}
 }
 
 func installTwoImageGenerator(t *testing.T, s *Server) {

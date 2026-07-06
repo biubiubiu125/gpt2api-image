@@ -7,6 +7,7 @@ type Config struct {
 	DatabaseURL                   string         `json:"database_url"`
 	RefreshAccountIntervalMinute  int            `json:"refresh_account_interval_minute"`
 	ImageRetentionDays            int            `json:"image_retention_days"`
+	ImageMaxStorageMB             int            `json:"image_max_storage_mb"`
 	ImagePollTimeoutSecs          int            `json:"image_poll_timeout_secs"`
 	ImagePollIntervalSecs         int            `json:"image_poll_interval_secs"`
 	ImagePollInitialWaitSecs      int            `json:"image_poll_initial_wait_secs"`

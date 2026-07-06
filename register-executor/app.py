@@ -9,10 +9,11 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from services.config import config
 from services.outlook_check import check_outlook_pool
+from services.register import mail_provider
 from services.register_service import register_service
 
 
@@ -30,6 +31,11 @@ class OutlookPoolResetRequest(BaseModel):
 
 class OutlookPoolTestRequest(BaseModel):
     limit: int = 5
+
+
+class YYDSDomainBlacklistRequest(BaseModel):
+    domain: str | None = None
+    domains: list[str] = Field(default_factory=list)
 
 
 def _require_internal(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)) -> None:
@@ -107,6 +113,49 @@ def reset_outlook_pool(body: OutlookPoolResetRequest, x_register_internal_key: s
 def test_outlook_pool(body: OutlookPoolTestRequest, x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
     return {"result": check_outlook_pool(register_service.get(redact=False), body.limit)}
+
+
+@app.get("/api/register/yyds-domain-blacklist")
+def get_yyds_domain_blacklist(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
+    _require_internal(x_register_internal_key, authorization)
+    return {"items": mail_provider.yyds_domain_blacklist_items()}
+
+
+@app.post("/api/register/yyds-domain-blacklist")
+def add_yyds_domain_blacklist(body: YYDSDomainBlacklistRequest, x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
+    _require_internal(x_register_internal_key, authorization)
+    domains = list(body.domains or [])
+    if body.domain:
+        domains.append(body.domain)
+    added = sum(1 for domain in domains if mail_provider.add_yyds_domain_blacklist(domain))
+    return {"items": mail_provider.yyds_domain_blacklist_items(), "added": added}
+
+
+@app.post("/api/register/yyds-domain-blacklist/remove")
+def remove_yyds_domain_blacklist(body: YYDSDomainBlacklistRequest, x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
+    _require_internal(x_register_internal_key, authorization)
+    domains = list(body.domains or [])
+    if body.domain:
+        domains.append(body.domain)
+    removed = sum(1 for domain in domains if mail_provider.remove_yyds_domain_blacklist(domain))
+    return {"items": mail_provider.yyds_domain_blacklist_items(), "removed": removed}
+
+
+@app.post("/api/register/yyds-domain-blacklist/replace")
+def replace_yyds_domain_blacklist(body: YYDSDomainBlacklistRequest, x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
+    _require_internal(x_register_internal_key, authorization)
+    domains = list(body.domains or [])
+    if body.domain:
+        domains.append(body.domain)
+    items = mail_provider.replace_yyds_domain_blacklist(domains)
+    return {"items": items, "replaced": len(items)}
+
+
+@app.post("/api/register/yyds-domain-blacklist/reset")
+def reset_yyds_domain_blacklist(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
+    _require_internal(x_register_internal_key, authorization)
+    cleared = mail_provider.reset_yyds_domain_blacklist()
+    return {"items": mail_provider.yyds_domain_blacklist_items(), "cleared": cleared}
 
 
 @app.get("/api/register/events")

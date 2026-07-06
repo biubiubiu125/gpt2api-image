@@ -53,16 +53,21 @@ func (l *logService) add(typ, summary string, detail map[string]any) {
 
 func (s *Server) logCallStart(id *Identity, endpoint, model, action, requestText string) string {
 	callID := randID(8)
+	identityDetail := callIdentityDetail(id)
 	s.logMu.Lock()
 	if s.callStarts != nil {
 		s.callStarts[callID] = time.Now()
 	}
+	if len(identityDetail) > 0 {
+		if s.callDetails == nil {
+			s.callDetails = map[string]map[string]any{}
+		}
+		s.callDetails[callID] = identityDetail
+	}
 	s.logMu.Unlock()
 	detail := map[string]any{"call_id": callID, "endpoint": endpoint, "model": model, "action": action, "status": "started"}
-	if id != nil {
-		detail["subject_id"] = id.ID
-		detail["role"] = id.Role
-		detail["name"] = id.Name
+	for k, v := range identityDetail {
+		detail[k] = v
 	}
 	if s.cfg.LogRequestText && strings.TrimSpace(requestText) != "" {
 		detail["request_text"] = truncateText(sanitizeLogText(requestText), 500)
@@ -73,7 +78,11 @@ func (s *Server) logCallStart(id *Identity, endpoint, model, action, requestText
 
 func (s *Server) logCallSuccess(callID, endpoint, model, action string, extra map[string]any) {
 	detail := map[string]any{"call_id": callID, "endpoint": endpoint, "model": model, "action": action, "status": "success"}
-	if duration := s.callDurationMS(callID); duration >= 0 {
+	duration, identityDetail := s.finishCallStart(callID)
+	for k, v := range identityDetail {
+		detail[k] = v
+	}
+	if duration >= 0 {
 		detail["duration_ms"] = duration
 	}
 	for k, v := range extra {
@@ -84,7 +93,11 @@ func (s *Server) logCallSuccess(callID, endpoint, model, action string, extra ma
 
 func (s *Server) logCallFailure(callID, endpoint, model, action string, err error, extra map[string]any) {
 	detail := map[string]any{"call_id": callID, "endpoint": endpoint, "model": model, "action": action, "status": "failed"}
-	if duration := s.callDurationMS(callID); duration >= 0 {
+	duration, identityDetail := s.finishCallStart(callID)
+	for k, v := range identityDetail {
+		detail[k] = v
+	}
+	if duration >= 0 {
 		detail["duration_ms"] = duration
 	}
 	if err != nil {
@@ -94,6 +107,24 @@ func (s *Server) logCallFailure(callID, endpoint, model, action string, err erro
 		detail[k] = v
 	}
 	s.logSvc.add("call", action+"失败", detail)
+}
+
+func callIdentityDetail(id *Identity) map[string]any {
+	if id == nil {
+		return nil
+	}
+	detail := map[string]any{}
+	if subjectID := strings.TrimSpace(id.ID); subjectID != "" {
+		detail["subject_id"] = subjectID
+	}
+	if role := strings.TrimSpace(id.Role); role != "" {
+		detail["role"] = role
+	}
+	if name := strings.TrimSpace(id.Name); name != "" {
+		detail["name"] = name
+		detail["key_name"] = name
+	}
+	return detail
 }
 
 func sanitizeLogText(value string) string {
@@ -110,18 +141,20 @@ func sanitizeLogText(value string) string {
 	})
 }
 
-func (s *Server) callDurationMS(callID string) int64 {
+func (s *Server) finishCallStart(callID string) (int64, map[string]any) {
 	if callID == "" {
-		return -1
+		return -1, nil
 	}
 	s.logMu.Lock()
 	defer s.logMu.Unlock()
+	detail := s.callDetails[callID]
+	delete(s.callDetails, callID)
 	start, ok := s.callStarts[callID]
 	if !ok {
-		return -1
+		return -1, detail
 	}
 	delete(s.callStarts, callID)
-	return time.Since(start).Milliseconds()
+	return time.Since(start).Milliseconds(), detail
 }
 
 func truncateText(s string, n int) string {
@@ -130,6 +163,16 @@ func truncateText(s string, n int) string {
 		return string(r)
 	}
 	return string(r[:n]) + "..."
+}
+
+func logImageURLs(data []map[string]any) []string {
+	urls := []string{}
+	for _, item := range data {
+		if url := strings.TrimSpace(strAny(item["url"], "")); url != "" {
+			urls = append(urls, url)
+		}
+	}
+	return urls
 }
 
 func (l *logService) list(typ, startDate, endDate string, limit int) []map[string]any {

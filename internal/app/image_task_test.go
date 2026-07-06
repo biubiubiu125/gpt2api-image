@@ -1589,23 +1589,52 @@ func TestCallLogsHidePromptByDefaultAndRedactSecrets(t *testing.T) {
 		logSvc:     newLogService(t.TempDir()),
 		callStarts: map[string]time.Time{},
 	}
-	callID := s.logCallStart(&Identity{ID: "svc", Role: "admin"}, "/v1/images/generations", "gpt-image-2", "文生图", "private prompt")
+	callID := s.logCallStart(&Identity{ID: "svc", Role: "admin", Name: "Admin Key"}, "/v1/images/generations", "gpt-image-2", "文生图", "private prompt")
 	s.logCallFailure(callID, "/v1/images/generations", "gpt-image-2", "文生图", errors.New(`access_token: abc123 Bearer xyz789 password=secret {"refresh_token":"rrr456"}`), nil)
 
+	successID := s.logCallStart(&Identity{ID: "svc-ok", Role: "admin", Name: "Success Key"}, "/v1/responses", "gpt-image-2", "Responses image", "success prompt")
+	s.logCallSuccess(successID, "/v1/responses", "gpt-image-2", "Responses image", map[string]any{"images": 1})
+
 	items := s.logSvc.listFiltered("call", "", "", "", "", "", "", 10)
-	if len(items) != 2 {
-		t.Fatalf("logs len = %d, want 2", len(items))
+	if len(items) != 4 {
+		t.Fatalf("logs len = %d, want 4", len(items))
 	}
+	seenFailed := false
+	seenSuccess := false
 	for _, item := range items {
 		detail, _ := item["detail"].(map[string]any)
 		if _, ok := detail["request_text"]; ok {
 			t.Fatalf("request_text should be disabled by default: %#v", detail)
+		}
+		if strAny(detail["status"], "") == "failed" {
+			seenFailed = true
+			if got := strAny(detail["key_name"], ""); got != "Admin Key" {
+				t.Fatalf("failed log key_name = %q, want Admin Key; detail=%#v", got, detail)
+			}
+			if got := strAny(detail["subject_id"], ""); got != "svc" {
+				t.Fatalf("failed log subject_id = %q, want svc; detail=%#v", got, detail)
+			}
+		}
+		if strAny(detail["status"], "") == "success" && strAny(detail["endpoint"], "") == "/v1/responses" {
+			seenSuccess = true
+			if got := strAny(detail["key_name"], ""); got != "Success Key" {
+				t.Fatalf("success log key_name = %q, want Success Key; detail=%#v", got, detail)
+			}
+			if got := strAny(detail["subject_id"], ""); got != "svc-ok" {
+				t.Fatalf("success log subject_id = %q, want svc-ok; detail=%#v", got, detail)
+			}
 		}
 		if errText := strAny(detail["error"], ""); errText != "" {
 			if strings.Contains(errText, "abc123") || strings.Contains(errText, "xyz789") || strings.Contains(errText, "secret") || strings.Contains(errText, "rrr456") {
 				t.Fatalf("error was not redacted: %q", errText)
 			}
 		}
+	}
+	if !seenFailed {
+		t.Fatalf("failed call log was not found: %#v", items)
+	}
+	if !seenSuccess {
+		t.Fatalf("success call log was not found: %#v", items)
 	}
 }
 

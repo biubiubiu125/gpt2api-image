@@ -35,6 +35,7 @@ type Server struct {
 	taskCleanupMu    sync.Mutex
 	lastTaskCleanup  time.Time
 	callStarts       map[string]time.Time
+	callDetails      map[string]map[string]any
 	taskCancels      map[string]context.CancelFunc
 	accountPool      *accountPool
 	logSvc           *logService
@@ -121,7 +122,7 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 	}
 	cfg.UpstreamTransport = normalizeUpstreamTransport(cfg.UpstreamTransport)
 	cfg.ImageRouteStrategy = normalizeImageRouteStrategy(cfg.ImageRouteStrategy)
-	s := &Server{root: root, dataDir: filepath.Join(root, "data"), imagesDir: filepath.Join(root, "data", "images"), webDist: filepath.Join(root, "web_dist"), cfg: cfg, callStarts: map[string]time.Time{}, taskCancels: map[string]context.CancelFunc{}, accountPool: newAccountPool(&cfg)}
+	s := &Server{root: root, dataDir: filepath.Join(root, "data"), imagesDir: filepath.Join(root, "data", "images"), webDist: filepath.Join(root, "web_dist"), cfg: cfg, callStarts: map[string]time.Time{}, callDetails: map[string]map[string]any{}, taskCancels: map[string]context.CancelFunc{}, accountPool: newAccountPool(&cfg)}
 	if err := os.MkdirAll(s.imagesDir, 0755); err != nil {
 		return nil, err
 	}
@@ -224,6 +225,7 @@ func configMapFrom(cfg Config, includeAuth bool) map[string]any {
 	}
 	m["refresh_account_interval_minute"] = cfg.RefreshAccountIntervalMinute
 	m["image_retention_days"] = cfg.ImageRetentionDays
+	m["image_max_storage_mb"] = cfg.ImageMaxStorageMB
 	m["image_poll_timeout_secs"] = cfg.ImagePollTimeoutSecs
 	m["image_poll_interval_secs"] = cfg.ImagePollIntervalSecs
 	m["image_poll_initial_wait_secs"] = cfg.ImagePollInitialWaitSecs
@@ -384,6 +386,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/register/repair-abnormal", s.handleRegisterRepairAbnormal)
 	s.mux.HandleFunc("/api/register/outlook-pool/reset", s.handleRegisterOutlookPoolReset)
 	s.mux.HandleFunc("/api/register/outlook-pool/test", s.handleRegisterOutlookPoolTest)
+	s.mux.HandleFunc("/api/register/yyds-domain-blacklist", s.handleRegisterYYDSDomainBlacklist)
+	s.mux.HandleFunc("/api/register/yyds-domain-blacklist/remove", s.handleRegisterYYDSDomainBlacklistRemove)
+	s.mux.HandleFunc("/api/register/yyds-domain-blacklist/replace", s.handleRegisterYYDSDomainBlacklistReplace)
+	s.mux.HandleFunc("/api/register/yyds-domain-blacklist/reset", s.handleRegisterYYDSDomainBlacklistReset)
 	s.mux.HandleFunc("/api/register/events", s.handleRegisterEvents)
 	s.mux.HandleFunc("/internal/register/accounts", s.handleInternalRegisterAccounts)
 	s.mux.HandleFunc("/internal/register/accounts/refresh", s.handleInternalRegisterAccountsRefresh)

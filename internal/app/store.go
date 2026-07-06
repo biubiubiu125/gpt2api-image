@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -58,7 +59,82 @@ func writeJSONFileUnlocked(path string, value any) error {
 	if err := os.WriteFile(tmp, b, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	defer os.Remove(tmp)
+	if err := os.Rename(tmp, path); err != nil {
+		if shouldFallbackJSONOverwrite(err) {
+			return overwriteJSONFileSynced(path, b)
+		}
+		return err
+	}
+	return nil
+}
+
+func overwriteJSONFileSynced(path string, b []byte) error {
+	backup := path + ".bak"
+	hadOriginal := false
+	if old, err := os.ReadFile(path); err == nil {
+		hadOriginal = true
+		if err := os.WriteFile(backup, old, 0644); err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	writeErr := error(nil)
+	if _, err := f.Write(b); err != nil {
+		writeErr = err
+	}
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	if closeErr := f.Close(); writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr != nil && hadOriginal {
+		_ = restoreJSONBackup(path, backup)
+	}
+	if writeErr == nil {
+		_ = os.Remove(backup)
+	}
+	return writeErr
+}
+
+func restoreJSONBackup(path, backup string) error {
+	b, err := os.ReadFile(backup)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	restoreErr := error(nil)
+	if _, err := f.Write(b); err != nil {
+		restoreErr = err
+	}
+	if restoreErr == nil {
+		restoreErr = f.Sync()
+	}
+	if closeErr := f.Close(); restoreErr == nil {
+		restoreErr = closeErr
+	}
+	return restoreErr
+}
+
+func shouldFallbackJSONOverwrite(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "device or resource busy") ||
+		strings.Contains(msg, "cross-device link") ||
+		strings.Contains(msg, "operation not permitted") ||
+		strings.Contains(msg, "access is denied")
 }
 
 func updateJSONFile(path string, fn func() error) error {

@@ -76,11 +76,18 @@ func (s *Server) cleanupSavedImageResults(rels []string) {
 	})
 }
 
-func (s *Server) recordImageMetadata(id *Identity, rel, prompt string, isEdit bool) error {
+func (s *Server) recordImageMetadata(id *Identity, rel, prompt string, isEdit bool, protectedRels ...string) error {
 	if err := s.recordOwner(id, rel); err != nil {
 		return err
 	}
-	return s.recordPrompt(rel, prompt, isEdit)
+	if err := s.recordPrompt(rel, prompt, isEdit); err != nil {
+		return err
+	}
+	if len(protectedRels) == 0 {
+		protectedRels = []string{rel}
+	}
+	s.cleanupImageStorageLimitExcept(protectedRels...)
+	return nil
 }
 
 func (s *Server) recordOwner(id *Identity, rel string) error {
@@ -144,7 +151,119 @@ func (s *Server) cleanupOldImages() int {
 		}
 		return nil
 	})
-	// 清理空目录，深目录优先
+	s.cleanupEmptyImageDirs()
+	if removed > 0 && s.logSvc != nil {
+		s.logSvc.add("system", "清理旧图片", map[string]any{"removed": removed, "retention_days": days})
+	}
+	return removed
+}
+
+type storedImageCleanupItem struct {
+	path      string
+	rel       string
+	size      int64
+	createdAt time.Time
+}
+
+func (s *Server) cleanupImageStorageLimit() int {
+	return s.cleanupImageStorageLimitExcept()
+}
+
+func (s *Server) cleanupImageStorageLimitExcept(protectedRels ...string) int {
+	maxMB := s.cfg.ImageMaxStorageMB
+	if maxMB <= 0 || s.store == nil {
+		return 0
+	}
+	limitBytes := int64(maxMB) * 1024 * 1024
+	if limitBytes <= 0 {
+		return 0
+	}
+	protected := map[string]bool{}
+	for _, rel := range protectedRels {
+		if rel = relClean(rel); rel != "" {
+			protected[rel] = true
+		}
+	}
+	prompts := s.store.LoadPrompts()
+	items := []storedImageCleanupItem{}
+	var total int64
+	_ = s.walkStoredImages(func(path string, rel string, st os.FileInfo) error {
+		size := st.Size()
+		total += size
+		items = append(items, storedImageCleanupItem{
+			path:      path,
+			rel:       rel,
+			size:      size,
+			createdAt: storedImageCreatedAt(st, prompts[rel]),
+		})
+		return nil
+	})
+	if total <= limitBytes {
+		return 0
+	}
+	beforeBytes := total
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].createdAt.Equal(items[j].createdAt) {
+			return items[i].rel < items[j].rel
+		}
+		return items[i].createdAt.Before(items[j].createdAt)
+	})
+	removed := 0
+	removedRels := map[string]bool{}
+	for _, item := range items {
+		if total <= limitBytes {
+			break
+		}
+		if protected[item.rel] {
+			continue
+		}
+		if os.Remove(item.path) != nil {
+			continue
+		}
+		total -= item.size
+		removed++
+		removedRels[item.rel] = true
+	}
+	if len(removedRels) > 0 {
+		s.deleteImageMetadata(removedRels)
+		s.cleanupEmptyImageDirs()
+	}
+	if removed > 0 && s.logSvc != nil {
+		s.logSvc.add("system", "按容量清理本地图片", map[string]any{
+			"removed":      removed,
+			"max_mb":       maxMB,
+			"before_bytes": beforeBytes,
+			"after_bytes":  total,
+		})
+	}
+	return removed
+}
+
+func storedImageCreatedAt(st os.FileInfo, prompt map[string]any) time.Time {
+	if prompt != nil {
+		switch v := prompt["created_at"].(type) {
+		case float64:
+			if v > 0 {
+				return time.Unix(int64(v), 0)
+			}
+		case int64:
+			if v > 0 {
+				return time.Unix(v, 0)
+			}
+		case int:
+			if v > 0 {
+				return time.Unix(int64(v), 0)
+			}
+		case string:
+			if t, err := time.Parse(time.RFC3339, strings.TrimSpace(v)); err == nil {
+				return t
+			}
+		}
+	}
+	return st.ModTime()
+}
+
+func (s *Server) cleanupEmptyImageDirs() {
 	dirs := []string{}
 	_ = filepath.WalkDir(s.imagesDir, func(path string, d os.DirEntry, err error) error {
 		if err == nil && d.IsDir() && path != s.imagesDir {
@@ -156,10 +275,6 @@ func (s *Server) cleanupOldImages() int {
 	for _, d := range dirs {
 		_ = os.Remove(d)
 	}
-	if removed > 0 && s.logSvc != nil {
-		s.logSvc.add("system", "清理旧图片", map[string]any{"removed": removed, "retention_days": days})
-	}
-	return removed
 }
 
 func relFromURL(u string) string {

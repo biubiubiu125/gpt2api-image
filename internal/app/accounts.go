@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -75,9 +76,10 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, "failed to save accounts: "+err.Error())
 			return
 		}
-		refreshed, errs := s.refreshAccountInfos(r.Context(), keysOf(tokset))
+		tokens := keysOf(tokset)
+		refreshed, errs := s.refreshAccountInfos(r.Context(), tokens)
 		accounts := s.store.LoadAccounts()
-		s.logSvc.add("account", "新增账号", map[string]any{"added": added, "skipped": skipped, "refreshed": refreshed})
+		s.logSvc.add("account", "新增账号", map[string]any{"added": added, "skipped": skipped, "refreshed": refreshed, "emails": accountEmailsForTokens(accounts, tokens)})
 		writeJSON(w, 200, map[string]any{"added": added, "skipped": skipped, "refreshed": refreshed, "errors": errs, "items": accounts})
 	case http.MethodDelete:
 		var body struct {
@@ -93,6 +95,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 				targets[strings.TrimSpace(t)] = true
 			}
 		}
+		before := s.store.LoadAccounts()
 		removed := 0
 		out := []Account{}
 		if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
@@ -108,6 +111,9 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			writeErr(w, 500, "failed to save accounts: "+err.Error())
 			return
+		}
+		if removed > 0 && s.logSvc != nil {
+			s.logSvc.add("account", "删除账号", map[string]any{"removed": removed, "emails": accountEmailsForTokenSet(before, targets)})
 		}
 		writeJSON(w, 200, map[string]any{"removed": removed, "mailboxes_removed": 0, "mailbox_errors": []any{}, "items": out})
 	default:
@@ -234,6 +240,37 @@ func keysOf(m map[string]map[string]any) []string {
 	for k := range m {
 		out = append(out, k)
 	}
+	return out
+}
+
+func accountEmailsForTokens(accounts []Account, tokens []string) []string {
+	targets := map[string]bool{}
+	for _, token := range tokens {
+		if token = strings.TrimSpace(token); token != "" {
+			targets[token] = true
+		}
+	}
+	return accountEmailsForTokenSet(accounts, targets)
+}
+
+func accountEmailsForTokenSet(accounts []Account, targets map[string]bool) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, account := range accounts {
+		if len(targets) > 0 && !targets[account.AccessToken] {
+			continue
+		}
+		if account.Email == nil {
+			continue
+		}
+		email := strings.TrimSpace(*account.Email)
+		if email == "" || seen[strings.ToLower(email)] {
+			continue
+		}
+		seen[strings.ToLower(email)] = true
+		out = append(out, email)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -412,9 +449,23 @@ func (s *Server) handleAccountsRefresh(w http.ResponseWriter, r *http.Request) {
 			tokens = append(tokens, token)
 		}
 	}
+	before := s.store.LoadAccounts()
 	refreshed, errs := s.refreshAccountInfos(r.Context(), tokens)
-	writeJSON(w, 200, map[string]any{"refreshed": refreshed, "errors": errs, "items": s.store.LoadAccounts()})
+	accounts := s.store.LoadAccounts()
+	if s.logSvc != nil {
+		s.logSvc.add("account", "刷新账号", map[string]any{"refreshed": refreshed, "errors": len(errs), "emails": accountEmailsForRefreshLog(before, accounts, tokens)})
+	}
+	writeJSON(w, 200, map[string]any{"refreshed": refreshed, "errors": errs, "items": accounts})
 }
+
+func accountEmailsForRefreshLog(before, after []Account, tokens []string) []string {
+	emails := accountEmailsForTokens(after, tokens)
+	if len(emails) > 0 {
+		return emails
+	}
+	return accountEmailsForTokens(before, tokens)
+}
+
 func (s *Server) handleAccountsUpdate(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return

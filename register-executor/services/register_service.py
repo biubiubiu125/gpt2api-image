@@ -269,6 +269,8 @@ class RegisterService:
                 provider["mailboxes_count"] = len(credentials)
                 provider["mailboxes_preview"] = [self._mask_email(c["email"]) for c in credentials]
                 provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
+            if provider.get("type") == "yyds_mail":
+                provider["auto_domain_blacklist"] = mail_provider.yyds_domain_blacklist_items()
 
     def _drop_mail_proxy(self) -> None:
         if isinstance(self._config.get("mail"), dict):

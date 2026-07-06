@@ -198,7 +198,7 @@ func (s *Server) runDBImageTask(parent context.Context, workerID string, ttl tim
 			return err
 		}
 		savedRels = append(savedRels, rel)
-		if err := s.recordImageMetadata(identity, rel, task.Prompt, task.Mode == "edit"); err != nil {
+		if err := s.recordImageMetadata(identity, rel, task.Prompt, task.Mode == "edit", savedRels...); err != nil {
 			s.cleanupSavedImageResults(savedRels)
 			if changed, _ := s.taskStore.FailTask(parent, task.ID, workerID, err.Error()); changed {
 				s.refundImage(identity, count)
@@ -229,7 +229,7 @@ func (s *Server) runDBImageTask(parent context.Context, workerID string, ttl tim
 		s.refundImage(identity, count-len(data))
 	}
 	s.cleanupTaskInputPaths(task.InputPaths)
-	s.logCallSuccess(callID, endpoint, task.Model, action, map[string]any{"task_id": task.ID, "image_count": len(data)})
+	s.logCallSuccess(callID, endpoint, task.Model, action, map[string]any{"task_id": task.ID, "image_count": len(data), "urls": logImageURLs(data)})
 	return nil
 }
 

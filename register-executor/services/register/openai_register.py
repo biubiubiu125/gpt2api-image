@@ -442,6 +442,16 @@ def wait_for_code(
     return mail_provider.wait_for_code(_mail_config(register_proxy, deadline), mailbox, wrapped_check_control)
 
 
+def _release_mailbox(mailbox: dict, mail_config: dict, index: int) -> None:
+    released, reason = mail_provider.release_mailbox(mailbox, mail_config)
+    if released:
+        return
+    provider = str(mailbox.get("provider") or "")
+    address = str(mailbox.get("address") or "").strip() or "-"
+    if provider == "yyds_mail":
+        step(index, f"yyds 邮箱释放失败: {address}, {reason or 'unknown error'}", "yellow")
+
+
 from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
 
 
@@ -1209,57 +1219,66 @@ class PlatformRegistrar:
             login_session.close()
 
     def register(self, index: int) -> dict:
-        self._check_task_control()
-        step(index, "创建邮箱")
-        mailbox = create_mailbox(register_proxy=self.proxy, deadline=self.deadline)
-        email = str(mailbox.get("address") or "").strip()
-        if not email:
-            mail_provider.release_mailbox(mailbox)
-            raise RuntimeError("邮箱服务未返回 address")
-        label = str(mailbox.get("label") or "")
-        step(index, f"创建邮箱[{label}]: {email}")
-        code_consumed = False
-        try:
-            fixed_password = str(config.get("fixed_password") or "").strip()
-            password = fixed_password or _random_password()
-            first_name, last_name = _random_name()
-            self._platform_authorize(email, index)
-            self._register_user(email, password, index)
-            self._send_otp(index)
-            step(index, "等待邮箱验证码")
+        last_error: Exception | None = None
+        mail_config = _mail_config(self.proxy, self.deadline)
+        for attempt in range(2):
             self._check_task_control()
-            code = wait_for_code(mailbox, self.proxy, self._check_task_control, self.deadline, lambda: heartbeat(index))
-            if not code:
-                raise RuntimeError("等待邮箱验证码超时")
-            code_consumed = True
-            step(index, f"收到邮箱验证码 {code}")
-            self._validate_otp(code, index)
-            self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+            step(index, "创建邮箱" if attempt == 0 else "yyds 域名已禁用，重新创建邮箱")
+            mailbox = mail_provider.create_mailbox(mail_config)
+            email = str(mailbox.get("address") or "").strip()
+            if not email:
+                _release_mailbox(mailbox, mail_config, index)
+                raise RuntimeError("邮箱服务未返回 address")
+            label = str(mailbox.get("label") or "")
+            step(index, f"创建邮箱[{label}]: {email}")
+            code_consumed = False
             try:
-                tokens = self._exchange_registered_tokens(index)
+                fixed_password = str(config.get("fixed_password") or "").strip()
+                password = fixed_password or _random_password()
+                first_name, last_name = _random_name()
+                self._platform_authorize(email, index)
+                self._register_user(email, password, index)
+                self._send_otp(index)
+                step(index, "等待邮箱验证码")
+                self._check_task_control()
+                code = wait_for_code(mailbox, self.proxy, self._check_task_control, self.deadline, lambda: heartbeat(index))
+                if not code:
+                    raise RuntimeError("等待邮箱验证码超时")
+                code_consumed = True
+                step(index, f"收到邮箱验证码 {code}")
+                self._validate_otp(code, index)
+                self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+                try:
+                    tokens = self._exchange_registered_tokens(index)
+                except Exception as error:
+                    step(index, f"注册后 token 交换失败，尝试登录补取：{error}", "yellow")
+                    tokens = self._login_and_exchange_tokens(email, password, mailbox, index)
+            except (RegisterStopped, RegisterRunInvalidated) as error:
+                if code_consumed:
+                    mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
+                else:
+                    _release_mailbox(mailbox, mail_config, index)
+                raise
             except Exception as error:
-                step(index, f"注册后 token 交换失败，尝试登录补取：{error}", "yellow")
-                tokens = self._login_and_exchange_tokens(email, password, mailbox, index)
-        except (RegisterStopped, RegisterRunInvalidated) as error:
-            if code_consumed:
+                if mail_provider.mark_yyds_mailbox_error(mailbox, error) and not code_consumed and attempt == 0:
+                    step(index, "yyds 邮箱域名被注册接口拒绝，已禁用该域名并重试", "yellow")
+                    _release_mailbox(mailbox, mail_config, index)
+                    last_error = error
+                    continue
                 mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
-            else:
-                mail_provider.release_mailbox(mailbox)
-            raise
-        except Exception as error:
-            mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
-            raise
-        mail_provider.mark_mailbox_result(mailbox, success=True)
-        return {
-            "email": email,
-            "password": password,
-            "access_token": str(tokens.get("access_token") or "").strip(),
-            "refresh_token": str(tokens.get("refresh_token") or "").strip(),
-            "id_token": str(tokens.get("id_token") or "").strip(),
-            "client_id": platform_oauth_client_id,
-            "source_type": "web",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+                raise
+            mail_provider.mark_mailbox_result(mailbox, success=True)
+            return {
+                "email": email,
+                "password": password,
+                "access_token": str(tokens.get("access_token") or "").strip(),
+                "refresh_token": str(tokens.get("refresh_token") or "").strip(),
+                "id_token": str(tokens.get("id_token") or "").strip(),
+                "client_id": platform_oauth_client_id,
+                "source_type": "web",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        raise last_error or RuntimeError("yyds 邮箱域名被注册接口拒绝")
 
 def _task_timeout_seconds(value: object = None) -> int:
     try:

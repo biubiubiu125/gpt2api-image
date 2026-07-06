@@ -760,7 +760,7 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			savedRels = append(savedRels, rel)
-			if err := s.recordImageMetadata(identity, rel, b.Prompt, false); err != nil {
+			if err := s.recordImageMetadata(identity, rel, b.Prompt, false, savedRels...); err != nil {
 				s.cleanupSavedImageResults(savedRels)
 				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
 				if updated {
@@ -787,7 +787,7 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		if len(data) < b.N {
 			s.refundImage(identity, b.N-len(data))
 		}
-		s.logCallSuccess(callID, "/api/image-tasks/generations", b.Model, "文生图任务", map[string]any{"task_id": task.ID, "image_count": len(data)})
+		s.logCallSuccess(callID, "/api/image-tasks/generations", b.Model, "文生图任务", map[string]any{"task_id": task.ID, "image_count": len(data), "urls": logImageURLs(data)})
 	}(t, id)
 	writeJSON(w, 200, t)
 }
@@ -967,7 +967,7 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			savedRels = append(savedRels, rel)
-			if err := s.recordImageMetadata(identity, rel, prompt, true); err != nil {
+			if err := s.recordImageMetadata(identity, rel, prompt, true, savedRels...); err != nil {
 				s.cleanupSavedImageResults(savedRels)
 				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
 				if updated {
@@ -992,7 +992,7 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 			s.cleanupSavedImageResults(savedRels)
 			return
 		}
-		s.logCallSuccess(callID, "/api/image-tasks/edits", model, "图生图任务", map[string]any{"task_id": task.ID, "image_count": len(data)})
+		s.logCallSuccess(callID, "/api/image-tasks/edits", model, "图生图任务", map[string]any{"task_id": task.ID, "image_count": len(data), "urls": logImageURLs(data)})
 	}(t, id)
 	writeJSON(w, 200, t)
 }
@@ -1236,6 +1236,7 @@ func (s *Server) resolveChatStreamImages(ctx context.Context, r *http.Request, i
 		return fallbackText, false
 	}
 	data := []map[string]any{}
+	savedRels := []string{}
 	for _, u := range urls {
 		bytes, err := client.download(ctx, u)
 		if err != nil {
@@ -1245,10 +1246,12 @@ func (s *Server) resolveChatStreamImages(ctx context.Context, r *http.Request, i
 		if err != nil {
 			continue
 		}
-		if err := s.recordImageMetadata(id, rel, fallbackText, isEdit); err != nil {
+		protectedRels := append(append([]string{}, savedRels...), rel)
+		if err := s.recordImageMetadata(id, rel, fallbackText, isEdit, protectedRels...); err != nil {
 			s.cleanupSavedImageResults([]string{rel})
 			continue
 		}
+		savedRels = append(savedRels, rel)
 		data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(bytes), "revised_prompt": fallbackText})
 	}
 	if len(data) == 0 {
@@ -1331,7 +1334,7 @@ func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, i
 			return
 		}
 		savedRels = append(savedRels, rel)
-		if err := s.recordImageMetadata(id, rel, prompt, len(extractChatImages(b)) > 0); err != nil {
+		if err := s.recordImageMetadata(id, rel, prompt, len(extractChatImages(b)) > 0, savedRels...); err != nil {
 			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, 1)
 			sse(w, map[string]any{"type": "conversation.error", "error": err.Error(), "done": true})
@@ -1342,7 +1345,7 @@ func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, i
 		break
 	}
 	text := buildChatImageMarkdown(data)
-	s.logCallSuccess(callID, "/api/chat/stream", model, "聊天", map[string]any{"image": true, "image_count": len(data)})
+	s.logCallSuccess(callID, "/api/chat/stream", model, "聊天", map[string]any{"image": true, "image_count": len(data), "urls": logImageURLs(data)})
 	sse(w, map[string]any{"type": "conversation.delta", "delta": text, "text": text, "conversation_id": cid, "done": false})
 	sse(w, map[string]any{"type": "conversation.done", "text": text, "conversation_id": cid, "done": true})
 	sseDone(w)

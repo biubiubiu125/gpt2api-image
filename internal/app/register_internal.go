@@ -51,7 +51,13 @@ func (s *Server) handleInternalRegisterAccounts(w http.ResponseWriter, r *http.R
 			return
 		}
 		if s.logSvc != nil {
-			s.logSvc.add("account", "注册机写入账号", map[string]any{"added": added, "skipped": skipped})
+			tokens := []string{}
+			for _, rec := range body.AccountRecords {
+				if token := strings.TrimSpace(strAny(rec["access_token"], strAny(rec["accessToken"], ""))); token != "" {
+					tokens = append(tokens, token)
+				}
+			}
+			s.logSvc.add("account", "注册机写入账号", map[string]any{"added": added, "skipped": skipped, "emails": accountEmailsForTokens(s.store.LoadAccounts(), tokens)})
 		}
 		writeJSON(w, 200, map[string]any{"added": added, "skipped": skipped, "items": s.store.LoadAccounts()})
 	default:
@@ -113,12 +119,17 @@ func (s *Server) handleInternalRegisterAccountsRefresh(w http.ResponseWriter, r 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
+	before := s.store.LoadAccounts()
 	refreshed, errs := s.refreshAccountInfos(ctx, body.AccessTokens)
 	removed := 0
 	if !body.DeferInvalidRemoval {
 		removed = s.removeRegisterUnusableAccounts(body.AccessTokens, errs)
 	}
-	writeJSON(w, 200, map[string]any{"refreshed": refreshed, "errors": errs, "removed_unusable": removed, "items": s.store.LoadAccounts()})
+	accounts := s.store.LoadAccounts()
+	if s.logSvc != nil {
+		s.logSvc.add("account", "注册机刷新账号", map[string]any{"refreshed": refreshed, "errors": len(errs), "removed_unusable": removed, "emails": accountEmailsForRefreshLog(before, accounts, body.AccessTokens)})
+	}
+	writeJSON(w, 200, map[string]any{"refreshed": refreshed, "errors": errs, "removed_unusable": removed, "items": accounts})
 }
 
 func (s *Server) handleInternalRegisterAccountsDelete(w http.ResponseWriter, r *http.Request) {
@@ -153,6 +164,7 @@ func (s *Server) deleteAccountTokens(tokens []string) (int, error) {
 	if len(targets) == 0 {
 		return 0, nil
 	}
+	before := s.store.LoadAccounts()
 	removed := 0
 	err := s.store.UpdateAccounts(func(accounts []Account) []Account {
 		out := accounts[:0]
@@ -169,7 +181,7 @@ func (s *Server) deleteAccountTokens(tokens []string) (int, error) {
 		return 0, err
 	}
 	if removed > 0 && s.logSvc != nil {
-		s.logSvc.add("account", "注册机删除不可用账号", map[string]any{"removed": removed})
+		s.logSvc.add("account", "注册机删除不可用账号", map[string]any{"removed": removed, "emails": accountEmailsForTokenSet(before, targets)})
 	}
 	return removed, nil
 }

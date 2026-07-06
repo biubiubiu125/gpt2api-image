@@ -72,6 +72,7 @@ export type SettingsConfig = {
   sensitive_words?: string[];
   refresh_account_interval_minute?: number | string;
   image_retention_days?: number | string;
+  image_max_storage_mb?: number | string;
   cleanup_protect_user_images?: boolean;
   image_poll_timeout_secs?: number | string;
   image_poll_interval_secs?: number | string;
@@ -645,6 +646,43 @@ export async function testRegisterOutlookPool(limit = 5) {
     method: "POST",
     body: { limit },
   });
+}
+
+export type YYDSDomainBlacklistResponse = {
+  items: string[];
+  added?: number;
+  removed?: number;
+  cleared?: number;
+  executor?: string;
+};
+
+export async function fetchYYDSDomainBlacklist() {
+  return httpRequest<YYDSDomainBlacklistResponse>("/api/register/yyds-domain-blacklist");
+}
+
+export async function addYYDSDomainBlacklist(domains: string[]) {
+  return httpRequest<YYDSDomainBlacklistResponse>("/api/register/yyds-domain-blacklist", {
+    method: "POST",
+    body: { domains },
+  });
+}
+
+export async function removeYYDSDomainBlacklist(domains: string[]) {
+  return httpRequest<YYDSDomainBlacklistResponse>("/api/register/yyds-domain-blacklist/remove", {
+    method: "POST",
+    body: { domains },
+  });
+}
+
+export async function replaceYYDSDomainBlacklist(domains: string[]) {
+  return httpRequest<YYDSDomainBlacklistResponse>("/api/register/yyds-domain-blacklist/replace", {
+    method: "POST",
+    body: { domains },
+  });
+}
+
+export async function resetYYDSDomainBlacklist() {
+  return httpRequest<YYDSDomainBlacklistResponse>("/api/register/yyds-domain-blacklist/reset", { method: "POST" });
 }
 
 // ── Upstream proxy ────────────────────────────────────────────────

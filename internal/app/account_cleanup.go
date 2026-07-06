@@ -91,6 +91,7 @@ func (s *Server) removeOrMarkImageAccount(token, reason string) (bool, error) {
 	}
 	now := nowISO()
 	hasActiveWork := s.imageAccountHasActiveWork(token)
+	before := s.store.LoadAccounts()
 	changed := false
 	removed := false
 	if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
@@ -122,7 +123,7 @@ func (s *Server) removeOrMarkImageAccount(token, reason string) (bool, error) {
 		if !removed {
 			action = "标记生图账号待清退"
 		}
-		s.logSvc.add("account", action, map[string]any{"reason": reason, "removed": removed})
+		s.logSvc.add("account", action, map[string]any{"reason": reason, "removed": removed, "emails": accountEmailsForTokens(before, []string{token})})
 	}
 	return changed, nil
 }

@@ -32,6 +32,14 @@ function getDetailText(item: SystemLog, key: string) {
   return typeof value === "string" || typeof value === "number" ? String(value) : "-";
 }
 
+function getLogKeyName(item: SystemLog) {
+  return getDetailText(item, "key_name") !== "-"
+    ? getDetailText(item, "key_name")
+    : getDetailText(item, "name") !== "-"
+      ? getDetailText(item, "name")
+      : getDetailText(item, "subject_id");
+}
+
 function formatDuration(item: SystemLog) {
   const value = item.detail?.duration_ms;
   return typeof value === "number" ? `${(value / 1000).toFixed(2)} s` : "-";
@@ -40,6 +48,11 @@ function formatDuration(item: SystemLog) {
 function getUrls(item: SystemLog | null) {
   const urls = item?.detail?.urls;
   return Array.isArray(urls) ? urls.filter((url): url is string => typeof url === "string") : [];
+}
+
+function getEmails(item: SystemLog | null) {
+  const emails = item?.detail?.emails;
+  return Array.isArray(emails) ? emails.filter((email): email is string => typeof email === "string" && email.trim().length > 0) : [];
 }
 
 function getStatus(item: SystemLog) {
@@ -77,8 +90,10 @@ function LogsContent() {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deletingItems, setDeletingItems] = useState<SystemLog[]>([]);
   const detailUrls = getUrls(detailLog);
+  const detailEmails = getEmails(detailLog);
   const detailImages = detailUrls.map((url, index) => ({ id: `${index}`, src: url }));
   const isCallLog = type === LogType.Call;
+  const isAccountLog = type === LogType.Account;
   const pageSize = 10;
   const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
   const safePage = Math.min(page, pageCount);
@@ -228,6 +243,7 @@ function LogsContent() {
                   {isCallLog ? <TableHead>调用耗时</TableHead> : null}
                   {isCallLog ? <TableHead>状态</TableHead> : null}
                   {isCallLog ? <TableHead className="w-36">图片</TableHead> : null}
+                  {isAccountLog ? <TableHead className="min-w-[220px]">账号邮箱</TableHead> : null}
                   <TableHead>简述</TableHead>
                   <TableHead className="w-40">操作</TableHead>
                 </TableRow>
@@ -235,6 +251,7 @@ function LogsContent() {
               <TableBody>
                 {currentRows.map((item) => {
                   const urls = getUrls(item);
+                  const emails = getEmails(item);
                   return (
                     <TableRow key={item.id} className="text-stone-600">
                       <TableCell>
@@ -242,7 +259,7 @@ function LogsContent() {
                       </TableCell>
                       <TableCell className="whitespace-nowrap">{item.time}</TableCell>
                       <TableCell><Badge variant="secondary" className="rounded-md">{typeLabels[item.type] || item.type}</Badge></TableCell>
-                      {isCallLog ? <TableCell>{getDetailText(item, "key_name")}</TableCell> : null}
+                      {isCallLog ? <TableCell>{getLogKeyName(item)}</TableCell> : null}
                       {isCallLog ? <TableCell>{formatDuration(item)}</TableCell> : null}
                       {isCallLog ? (
                         <TableCell>
@@ -273,6 +290,22 @@ function LogsContent() {
                               <ImageIcon className="size-3.5" />
                               -
                             </span>
+                          )}
+                        </TableCell>
+                      ) : null}
+                      {isAccountLog ? (
+                        <TableCell>
+                          {emails.length ? (
+                            <div className="flex max-w-[360px] flex-wrap gap-1.5">
+                              {emails.slice(0, 4).map((email) => (
+                                <Badge key={email} variant="secondary" className="rounded-md font-data text-[11px]">
+                                  {email}
+                                </Badge>
+                              ))}
+                              {emails.length > 4 ? <span className="text-xs text-stone-400">+{emails.length - 4}</span> : null}
+                            </div>
+                          ) : (
+                            <span className="text-xs text-stone-400">-</span>
                           )}
                         </TableCell>
                       ) : null}
@@ -314,7 +347,7 @@ function LogsContent() {
             <div className="space-y-4">
               <div className="grid gap-3 rounded-xl border border-stone-200 bg-white p-4 text-sm text-stone-600 md:grid-cols-2">
                 {Object.entries(detailLog?.detail || {})
-                  .filter(([key, value]) => key !== "urls" && typeof value !== "object")
+                  .filter(([key, value]) => key !== "urls" && key !== "emails" && typeof value !== "object")
                   .map(([key, value]) => (
                     <div key={key} className="flex items-start justify-between gap-4">
                       <span className="text-stone-400">{key}</span>
@@ -322,6 +355,18 @@ function LogsContent() {
                     </div>
                   ))}
               </div>
+              {detailEmails.length ? (
+                <div className="rounded-xl border border-stone-200 bg-white p-4">
+                  <div className="mb-3 text-xs font-semibold text-stone-400">账号邮箱</div>
+                  <div className="flex flex-wrap gap-2">
+                    {detailEmails.map((email) => (
+                      <Badge key={email} variant="secondary" className="rounded-md font-data text-[11px]">
+                        {email}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
               {detailUrls.length ? (
                 <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3">
                   {detailUrls.map((url, index) => (

@@ -213,6 +213,11 @@ func redactRegisterSecrets(cfg RegisterConfig) RegisterConfig {
 			provider["mailboxes_count"] = countNonEmptyLines(text)
 			provider["mailboxes_preview"] = maskedMailboxPreview(text, 20)
 		}
+		if strings.EqualFold(strAny(provider["type"], ""), "yyds_mail") {
+			if _, ok := provider["auto_domain_blacklist"]; !ok {
+				provider["auto_domain_blacklist"] = []string{}
+			}
+		}
 	}
 	return cfg
 }
@@ -627,6 +632,70 @@ func (s *Server) handleRegisterOutlookPoolTest(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeErr(w, 400, "register executor is not configured")
+}
+
+func (s *Server) handleRegisterYYDSDomainBlacklist(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if !s.registerExecutorConfigured() {
+		if r.Method == http.MethodGet {
+			writeJSON(w, 200, map[string]any{"items": []string{}, "executor": "not_configured"})
+			return
+		}
+		writeErr(w, 400, "register executor is not configured")
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	s.proxyRegisterExecutorJSON(w, r, "/api/register/yyds-domain-blacklist")
+}
+
+func (s *Server) handleRegisterYYDSDomainBlacklistRemove(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	if !s.registerExecutorConfigured() {
+		writeErr(w, 400, "register executor is not configured")
+		return
+	}
+	s.proxyRegisterExecutorJSON(w, r, "/api/register/yyds-domain-blacklist/remove")
+}
+
+func (s *Server) handleRegisterYYDSDomainBlacklistReplace(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	if !s.registerExecutorConfigured() {
+		writeErr(w, 400, "register executor is not configured")
+		return
+	}
+	s.proxyRegisterExecutorJSON(w, r, "/api/register/yyds-domain-blacklist/replace")
+}
+
+func (s *Server) handleRegisterYYDSDomainBlacklistReset(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	if !s.registerExecutorConfigured() {
+		writeErr(w, 400, "register executor is not configured")
+		return
+	}
+	s.proxyRegisterExecutorJSON(w, r, "/api/register/yyds-domain-blacklist/reset")
 }
 
 func (s *Server) handleRegisterEvents(w http.ResponseWriter, r *http.Request) {

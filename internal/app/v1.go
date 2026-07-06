@@ -71,6 +71,7 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 	defer cancel()
 	data := []map[string]any{}
 	savedRels := []string{}
+	urls := []string{}
 	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
 	if err != nil {
 		s.refundImage(id, n)
@@ -88,7 +89,8 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 			return
 		}
 		savedRels = append(savedRels, rel)
-		if err := s.recordImageMetadata(id, rel, prompt, isEdit); err != nil {
+		urls = append(urls, url)
+		if err := s.recordImageMetadata(id, rel, prompt, isEdit, savedRels...); err != nil {
 			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, n)
 			s.logCallFailure(callID, endpoint, model, action, err, nil)
@@ -107,7 +109,7 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 	if len(data) < n {
 		s.refundImage(id, n-len(data))
 	}
-	s.logCallSuccess(callID, endpoint, model, action, map[string]any{"n": n, "image_count": len(data)})
+	s.logCallSuccess(callID, endpoint, model, action, map[string]any{"n": n, "image_count": len(data), "urls": urls})
 	writeJSON(w, 200, map[string]any{"created": time.Now().Unix(), "data": data})
 }
 func (s *Server) handleV1ImagesGenerations(w http.ResponseWriter, r *http.Request) {
@@ -395,7 +397,9 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 		writeErr(w, 400, "prompt is required")
 		return
 	}
+	callID := s.logCallStart(id, "/v1/chat/completions", model, "聊天生图", prompt)
 	if err := s.checkContent(prompt); err != nil {
+		s.logCallFailure(callID, "/v1/chat/completions", model, "聊天生图", err, nil)
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -407,6 +411,7 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 		n = 4
 	}
 	if err := s.checkImageAccess(id, model, strAny(b["resolution"], "")); err != nil {
+		s.logCallFailure(callID, "/v1/chat/completions", model, "聊天生图", err, nil)
 		writeErr(w, 403, err.Error())
 		return
 	}
@@ -429,13 +434,17 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 			Inputs:         refs,
 		})
 		if err != nil {
+			s.logCallFailure(callID, "/v1/chat/completions", model, "聊天生图", err, nil)
 			writeCreateTaskError(w, err)
 			return
 		}
+		s.logCallSuccess(callID, "/v1/chat/completions", model, "聊天生图", map[string]any{"task_id": task.ID, "queued": true})
 		writeJSON(w, 202, chatCompletionTaskResponse(task))
 		return
 	}
 	if !s.consumeImage(id, n) {
+		err := fmt.Errorf("image quota insufficient")
+		s.logCallFailure(callID, "/v1/chat/completions", model, "聊天生图", err, nil)
 		writeErr(w, 402, "画图额度不足")
 		return
 	}
@@ -449,6 +458,7 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
 	if err != nil {
 		s.refundImage(id, n)
+		s.logCallFailure(callID, "/v1/chat/completions", model, "聊天生图", err, nil)
 		writeErr(w, 502, err.Error())
 		return
 	}
@@ -457,13 +467,15 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 		if err != nil {
 			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, n)
+			s.logCallFailure(callID, "/v1/chat/completions", model, "聊天生图", err, nil)
 			writeErr(w, 500, err.Error())
 			return
 		}
 		savedRels = append(savedRels, rel)
-		if err := s.recordImageMetadata(id, rel, prompt, len(refs) > 0); err != nil {
+		if err := s.recordImageMetadata(id, rel, prompt, len(refs) > 0, savedRels...); err != nil {
 			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, n)
+			s.logCallFailure(callID, "/v1/chat/completions", model, "聊天生图", err, nil)
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -476,7 +488,9 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 		s.refundImage(id, n-len(data))
 	}
 	content := buildChatImageMarkdown(data)
+	urls := logImageURLs(data)
 	if boolAny(b["stream"], false) {
+		s.logCallSuccess(callID, "/v1/chat/completions", model, "聊天生图", map[string]any{"stream": true, "image_count": len(data), "urls": urls})
 		w.Header().Set("Content-Type", "text/event-stream")
 		cid := "chatcmpl-" + randID(8)
 		created := time.Now().Unix()
@@ -485,6 +499,7 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 		sseDone(w)
 		return
 	}
+	s.logCallSuccess(callID, "/v1/chat/completions", model, "聊天生图", map[string]any{"image_count": len(data), "urls": urls})
 	writeJSON(w, 200, map[string]any{"id": "chatcmpl-" + randID(8), "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": content}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": approxTokens(prompt), "completion_tokens": approxTokens(content), "total_tokens": approxTokens(prompt) + approxTokens(content)}})
 }
 
@@ -693,7 +708,7 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 			return
 		}
 		savedRels = append(savedRels, rel)
-		if err := s.recordImageMetadata(id, rel, prompt, len(refs) > 0); err != nil {
+		if err := s.recordImageMetadata(id, rel, prompt, len(refs) > 0, savedRels...); err != nil {
 			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, 1)
 			s.logCallFailure(callID, "/v1/responses", model, "Responses", err, nil)
@@ -706,8 +721,9 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 	respID := "resp_" + randID(8)
 	created := time.Now().Unix()
 	out := responseImageOutputItems(prompt, data)
+	urls := logImageURLs(data)
 	if boolAny(b["stream"], false) {
-		s.logCallSuccess(callID, "/v1/responses", model, "Responses", map[string]any{"stream": true, "image_count": len(out)})
+		s.logCallSuccess(callID, "/v1/responses", model, "Responses", map[string]any{"stream": true, "image_count": len(out), "urls": urls})
 		w.Header().Set("Content-Type", "text/event-stream")
 		sse(w, responseCreatedEvent(respID, model, created))
 		sse(w, responseInProgressEvent(respID, model, created))
@@ -720,7 +736,7 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 		sseDone(w)
 		return
 	}
-	s.logCallSuccess(callID, "/v1/responses", model, "Responses", map[string]any{"image_count": len(out)})
+	s.logCallSuccess(callID, "/v1/responses", model, "Responses", map[string]any{"image_count": len(out), "urls": urls})
 	writeJSON(w, 200, responseCompletedEvent(respID, model, created, out)["response"])
 }
 
@@ -899,6 +915,13 @@ func (s *Server) streamAnthropicEvents(w http.ResponseWriter, r *http.Request, i
 
 func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *Identity, prompt, model, size, resolution string, n int, isEdit bool, inputs [][]byte) {
 	model = normalizeImageModel(model)
+	action := "文生图"
+	endpoint := "/v1/images/generations"
+	if isEdit {
+		action = "图生图"
+		endpoint = "/v1/images/edits"
+	}
+	callID := s.logCallStart(id, endpoint, model, action, prompt)
 	if n < 1 {
 		n = 1
 	}
@@ -906,14 +929,18 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 		n = 4
 	}
 	if err := s.checkContent(prompt); err != nil {
+		s.logCallFailure(callID, endpoint, model, action, err, nil)
 		writeErr(w, 400, err.Error())
 		return
 	}
 	if err := s.checkImageAccess(id, model, resolution); err != nil {
+		s.logCallFailure(callID, endpoint, model, action, err, nil)
 		writeErr(w, 403, err.Error())
 		return
 	}
 	if !s.consumeImage(id, n) {
+		err := fmt.Errorf("image quota insufficient")
+		s.logCallFailure(callID, endpoint, model, action, err, nil)
 		writeErr(w, 402, "画图额度不足")
 		return
 	}
@@ -925,32 +952,36 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
 	if err != nil {
 		s.refundImage(id, n)
-		s.logSvc.add("call", "上游图片生成失败", map[string]any{"model": model, "error": err.Error()})
+		s.logCallFailure(callID, endpoint, model, action, err, map[string]any{"stream": true, "n": n})
 		sse(w, map[string]any{"object": "image.generation.message", "created": created, "model": model, "index": 0, "total": n, "message": err.Error()})
 		sseDone(w)
 		return
 	}
 	savedRels := make([]string, 0, len(items))
 	streamItems := make([][]map[string]any, 0, len(items))
+	urls := []string{}
 	for _, result := range items {
 		rel, url, err := s.saveImage(r, result.Bytes)
 		if err != nil {
 			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, n)
+			s.logCallFailure(callID, endpoint, model, action, err, map[string]any{"stream": true})
 			sse(w, map[string]any{"error": err.Error()})
 			sseDone(w)
 			return
 		}
 		savedRels = append(savedRels, rel)
-		if err := s.recordImageMetadata(id, rel, prompt, isEdit); err != nil {
+		if err := s.recordImageMetadata(id, rel, prompt, isEdit, savedRels...); err != nil {
 			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, n)
+			s.logCallFailure(callID, endpoint, model, action, err, map[string]any{"stream": true})
 			sse(w, map[string]any{"error": err.Error()})
 			sseDone(w)
 			return
 		}
 		revisedPrompt := firstNonEmpty(result.RevisedPrompt, prompt)
 		streamItems = append(streamItems, []map[string]any{{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": revisedPrompt}})
+		urls = append(urls, url)
 	}
 	for i, data := range streamItems {
 		sse(w, map[string]any{"object": "image.generation.result", "created": created, "model": model, "index": i, "total": n, "data": data})
@@ -958,6 +989,7 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 	if len(items) < n {
 		s.refundImage(id, n-len(items))
 	}
+	s.logCallSuccess(callID, endpoint, model, action, map[string]any{"stream": true, "image_count": len(streamItems), "urls": urls})
 	ssedoneAndDone(w)
 }
 

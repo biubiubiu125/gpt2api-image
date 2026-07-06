@@ -22,6 +22,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     ...config,
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 60),
     image_retention_days: Number(config.image_retention_days || 15),
+    image_max_storage_mb: Math.max(0, Number(config.image_max_storage_mb) || 0),
     cleanup_protect_user_images: Boolean(config.cleanup_protect_user_images ?? true),
     image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
     image_poll_interval_secs: Number(config.image_poll_interval_secs || 4),
@@ -93,6 +94,7 @@ type SettingsStore = {
 
   setRefreshAccountIntervalMinute: (value: string) => void;
   setImageRetentionDays: (value: string) => void;
+  setImageMaxStorageMB: (value: string) => void;
   setCleanupProtectUserImages: (value: boolean) => void;
   setImagePollTimeoutSecs: (value: string) => void;
   setImagePollIntervalSecs: (value: string) => void;
@@ -177,6 +179,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       ...config,
       refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 60),
       image_retention_days: Math.max(1, Number(config.image_retention_days) || 15),
+      image_max_storage_mb: Math.max(0, Number(config.image_max_storage_mb) || 0),
       cleanup_protect_user_images: Boolean(config.cleanup_protect_user_images ?? true),
       image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
       image_poll_interval_secs: Math.max(1, Number(config.image_poll_interval_secs) || 4),
@@ -213,6 +216,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
   setImageRetentionDays: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_retention_days: value }, isDirty: true } : {});
+  },
+  setImageMaxStorageMB: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_max_storage_mb: value }, isDirty: true } : {});
   },
   setCleanupProtectUserImages: (value) => {
     set((state) => state.config ? { config: { ...state.config, cleanup_protect_user_images: value }, isDirty: true } : {});

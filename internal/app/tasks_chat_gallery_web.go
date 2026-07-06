@@ -680,7 +680,7 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		}
 		for _, res := range items {
 			if ctx.Err() != nil {
-				s.cleanupSavedImages(savedRels)
+				s.cleanupSavedImageResults(savedRels)
 				updated, updateErr := s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
 				if updated {
 					s.refundImage(identity, b.N)
@@ -690,7 +690,7 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 			}
 			rel, url, err := s.saveImage(r, res.Bytes)
 			if err != nil {
-				s.cleanupSavedImages(savedRels)
+				s.cleanupSavedImageResults(savedRels)
 				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
 				if updated {
 					s.refundImage(identity, b.N)
@@ -699,11 +699,20 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			savedRels = append(savedRels, rel)
+			if err := s.recordImageMetadata(identity, rel, b.Prompt, false); err != nil {
+				s.cleanupSavedImageResults(savedRels)
+				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+				if updated {
+					s.refundImage(identity, b.N)
+				}
+				s.logTaskUpdateError(task.ID, updateErr)
+				return
+			}
 			data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, b.Prompt)})
 		}
 		updated, updateErr := s.updateTaskStatus(task.ID, "success", "", data)
 		if updateErr != nil {
-			s.cleanupSavedImages(savedRels)
+			s.cleanupSavedImageResults(savedRels)
 			if updated {
 				s.refundImage(identity, b.N)
 			}
@@ -711,15 +720,11 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		if !updated {
-			s.cleanupSavedImages(savedRels)
+			s.cleanupSavedImageResults(savedRels)
 			return
 		}
 		if len(data) < b.N {
 			s.refundImage(identity, b.N-len(data))
-		}
-		for _, rel := range savedRels {
-			s.recordOwner(identity, rel)
-			s.recordPrompt(rel, b.Prompt, false)
 		}
 		s.logCallSuccess(callID, "/api/image-tasks/generations", b.Model, "文生图任务", map[string]any{"task_id": task.ID, "image_count": len(data)})
 	}(t, id)
@@ -857,7 +862,7 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		savedRels := []string{}
 		for _, res := range items {
 			if ctx.Err() != nil {
-				s.cleanupSavedImages(savedRels)
+				s.cleanupSavedImageResults(savedRels)
 				updated, updateErr := s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
 				if updated {
 					s.refundImage(identity, 1)
@@ -867,7 +872,7 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 			}
 			rel, url, err := s.saveImage(r, res.Bytes)
 			if err != nil {
-				s.cleanupSavedImages(savedRels)
+				s.cleanupSavedImageResults(savedRels)
 				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
 				if updated {
 					s.refundImage(identity, 1)
@@ -876,12 +881,21 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			savedRels = append(savedRels, rel)
+			if err := s.recordImageMetadata(identity, rel, prompt, true); err != nil {
+				s.cleanupSavedImageResults(savedRels)
+				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+				if updated {
+					s.refundImage(identity, 1)
+				}
+				s.logTaskUpdateError(task.ID, updateErr)
+				return
+			}
 			data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, prompt)})
 			break
 		}
 		updated, updateErr := s.updateTaskStatus(task.ID, "success", "", data)
 		if updateErr != nil {
-			s.cleanupSavedImages(savedRels)
+			s.cleanupSavedImageResults(savedRels)
 			if updated {
 				s.refundImage(identity, 1)
 			}
@@ -889,12 +903,8 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !updated {
-			s.cleanupSavedImages(savedRels)
+			s.cleanupSavedImageResults(savedRels)
 			return
-		}
-		for _, rel := range savedRels {
-			s.recordOwner(identity, rel)
-			s.recordPrompt(rel, prompt, true)
 		}
 		s.logCallSuccess(callID, "/api/image-tasks/edits", model, "图生图任务", map[string]any{"task_id": task.ID, "image_count": len(data)})
 	}(t, id)
@@ -966,18 +976,23 @@ func (s *Server) handleImageTaskCancel(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
 		for _, id := range ids {
 			idx := -1
+			outOfScope := false
 			for i, task := range tasks {
 				if imageTaskMatchesLookup(task, lookupIdentity, id) {
+					if task.OwnerID != "" && task.OwnerID != lookupIdentity.ID && lookupIdentity.Role != "admin" {
+						outOfScope = true
+						continue
+					}
 					idx = i
 					break
 				}
 			}
 			if idx < 0 {
+				if outOfScope {
+					skipped = append(skipped, id)
+					continue
+				}
 				missing = append(missing, id)
-				continue
-			}
-			if tasks[idx].OwnerID != "" && tasks[idx].OwnerID != lookupIdentity.ID && lookupIdentity.Role != "admin" {
-				skipped = append(skipped, id)
 				continue
 			}
 			if !localTaskStatusMutable(tasks[idx].Status) {
@@ -1140,8 +1155,10 @@ func (s *Server) resolveChatStreamImages(ctx context.Context, r *http.Request, i
 		if err != nil {
 			continue
 		}
-		s.recordOwner(id, rel)
-		s.recordPrompt(rel, fallbackText, isEdit)
+		if err := s.recordImageMetadata(id, rel, fallbackText, isEdit); err != nil {
+			s.cleanupSavedImageResults([]string{rel})
+			continue
+		}
 		data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(bytes), "revised_prompt": fallbackText})
 	}
 	if len(data) == 0 {
@@ -1213,16 +1230,24 @@ func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, i
 		return
 	}
 	data := []map[string]any{}
+	savedRels := []string{}
 	for _, res := range items {
 		rel, url, err := s.saveImage(r, res.Bytes)
 		if err != nil {
+			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, 1)
 			sse(w, map[string]any{"type": "conversation.error", "error": err.Error(), "done": true})
 			sseDone(w)
 			return
 		}
-		s.recordOwner(id, rel)
-		s.recordPrompt(rel, prompt, len(extractChatImages(b)) > 0)
+		savedRels = append(savedRels, rel)
+		if err := s.recordImageMetadata(id, rel, prompt, len(extractChatImages(b)) > 0); err != nil {
+			s.cleanupSavedImageResults(savedRels)
+			s.refundImage(id, 1)
+			sse(w, map[string]any{"type": "conversation.error", "error": err.Error(), "done": true})
+			sseDone(w)
+			return
+		}
 		data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, prompt)})
 		break
 	}

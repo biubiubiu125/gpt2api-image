@@ -180,16 +180,16 @@ func (s *Server) runDBImageTask(parent context.Context, workerID string, ttl tim
 	for _, result := range items {
 		ok, err := s.taskStore.HeartbeatTask(parent, task.ID, workerID, ttl)
 		if err != nil {
-			s.cleanupSavedImages(savedRels)
+			s.cleanupSavedImageResults(savedRels)
 			return err
 		}
 		if !ok {
-			s.cleanupSavedImages(savedRels)
+			s.cleanupSavedImageResults(savedRels)
 			return errors.New("task was canceled before saving result")
 		}
 		rel, url, err := s.saveImageWithBaseURL(baseURL, result.Bytes)
 		if err != nil {
-			s.cleanupSavedImages(savedRels)
+			s.cleanupSavedImageResults(savedRels)
 			if changed, _ := s.taskStore.FailTask(parent, task.ID, workerID, err.Error()); changed {
 				s.refundImage(identity, count)
 				s.cleanupTaskInputPaths(task.InputPaths)
@@ -198,6 +198,15 @@ func (s *Server) runDBImageTask(parent context.Context, workerID string, ttl tim
 			return err
 		}
 		savedRels = append(savedRels, rel)
+		if err := s.recordImageMetadata(identity, rel, task.Prompt, task.Mode == "edit"); err != nil {
+			s.cleanupSavedImageResults(savedRels)
+			if changed, _ := s.taskStore.FailTask(parent, task.ID, workerID, err.Error()); changed {
+				s.refundImage(identity, count)
+				s.cleanupTaskInputPaths(task.InputPaths)
+				s.logCallFailure(callID, endpoint, task.Model, action, err, map[string]any{"task_id": task.ID})
+			}
+			return err
+		}
 		item := map[string]any{"url": url, "revised_prompt": firstNonEmpty(result.RevisedPrompt, task.Prompt)}
 		if task.ResponseFormat == "b64_json" || task.ResponseFormat == "" {
 			item["b64_json"] = base64.StdEncoding.EncodeToString(result.Bytes)
@@ -209,16 +218,12 @@ func (s *Server) runDBImageTask(parent context.Context, workerID string, ttl tim
 	}
 	changed, err := s.taskStore.CompleteTask(parent, task.ID, workerID, data)
 	if err != nil {
-		s.cleanupSavedImages(savedRels)
+		s.cleanupSavedImageResults(savedRels)
 		return err
 	}
 	if !changed {
-		s.cleanupSavedImages(savedRels)
+		s.cleanupSavedImageResults(savedRels)
 		return errors.New("task was canceled or reclaimed before completion")
-	}
-	for _, rel := range savedRels {
-		s.recordOwner(identity, rel)
-		s.recordPrompt(rel, task.Prompt, task.Mode == "edit")
 	}
 	if len(data) < count {
 		s.refundImage(identity, count-len(data))

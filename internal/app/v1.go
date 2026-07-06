@@ -84,8 +84,13 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 			return
 		}
 		savedRels = append(savedRels, rel)
-		s.recordOwner(id, rel)
-		s.recordPrompt(rel, prompt, isEdit)
+		if err := s.recordImageMetadata(id, rel, prompt, isEdit); err != nil {
+			s.cleanupSavedImageResults(savedRels)
+			s.refundImage(id, n)
+			s.logCallFailure(callID, endpoint, model, action, err, nil)
+			writeErr(w, 500, err.Error())
+			return
+		}
 		item := map[string]any{"url": url, "revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt)}
 		if responseFormat == "b64_json" || responseFormat == "" {
 			item["b64_json"] = base64.StdEncoding.EncodeToString(result.Bytes)
@@ -427,8 +432,12 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		savedRels = append(savedRels, rel)
-		s.recordOwner(id, rel)
-		s.recordPrompt(rel, prompt, len(refs) > 0)
+		if err := s.recordImageMetadata(id, rel, prompt, len(refs) > 0); err != nil {
+			s.cleanupSavedImageResults(savedRels)
+			s.refundImage(id, n)
+			writeErr(w, 500, err.Error())
+			return
+		}
 		data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt)})
 		if len(data) >= n {
 			break
@@ -635,16 +644,24 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 		return
 	}
 	data := []map[string]any{}
+	savedRels := []string{}
 	for _, result := range items {
 		rel, url, err := s.saveImage(r, result.Bytes)
 		if err != nil {
+			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, 1)
 			s.logCallFailure(callID, "/v1/responses", model, "Responses", err, nil)
 			writeErr(w, 500, err.Error())
 			return
 		}
-		s.recordOwner(id, rel)
-		s.recordPrompt(rel, prompt, len(refs) > 0)
+		savedRels = append(savedRels, rel)
+		if err := s.recordImageMetadata(id, rel, prompt, len(refs) > 0); err != nil {
+			s.cleanupSavedImageResults(savedRels)
+			s.refundImage(id, 1)
+			s.logCallFailure(callID, "/v1/responses", model, "Responses", err, nil)
+			writeErr(w, 500, err.Error())
+			return
+		}
 		data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": firstNonEmpty(result.RevisedPrompt, prompt)})
 		break
 	}
@@ -880,19 +897,24 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 	for _, result := range items {
 		rel, url, err := s.saveImage(r, result.Bytes)
 		if err != nil {
-			s.cleanupSavedImages(savedRels)
+			s.cleanupSavedImageResults(savedRels)
 			s.refundImage(id, n)
 			sse(w, map[string]any{"error": err.Error()})
 			sseDone(w)
 			return
 		}
 		savedRels = append(savedRels, rel)
+		if err := s.recordImageMetadata(id, rel, prompt, isEdit); err != nil {
+			s.cleanupSavedImageResults(savedRels)
+			s.refundImage(id, n)
+			sse(w, map[string]any{"error": err.Error()})
+			sseDone(w)
+			return
+		}
 		revisedPrompt := firstNonEmpty(result.RevisedPrompt, prompt)
 		streamItems = append(streamItems, []map[string]any{{"url": url, "b64_json": base64.StdEncoding.EncodeToString(result.Bytes), "revised_prompt": revisedPrompt}})
 	}
 	for i, data := range streamItems {
-		s.recordOwner(id, savedRels[i])
-		s.recordPrompt(savedRels[i], prompt, isEdit)
 		sse(w, map[string]any{"object": "image.generation.result", "created": created, "model": model, "index": i, "total": n, "data": data})
 	}
 	if len(items) < n {

@@ -23,6 +23,30 @@ func TestV1ImageResultSaveFailureCleansSavedImagesAndRefunds(t *testing.T) {
 	assertSaveFailureCleaned(t, s, rr, saved, id.ID)
 }
 
+func TestV1ImageResultMetadataFailureCleansSavedImageAndRefunds(t *testing.T) {
+	s, id := newV1ImageCleanupTestServer(t)
+	s.imageGenerator = func(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+		return []upstreamImageResult{{Bytes: []byte("image data"), RevisedPrompt: prompt}}, nil
+	}
+	saved := []string{}
+	s.imageSaver = func(r *http.Request, data []byte) (string, string, error) {
+		rel, url, err := s.saveImageWithBaseURL(s.baseURL(r), data)
+		if err == nil {
+			saved = append(saved, rel)
+		}
+		return rel, url, err
+	}
+	if err := os.Mkdir(s.store.path("image_owners.json.tmp"), 0755); err != nil {
+		t.Fatalf("block owner metadata writes: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	rr := httptest.NewRecorder()
+	s.imageResult(rr, req, id, "draw a cat", "gpt-image-2", "", "", "b64_json", 1, false, nil)
+
+	assertMetadataFailureCleaned(t, s, rr, saved, id.ID)
+}
+
 func TestV1ChatImageSaveFailureCleansSavedImagesAndRefunds(t *testing.T) {
 	s, id := newV1ImageCleanupTestServer(t)
 	installTwoImageGenerator(t, s)
@@ -114,6 +138,39 @@ func assertSaveFailureCleaned(t *testing.T, s *Server, rr *httptest.ResponseReco
 		t.Fatalf("saved rels = %#v, want exactly one saved image before failure", *saved)
 	}
 	rel := (*saved)[0]
+	path, err := s.imagePath(rel)
+	if err != nil {
+		t.Fatalf("image path: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("saved image still exists at %s, stat err=%v", path, err)
+	}
+	if _, ok := s.store.LoadOwners()[rel]; ok {
+		t.Fatalf("owner metadata still exists for %s", rel)
+	}
+	if _, ok := s.store.LoadPrompts()[rel]; ok {
+		t.Fatalf("prompt metadata still exists for %s", rel)
+	}
+	for _, key := range s.store.LoadAuthKeys() {
+		if key.ID == userID {
+			if key.ImageDailyUsed != 0 || key.ImageMonthlyUsed != 0 || key.ImageTotalUsed != 0 {
+				t.Fatalf("image quota used = daily:%d monthly:%d total:%d, want all 0", key.ImageDailyUsed, key.ImageMonthlyUsed, key.ImageTotalUsed)
+			}
+			return
+		}
+	}
+	t.Fatalf("auth key %q not found", userID)
+}
+
+func assertMetadataFailureCleaned(t *testing.T, s *Server, rr *httptest.ResponseRecorder, saved []string, userID string) {
+	t.Helper()
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s, want 500", rr.Code, rr.Body.String())
+	}
+	if len(saved) != 1 {
+		t.Fatalf("saved rels = %#v, want exactly one saved image before metadata failure", saved)
+	}
+	rel := saved[0]
 	path, err := s.imagePath(rel)
 	if err != nil {
 		t.Fatalf("image path: %v", err)

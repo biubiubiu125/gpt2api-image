@@ -242,6 +242,94 @@ func TestNonDBImageTasksLookupAcceptsOriginalClientTaskID(t *testing.T) {
 	}
 }
 
+func TestNonDBImageTaskCancelSkipsOtherOwnerSameClientTaskID(t *testing.T) {
+	store := NewStore(t.TempDir())
+	clientTaskID := "client-task-1"
+	userTaskID := newImageTaskID("user-a", clientTaskID)
+	otherTaskID := newImageTaskID("user-b", clientTaskID)
+	now := nowISO()
+	if err := store.SaveTasks([]ImageTask{
+		{
+			ID:           otherTaskID,
+			ClientTaskID: clientTaskID,
+			OwnerID:      "user-b",
+			OwnerRole:    "user",
+			Status:       "running",
+			Mode:         "generate",
+			N:            1,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		},
+		{
+			ID:           userTaskID,
+			ClientTaskID: clientTaskID,
+			OwnerID:      "user-a",
+			OwnerRole:    "user",
+			Status:       "running",
+			Mode:         "generate",
+			N:            1,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		},
+	}); err != nil {
+		t.Fatalf("save tasks: %v", err)
+	}
+	userCanceled := false
+	otherCanceled := false
+	s := &Server{
+		cfg:   Config{AuthKey: "root-key"},
+		store: store,
+		taskCancels: map[string]context.CancelFunc{
+			userTaskID:  func() { userCanceled = true },
+			otherTaskID: func() { otherCanceled = true },
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/image-tasks/cancel", strings.NewReader(`{"ids":["client-task-1"],"owner_id":"user-a"}`))
+	req.Header.Set("Authorization", "Bearer root-key")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	s.handleImageTaskCancel(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Canceled   []string `json:"canceled"`
+		Skipped    []string `json:"skipped"`
+		MissingIDs []string `json:"missing_ids"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Canceled) != 1 || body.Canceled[0] != userTaskID {
+		t.Fatalf("canceled = %#v, want only %s", body.Canceled, userTaskID)
+	}
+	if len(body.Skipped) != 0 || len(body.MissingIDs) != 0 {
+		t.Fatalf("skipped=%#v missing=%#v, want empty", body.Skipped, body.MissingIDs)
+	}
+	if !userCanceled {
+		t.Fatal("user task cancel callback was not called")
+	}
+	if otherCanceled {
+		t.Fatal("other owner task cancel callback was called")
+	}
+	tasks := store.LoadTasks()
+	statusByID := map[string]string{}
+	for _, task := range tasks {
+		statusByID[task.ID] = task.Status
+	}
+	if statusByID[userTaskID] != "canceled" {
+		t.Fatalf("user task status = %q, want canceled", statusByID[userTaskID])
+	}
+	if statusByID[otherTaskID] != "running" {
+		t.Fatalf("other task status = %q, want running", statusByID[otherTaskID])
+	}
+	if _, ok := s.taskCancels[otherTaskID]; !ok {
+		t.Fatal("other owner cancel callback should remain registered")
+	}
+}
+
 func TestImageTaskIDLengthBounded(t *testing.T) {
 	clientID := strings.Repeat("client-task-", 40)
 	id := imageTaskID("user-a", clientID)
@@ -322,6 +410,60 @@ func TestCleanupTaskInputPathsStaysUnderTaskInputs(t *testing.T) {
 	if _, err := os.Stat(base); err != nil {
 		t.Fatalf("task input root should not be touched: %v", err)
 	}
+}
+
+func TestImageTagWriteFailureReturnsServerError(t *testing.T) {
+	newServerWithBlockedTags := func(t *testing.T) *Server {
+		t.Helper()
+		dir := t.TempDir()
+		store := NewStore(dir)
+		if err := os.Mkdir(filepath.Join(dir, "image_tags.json.tmp"), 0755); err != nil {
+			t.Fatalf("block tag metadata writes: %v", err)
+		}
+		return &Server{cfg: Config{AuthKey: "root-key"}, store: store}
+	}
+
+	t.Run("post", func(t *testing.T) {
+		s := newServerWithBlockedTags(t)
+		req := httptest.NewRequest(http.MethodPost, "/api/images/tags", strings.NewReader(`{"path":"2026/07/05/a.png","tags":["x"]}`))
+		req.Header.Set("Authorization", "Bearer root-key")
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+
+		s.handleImageTags(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d body=%s, want 500", rr.Code, rr.Body.String())
+		}
+		if len(s.store.LoadTags()) != 0 {
+			t.Fatalf("tags = %#v, want empty after failed write", s.store.LoadTags())
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		dir := t.TempDir()
+		store := NewStore(dir)
+		if err := store.SaveTags(map[string][]string{"2026/07/05/a.png": []string{"x", "y"}}); err != nil {
+			t.Fatalf("save tags: %v", err)
+		}
+		if err := os.Mkdir(filepath.Join(dir, "image_tags.json.tmp"), 0755); err != nil {
+			t.Fatalf("block tag metadata writes: %v", err)
+		}
+		s := &Server{cfg: Config{AuthKey: "root-key"}, store: store}
+		req := httptest.NewRequest(http.MethodDelete, "/api/images/tags/x", nil)
+		req.Header.Set("Authorization", "Bearer root-key")
+		rr := httptest.NewRecorder()
+
+		s.handleImageTagDelete(rr, req)
+
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d body=%s, want 500", rr.Code, rr.Body.String())
+		}
+		got := s.store.LoadTags()["2026/07/05/a.png"]
+		if strings.Join(got, ",") != "x,y" {
+			t.Fatalf("tags = %#v, want original tags after failed delete", got)
+		}
+	})
 }
 
 func TestImageManagementFiltersOwnersAndBulkDelete(t *testing.T) {

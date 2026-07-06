@@ -76,17 +76,27 @@ func (s *Server) cleanupSavedImageResults(rels []string) {
 	})
 }
 
-func (s *Server) recordOwner(id *Identity, rel string) {
-	if id == nil {
-		return
+func (s *Server) recordImageMetadata(id *Identity, rel, prompt string, isEdit bool) error {
+	if err := s.recordOwner(id, rel); err != nil {
+		return err
 	}
-	_ = s.store.UpdateOwners(func(owners map[string]string) map[string]string {
+	return s.recordPrompt(rel, prompt, isEdit)
+}
+
+func (s *Server) recordOwner(id *Identity, rel string) error {
+	if id == nil || s.store == nil {
+		return nil
+	}
+	return s.store.UpdateOwners(func(owners map[string]string) map[string]string {
 		owners[rel] = id.ID
 		return owners
 	})
 }
-func (s *Server) recordPrompt(rel, prompt string, isEdit bool) {
-	_ = s.store.UpdatePrompts(func(ps map[string]map[string]any) map[string]map[string]any {
+func (s *Server) recordPrompt(rel, prompt string, isEdit bool) error {
+	if s.store == nil {
+		return nil
+	}
+	return s.store.UpdatePrompts(func(ps map[string]map[string]any) map[string]map[string]any {
 		ps[rel] = map[string]any{"prompt": prompt, "is_edit": isEdit, "created_at": time.Now().Unix()}
 		return ps
 	})
@@ -601,10 +611,13 @@ func (s *Server) handleImageTags(w http.ResponseWriter, r *http.Request) {
 		if !readBody(w, r, &b) {
 			return
 		}
-		_ = s.store.UpdateTags(func(tags map[string][]string) map[string][]string {
+		if err := s.store.UpdateTags(func(tags map[string][]string) map[string][]string {
 			tags[relClean(b.Path)] = b.Tags
 			return tags
-		})
+		}); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		writeJSON(w, 200, map[string]any{"ok": true, "tags": b.Tags})
 		return
 	}
@@ -616,7 +629,7 @@ func (s *Server) handleImageTagDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	tag, _ := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/images/tags/"))
 	n := 0
-	_ = s.store.UpdateTags(func(tags map[string][]string) map[string][]string {
+	if err := s.store.UpdateTags(func(tags map[string][]string) map[string][]string {
 		for rel, ts := range tags {
 			out := []string{}
 			for _, t := range ts {
@@ -629,6 +642,9 @@ func (s *Server) handleImageTagDelete(w http.ResponseWriter, r *http.Request) {
 			tags[rel] = out
 		}
 		return tags
-	})
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, 200, map[string]any{"ok": true, "removed_from": n})
 }

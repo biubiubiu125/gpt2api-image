@@ -98,9 +98,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if v, ok := body["sensitive_words"]; ok {
 			s.cfg.SensitiveWords = stringSliceAny(v)
 		}
-		if v, ok := body["ai_review"].(map[string]any); ok {
-			s.cfg.AIReview = v
-		}
+		delete(s.cfg.Extra, "ai_review")
 		_ = s.saveConfig()
 		writeJSON(w, 200, map[string]any{"config": s.configMap(false)})
 	default:

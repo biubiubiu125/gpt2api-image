@@ -27,42 +27,6 @@ func TestNormalizeImageResponseFormat(t *testing.T) {
 	}
 }
 
-func TestCheckContentAIReviewFailsClosed(t *testing.T) {
-	incomplete := &Server{cfg: Config{AIReview: map[string]any{"enabled": true}}}
-	if err := incomplete.checkContent("hello"); err == nil {
-		t.Fatal("enabled AI review with incomplete config should fail")
-	}
-
-	failingReview := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "bad upstream key", http.StatusUnauthorized)
-	}))
-	defer failingReview.Close()
-	s := &Server{cfg: Config{AIReview: map[string]any{"enabled": true, "base_url": failingReview.URL, "api_key": "key", "model": "review-model"}}}
-	if err := s.checkContent("hello"); err == nil || !strings.Contains(err.Error(), "HTTP 401") {
-		t.Fatalf("AI review HTTP failure error = %v, want HTTP 401", err)
-	}
-
-	malformedReview := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("not-json"))
-	}))
-	defer malformedReview.Close()
-	s.cfg.AIReview["base_url"] = malformedReview.URL
-	if err := s.checkContent("hello"); err == nil || !strings.Contains(err.Error(), "parse failed") {
-		t.Fatalf("AI review malformed response error = %v, want parse failure", err)
-	}
-
-	safeReview := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"SAFE"}}]}`))
-	}))
-	defer safeReview.Close()
-	s.cfg.AIReview["base_url"] = safeReview.URL
-	if err := s.checkContent("hello"); err != nil {
-		t.Fatalf("safe AI review should pass: %v", err)
-	}
-}
-
 func TestImageTaskIDNamespacedByOwner(t *testing.T) {
 	clientID := "client-task-1"
 	a := imageTaskID("user-a", clientID)

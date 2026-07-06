@@ -285,66 +285,6 @@ export function SecuritySection() {
   );
 }
 
-/* ───────────────────────── AI 审核 ───────────────────────── */
-
-export function AIReviewSection() {
-  const config = useSettingsStore((s) => s.config);
-  const setAIReviewField = useSettingsStore((s) => s.setAIReviewField);
-
-  return (
-    <div className="space-y-4">
-      <label className="flex items-center gap-3 text-sm text-stone-700">
-        <Checkbox
-          checked={Boolean(config?.ai_review?.enabled)}
-          onCheckedChange={(c) => setAIReviewField("enabled", Boolean(c))}
-        />
-        启用 AI 审核
-      </label>
-      <p className="text-xs leading-6 text-stone-500">
-        开启后会在请求进入生图账号前先调用审核模型，审核不通过会直接拒绝，减少违规提示词触达账号造成风控或封号的风险。
-      </p>
-      <div className="grid gap-4 md:grid-cols-3">
-        <div className="space-y-2">
-          <label className={LABEL_CLASS}>Base URL</label>
-          <Input
-            value={String(config?.ai_review?.base_url || "")}
-            onChange={(e) => setAIReviewField("base_url", e.target.value)}
-            placeholder="https://api.openai.com"
-            className={INPUT_CLASS}
-          />
-        </div>
-        <div className="space-y-2">
-          <label className={LABEL_CLASS}>API Key</label>
-          <Input
-            value={String(config?.ai_review?.api_key || "")}
-            onChange={(e) => setAIReviewField("api_key", e.target.value)}
-            placeholder="sk-..."
-            className={INPUT_CLASS}
-          />
-        </div>
-        <div className="space-y-2">
-          <label className={LABEL_CLASS}>Model</label>
-          <Input
-            value={String(config?.ai_review?.model || "")}
-            onChange={(e) => setAIReviewField("model", e.target.value)}
-            placeholder="gpt-4o-mini"
-            className={INPUT_CLASS}
-          />
-        </div>
-      </div>
-      <div className="space-y-2">
-        <label className={LABEL_CLASS}>审核提示词</label>
-        <Textarea
-          value={String(config?.ai_review?.prompt || "")}
-          onChange={(e) => setAIReviewField("prompt", e.target.value)}
-          placeholder="判断用户请求是否允许。只回答 ALLOW 或 REJECT。"
-          className="min-h-24 rounded-xl border-stone-200 bg-white text-xs shadow-none"
-        />
-      </div>
-    </div>
-  );
-}
-
 /* ───────────────────────── 日志 ───────────────────────── */
 
 export function LogSection() {

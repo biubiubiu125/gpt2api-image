@@ -120,9 +120,6 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 	}
 	cfg.UpstreamTransport = normalizeUpstreamTransport(cfg.UpstreamTransport)
 	cfg.ImageRouteStrategy = normalizeImageRouteStrategy(cfg.ImageRouteStrategy)
-	if cfg.AIReview == nil {
-		cfg.AIReview = map[string]any{"enabled": false}
-	}
 	s := &Server{root: root, dataDir: filepath.Join(root, "data"), imagesDir: filepath.Join(root, "data", "images"), webDist: filepath.Join(root, "web_dist"), cfg: cfg, callStarts: map[string]time.Time{}, taskCancels: map[string]context.CancelFunc{}, accountPool: newAccountPool(&cfg)}
 	if err := os.MkdirAll(s.imagesDir, 0755); err != nil {
 		return nil, err
@@ -186,7 +183,7 @@ func (s *Server) saveConfig() error {
 func (s *Server) configMap(includeAuth bool) map[string]any {
 	m := map[string]any{}
 	for k, v := range s.cfg.Extra {
-		if isLegacyConfigKey(k) {
+		if isLegacyConfigKey(k) || k == "ai_review" {
 			continue
 		}
 		m[k] = v
@@ -216,7 +213,6 @@ func (s *Server) configMap(includeAuth bool) map[string]any {
 	m["base_url"] = s.cfg.BaseURL
 	m["sensitive_words"] = s.cfg.SensitiveWords
 	m["global_system_prompt"] = s.cfg.GlobalSystemPrompt
-	m["ai_review"] = s.cfg.AIReview
 	m["image_account_concurrency"] = s.cfg.ImageAccountConcurrency
 	m["cleanup_protect_user_images"] = s.cfg.CleanupProtectUserImages
 	m["register_executor_url"] = s.cfg.RegisterExecutorURL

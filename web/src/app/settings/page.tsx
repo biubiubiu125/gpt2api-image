@@ -11,7 +11,6 @@ import { SettingsHeader } from "./components/settings-header";
 import { SettingsTOC, type TOCItem } from "./components/settings-toc";
 import {
   AccountSection,
-  AIReviewSection,
   ImageSection,
   LogSection,
   NetworkSection,
@@ -29,7 +28,6 @@ const SECTIONS: Array<TOCItem & { description: string }> = [
   { id: "network", label: "网络", description: "全局代理：同时影响生图请求和 OpenAI 上游转发。" },
   { id: "images", label: "图片", description: "访问地址、生成超时、并发上限、过期清理及保护策略。" },
   { id: "security", label: "内容安全", description: "敏感词与全局附加指令——把审查放在请求落到生图账号之前。" },
-  { id: "ai-review", label: "AI 审核", description: "用一个独立模型对用户提示词做合规判断，命中即拒绝。" },
   { id: "logs", label: "日志", description: "控制台输出级别。debug 仅排查问题时打开。" },
 ];
 
@@ -61,8 +59,6 @@ function SectionBody({ id }: { id: string }) {
       return <ImageSection />;
     case "security":
       return <SecuritySection />;
-    case "ai-review":
-      return <AIReviewSection />;
     case "logs":
       return <LogSection />;
     default:

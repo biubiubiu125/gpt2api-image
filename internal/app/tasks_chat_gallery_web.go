@@ -86,12 +86,12 @@ func (s *Server) handleImageTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"items": items, "missing_ids": missing})
 }
-func (s *Server) saveTask(t ImageTask) {
-	s.upsertTask(t)
+func (s *Server) saveTask(t ImageTask) error {
+	return s.upsertTask(t)
 }
-func (s *Server) upsertTask(t ImageTask) {
+func (s *Server) upsertTask(t ImageTask) error {
 	t.UpdatedAt = nowISO()
-	_ = s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
+	return s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
 		for i := range tasks {
 			if tasks[i].ID == t.ID {
 				tasks[i] = t
@@ -100,6 +100,21 @@ func (s *Server) upsertTask(t ImageTask) {
 		}
 		return append([]ImageTask{t}, tasks...)
 	})
+}
+
+func (s *Server) saveTaskOrError(w http.ResponseWriter, t ImageTask) bool {
+	if err := s.saveTask(t); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return false
+	}
+	return true
+}
+
+func (s *Server) logTaskUpdateError(taskID string, err error) {
+	if err == nil || s.logSvc == nil {
+		return
+	}
+	s.logSvc.add("task", "image task update failed", map[string]any{"task_id": taskID, "error": err.Error()})
 }
 func (s *Server) setTaskCancel(id string, cancel context.CancelFunc) {
 	s.taskMu.Lock()
@@ -161,9 +176,9 @@ func (s *Server) cleanupOldTasks() {
 	}
 }
 
-func (s *Server) updateTaskStatus(id, status, errText string, data []map[string]any) bool {
+func (s *Server) updateTaskStatus(id, status, errText string, data []map[string]any) (bool, error) {
 	updated := false
-	_ = s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
+	err := s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
 		for i := range tasks {
 			if tasks[i].ID == id {
 				if !localTaskStatusMutable(tasks[i].Status) {
@@ -179,7 +194,7 @@ func (s *Server) updateTaskStatus(id, status, errText string, data []map[string]
 		}
 		return tasks
 	})
-	return updated
+	return updated, err
 }
 
 func localTaskStatusMutable(status string) bool {
@@ -607,7 +622,9 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", err, nil)
-		s.saveTask(t)
+		if !s.saveTaskOrError(w, t) {
+			return
+		}
 		writeJSON(w, 200, t)
 		return
 	}
@@ -615,18 +632,26 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", err, nil)
-		s.saveTask(t)
+		if !s.saveTaskOrError(w, t) {
+			return
+		}
 		writeJSON(w, 200, t)
 		return
 	}
 	if !s.consumeImage(id, b.N) {
 		t.Status = "error"
 		t.Error = "画图额度不足"
-		s.saveTask(t)
+		if !s.saveTaskOrError(w, t) {
+			return
+		}
 		writeJSON(w, 200, t)
 		return
 	}
-	s.saveTask(t)
+	if err := s.saveTask(t); err != nil {
+		s.refundImage(id, b.N)
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.imageRequestTimeout())
 	s.setTaskCancel(t.ID, cancel)
 	go func(task ImageTask, identity *Identity) {
@@ -637,14 +662,18 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		items, err := s.generateImagesWithPool(ctx, b.Prompt, b.Model, b.Size, b.Resolution, nil, b.N)
 		if err != nil {
 			if ctx.Err() != nil {
-				if s.updateTaskStatus(task.ID, "canceled", "canceled", nil) {
+				updated, updateErr := s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
+				if updated {
 					s.refundImage(identity, b.N)
 				}
+				s.logTaskUpdateError(task.ID, updateErr)
 				s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", errors.New("canceled"), map[string]any{"task_id": task.ID})
 			} else {
-				if s.updateTaskStatus(task.ID, "error", err.Error(), nil) {
+				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+				if updated {
 					s.refundImage(identity, b.N)
 				}
+				s.logTaskUpdateError(task.ID, updateErr)
 				s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", err, map[string]any{"task_id": task.ID})
 			}
 			return
@@ -652,23 +681,36 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		for _, res := range items {
 			if ctx.Err() != nil {
 				s.cleanupSavedImages(savedRels)
-				if s.updateTaskStatus(task.ID, "canceled", "canceled", nil) {
+				updated, updateErr := s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
+				if updated {
 					s.refundImage(identity, b.N)
 				}
+				s.logTaskUpdateError(task.ID, updateErr)
 				return
 			}
 			rel, url, err := s.saveImage(r, res.Bytes)
 			if err != nil {
 				s.cleanupSavedImages(savedRels)
-				if s.updateTaskStatus(task.ID, "error", err.Error(), nil) {
+				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+				if updated {
 					s.refundImage(identity, b.N)
 				}
+				s.logTaskUpdateError(task.ID, updateErr)
 				return
 			}
 			savedRels = append(savedRels, rel)
 			data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, b.Prompt)})
 		}
-		if !s.updateTaskStatus(task.ID, "success", "", data) {
+		updated, updateErr := s.updateTaskStatus(task.ID, "success", "", data)
+		if updateErr != nil {
+			s.cleanupSavedImages(savedRels)
+			if updated {
+				s.refundImage(identity, b.N)
+			}
+			s.logTaskUpdateError(task.ID, updateErr)
+			return
+		}
+		if !updated {
 			s.cleanupSavedImages(savedRels)
 			return
 		}
@@ -728,7 +770,9 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", err, nil)
-		s.saveTask(t)
+		if !s.saveTaskOrError(w, t) {
+			return
+		}
 		writeJSON(w, 200, t)
 		return
 	}
@@ -736,14 +780,18 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", err, nil)
-		s.saveTask(t)
+		if !s.saveTaskOrError(w, t) {
+			return
+		}
 		writeJSON(w, 200, t)
 		return
 	}
 	if !s.consumeImage(id, 1) {
 		t.Status = "error"
 		t.Error = "画图额度不足"
-		s.saveTask(t)
+		if !s.saveTaskOrError(w, t) {
+			return
+		}
 		writeJSON(w, 200, t)
 		return
 	}
@@ -770,11 +818,17 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		s.refundImage(id, 1)
 		t.Status = "error"
 		t.Error = "image file is required"
-		s.saveTask(t)
+		if !s.saveTaskOrError(w, t) {
+			return
+		}
 		writeJSON(w, 200, t)
 		return
 	}
-	s.saveTask(t)
+	if err := s.saveTask(t); err != nil {
+		s.refundImage(id, 1)
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.imageRequestTimeout())
 	s.setTaskCancel(t.ID, cancel)
 	go func(task ImageTask, identity *Identity) {
@@ -783,14 +837,18 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		items, err := s.generateImageWithPool(ctx, prompt, model, r.FormValue("size"), r.FormValue("resolution"), inputs)
 		if err != nil {
 			if ctx.Err() != nil {
-				if s.updateTaskStatus(task.ID, "canceled", "canceled", nil) {
+				updated, updateErr := s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
+				if updated {
 					s.refundImage(identity, 1)
 				}
+				s.logTaskUpdateError(task.ID, updateErr)
 				s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", errors.New("canceled"), map[string]any{"task_id": task.ID})
 			} else {
-				if s.updateTaskStatus(task.ID, "error", err.Error(), nil) {
+				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+				if updated {
 					s.refundImage(identity, 1)
 				}
+				s.logTaskUpdateError(task.ID, updateErr)
 				s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", err, map[string]any{"task_id": task.ID})
 			}
 			return
@@ -800,24 +858,37 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		for _, res := range items {
 			if ctx.Err() != nil {
 				s.cleanupSavedImages(savedRels)
-				if s.updateTaskStatus(task.ID, "canceled", "canceled", nil) {
+				updated, updateErr := s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
+				if updated {
 					s.refundImage(identity, 1)
 				}
+				s.logTaskUpdateError(task.ID, updateErr)
 				return
 			}
 			rel, url, err := s.saveImage(r, res.Bytes)
 			if err != nil {
 				s.cleanupSavedImages(savedRels)
-				if s.updateTaskStatus(task.ID, "error", err.Error(), nil) {
+				updated, updateErr := s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+				if updated {
 					s.refundImage(identity, 1)
 				}
+				s.logTaskUpdateError(task.ID, updateErr)
 				return
 			}
 			savedRels = append(savedRels, rel)
 			data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, prompt)})
 			break
 		}
-		if !s.updateTaskStatus(task.ID, "success", "", data) {
+		updated, updateErr := s.updateTaskStatus(task.ID, "success", "", data)
+		if updateErr != nil {
+			s.cleanupSavedImages(savedRels)
+			if updated {
+				s.refundImage(identity, 1)
+			}
+			s.logTaskUpdateError(task.ID, updateErr)
+			return
+		}
+		if !updated {
 			s.cleanupSavedImages(savedRels)
 			return
 		}
@@ -891,7 +962,8 @@ func (s *Server) handleImageTaskCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	canceledTasks := []ImageTask{}
-	_ = s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
+	cancelTaskIDs := []string{}
+	if err := s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
 		for _, id := range ids {
 			idx := -1
 			for i, task := range tasks {
@@ -912,17 +984,23 @@ func (s *Server) handleImageTaskCancel(w http.ResponseWriter, r *http.Request) {
 				skipped = append(skipped, id)
 				continue
 			}
-			if cancel := s.popTaskCancel(tasks[idx].ID); cancel != nil {
-				cancel()
-			}
 			tasks[idx].Status = "canceled"
 			tasks[idx].Error = "canceled"
 			tasks[idx].UpdatedAt = nowISO()
 			canceled = append(canceled, tasks[idx].ID)
 			canceledTasks = append(canceledTasks, tasks[idx])
+			cancelTaskIDs = append(cancelTaskIDs, tasks[idx].ID)
 		}
 		return tasks
-	})
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	for _, taskID := range cancelTaskIDs {
+		if cancel := s.popTaskCancel(taskID); cancel != nil {
+			cancel()
+		}
+	}
 	for _, task := range canceledTasks {
 		if task.OwnerRole != "" {
 			s.refundImage(&Identity{ID: task.OwnerID, Role: task.OwnerRole}, maxInt(task.N, 1))

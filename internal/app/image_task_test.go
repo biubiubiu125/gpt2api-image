@@ -65,7 +65,11 @@ func TestUpdateTaskStatusDoesNotOverrideCanceledTask(t *testing.T) {
 		t.Fatalf("save tasks: %v", err)
 	}
 	s := &Server{store: store}
-	if s.updateTaskStatus("task-1", "success", "", []map[string]any{{"url": "https://example.com/image.png"}}) {
+	updated, err := s.updateTaskStatus("task-1", "success", "", []map[string]any{{"url": "https://example.com/image.png"}})
+	if err != nil {
+		t.Fatalf("update canceled task: %v", err)
+	}
+	if updated {
 		t.Fatal("canceled task should not be updated to success")
 	}
 	got := store.LoadTasks()[0]
@@ -83,12 +87,118 @@ func TestUpdateTaskStatusDoesNotOverrideCanceledTask(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("save running task: %v", err)
 	}
-	if !s.updateTaskStatus("task-2", "success", "", []map[string]any{{"url": "https://example.com/image.png"}}) {
+	updated, err = s.updateTaskStatus("task-2", "success", "", []map[string]any{{"url": "https://example.com/image.png"}})
+	if err != nil {
+		t.Fatalf("update running task: %v", err)
+	}
+	if !updated {
 		t.Fatal("running task should be updated")
 	}
 	got = store.LoadTasks()[0]
 	if got.Status != "success" || len(got.Data) != 1 {
 		t.Fatalf("task after running update = %#v, want success with data", got)
+	}
+}
+
+func TestSaveTaskReturnsStoreError(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := os.Mkdir(filepath.Join(dir, "image_tasks.json.tmp"), 0755); err != nil {
+		t.Fatalf("block task writes: %v", err)
+	}
+	s := &Server{store: store}
+
+	err := s.saveTask(ImageTask{
+		ID:        "task-1",
+		OwnerID:   "user-a",
+		Status:    "running",
+		Mode:      "generate",
+		CreatedAt: nowISO(),
+		UpdatedAt: nowISO(),
+	})
+	if err == nil {
+		t.Fatal("saveTask error = nil, want store write error")
+	}
+	if got := store.LoadTasks(); len(got) != 0 {
+		t.Fatalf("tasks after failed save = %#v, want empty", got)
+	}
+}
+
+func TestUpdateTaskStatusReturnsStoreError(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.SaveTasks([]ImageTask{{
+		ID:        "task-1",
+		OwnerID:   "user-a",
+		Status:    "running",
+		Mode:      "generate",
+		CreatedAt: nowISO(),
+		UpdatedAt: nowISO(),
+	}}); err != nil {
+		t.Fatalf("save tasks: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "image_tasks.json.tmp"), 0755); err != nil {
+		t.Fatalf("block task writes: %v", err)
+	}
+	s := &Server{store: store}
+
+	updated, err := s.updateTaskStatus("task-1", "success", "", []map[string]any{{"url": "https://example.com/image.png"}})
+	if err == nil {
+		t.Fatal("updateTaskStatus error = nil, want store write error")
+	}
+	if !updated {
+		t.Fatal("updateTaskStatus updated = false, want true before write failure")
+	}
+	got := store.LoadTasks()[0]
+	if got.Status != "running" || len(got.Data) != 0 {
+		t.Fatalf("task after failed update = %#v, want original running task", got)
+	}
+}
+
+func TestNonDBImageTaskCancelDoesNotCancelWhenStoreUpdateFails(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	taskID := "task-1"
+	if err := store.SaveTasks([]ImageTask{{
+		ID:        taskID,
+		OwnerID:   "user-a",
+		OwnerRole: "user",
+		Status:    "running",
+		Mode:      "generate",
+		N:         1,
+		CreatedAt: nowISO(),
+		UpdatedAt: nowISO(),
+	}}); err != nil {
+		t.Fatalf("save tasks: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "image_tasks.json.tmp"), 0755); err != nil {
+		t.Fatalf("block task writes: %v", err)
+	}
+	canceled := false
+	s := &Server{
+		cfg:         Config{AuthKey: "root-key"},
+		store:       store,
+		taskCancels: map[string]context.CancelFunc{taskID: func() { canceled = true }},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/image-tasks/cancel", strings.NewReader(`{"ids":["task-1"]}`))
+	req.Header.Set("Authorization", "Bearer root-key")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	s.handleImageTaskCancel(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s, want 500", rr.Code, rr.Body.String())
+	}
+	if canceled {
+		t.Fatal("cancel callback was called before task status write succeeded")
+	}
+	if _, ok := s.taskCancels[taskID]; !ok {
+		t.Fatal("cancel callback was removed before task status write succeeded")
+	}
+	got := store.LoadTasks()[0]
+	if got.Status != "running" {
+		t.Fatalf("task status = %q, want running", got.Status)
 	}
 }
 

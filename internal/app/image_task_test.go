@@ -27,6 +27,42 @@ func TestNormalizeImageResponseFormat(t *testing.T) {
 	}
 }
 
+func TestCheckContentAIReviewFailsClosed(t *testing.T) {
+	incomplete := &Server{cfg: Config{AIReview: map[string]any{"enabled": true}}}
+	if err := incomplete.checkContent("hello"); err == nil {
+		t.Fatal("enabled AI review with incomplete config should fail")
+	}
+
+	failingReview := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad upstream key", http.StatusUnauthorized)
+	}))
+	defer failingReview.Close()
+	s := &Server{cfg: Config{AIReview: map[string]any{"enabled": true, "base_url": failingReview.URL, "api_key": "key", "model": "review-model"}}}
+	if err := s.checkContent("hello"); err == nil || !strings.Contains(err.Error(), "HTTP 401") {
+		t.Fatalf("AI review HTTP failure error = %v, want HTTP 401", err)
+	}
+
+	malformedReview := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("not-json"))
+	}))
+	defer malformedReview.Close()
+	s.cfg.AIReview["base_url"] = malformedReview.URL
+	if err := s.checkContent("hello"); err == nil || !strings.Contains(err.Error(), "parse failed") {
+		t.Fatalf("AI review malformed response error = %v, want parse failure", err)
+	}
+
+	safeReview := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"SAFE"}}]}`))
+	}))
+	defer safeReview.Close()
+	s.cfg.AIReview["base_url"] = safeReview.URL
+	if err := s.checkContent("hello"); err != nil {
+		t.Fatalf("safe AI review should pass: %v", err)
+	}
+}
+
 func TestImageTaskIDNamespacedByOwner(t *testing.T) {
 	clientID := "client-task-1"
 	a := imageTaskID("user-a", clientID)
@@ -49,6 +85,46 @@ func TestPossibleImageTaskIDsIncludesClientAndDerivedID(t *testing.T) {
 	}
 	if ids[1] != imageTaskID("user-a", "client-task-1") {
 		t.Fatalf("derived id = %q, want %q", ids[1], imageTaskID("user-a", "client-task-1"))
+	}
+}
+
+func TestUpdateTaskStatusDoesNotOverrideCanceledTask(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.SaveTasks([]ImageTask{{
+		ID:        "task-1",
+		OwnerID:   "user-a",
+		Status:    "canceled",
+		Mode:      "generate",
+		CreatedAt: nowISO(),
+		UpdatedAt: nowISO(),
+	}}); err != nil {
+		t.Fatalf("save tasks: %v", err)
+	}
+	s := &Server{store: store}
+	if s.updateTaskStatus("task-1", "success", "", []map[string]any{{"url": "https://example.com/image.png"}}) {
+		t.Fatal("canceled task should not be updated to success")
+	}
+	got := store.LoadTasks()[0]
+	if got.Status != "canceled" || len(got.Data) != 0 {
+		t.Fatalf("task after update = %#v, want canceled without data", got)
+	}
+
+	if err := store.SaveTasks([]ImageTask{{
+		ID:        "task-2",
+		OwnerID:   "user-a",
+		Status:    "running",
+		Mode:      "generate",
+		CreatedAt: nowISO(),
+		UpdatedAt: nowISO(),
+	}}); err != nil {
+		t.Fatalf("save running task: %v", err)
+	}
+	if !s.updateTaskStatus("task-2", "success", "", []map[string]any{{"url": "https://example.com/image.png"}}) {
+		t.Fatal("running task should be updated")
+	}
+	got = store.LoadTasks()[0]
+	if got.Status != "success" || len(got.Data) != 1 {
+		t.Fatalf("task after running update = %#v, want success with data", got)
 	}
 }
 
@@ -585,6 +661,37 @@ func TestSaveImageWithBaseURLUniqueForSameBytes(t *testing.T) {
 	}
 	if relA == relB {
 		t.Fatalf("same bytes saved twice should get unique rel path: %q", relA)
+	}
+}
+
+func TestSaveImageWithBaseURLUsesDetectedImageExtension(t *testing.T) {
+	root := t.TempDir()
+	s := &Server{
+		dataDir:   filepath.Join(root, "data"),
+		imagesDir: filepath.Join(root, "data", "images"),
+		store:     NewStore(filepath.Join(root, "data")),
+		cfg:       Config{ImageRetentionDays: 15},
+	}
+	webpData := []byte("RIFF\x00\x00\x00\x00WEBPVP8 ")
+	rel, url, err := s.saveImageWithBaseURL("https://example.com", webpData)
+	if err != nil {
+		t.Fatalf("save webp image: %v", err)
+	}
+	if !strings.HasSuffix(rel, ".webp") {
+		t.Fatalf("rel = %q, want .webp suffix", rel)
+	}
+	if !strings.HasSuffix(url, ".webp") {
+		t.Fatalf("url = %q, want .webp suffix", url)
+	}
+	if _, err := os.Stat(filepath.Join(s.imagesDir, filepath.FromSlash(rel))); err != nil {
+		t.Fatalf("saved file missing: %v", err)
+	}
+	avifData := []byte{0, 0, 0, 24, 'f', 't', 'y', 'p', 'a', 'v', 'i', 'f', 0, 0, 0, 0}
+	if got := storedImageExtension(avifData); got != ".avif" {
+		t.Fatalf("avif extension = %q, want .avif", got)
+	}
+	if !isStoredImageFile("image.avif") || !isStoredImageFile("image.gif") {
+		t.Fatalf("stored image whitelist should include avif and gif")
 	}
 }
 

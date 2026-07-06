@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,7 +24,7 @@ func (s *Server) saveImageWithBaseURL(baseURL string, data []byte) (string, stri
 	now := time.Now()
 	sum := md5.Sum(data)
 	relDir := filepath.Join(now.Format("2006"), now.Format("01"), now.Format("02"))
-	name := fmt.Sprintf("%d_%s_%x.png", now.UnixNano(), randID(6), sum)
+	name := fmt.Sprintf("%d_%s_%x%s", now.UnixNano(), randID(6), sum, storedImageExtension(data))
 	rel := filepath.ToSlash(filepath.Join(relDir, name))
 	path := filepath.Join(s.imagesDir, relDir, name)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -220,8 +221,46 @@ func (f imageFilter) matches(owner string, modTime time.Time) bool {
 }
 
 func isStoredImageFile(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp"
+	return isStoredImageExtension(filepath.Ext(path))
+}
+
+func isStoredImageExtension(ext string) bool {
+	switch strings.ToLower(strings.TrimSpace(ext)) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".tif", ".tiff":
+		return true
+	default:
+		return false
+	}
+}
+
+func storedImageExtension(data []byte) string {
+	mediaType := strings.ToLower(downloadedImageMIME(data))
+	switch mediaType {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/avif":
+		return ".avif"
+	case "image/bmp":
+		return ".bmp"
+	case "image/tiff":
+		return ".tif"
+	}
+	if strings.HasPrefix(mediaType, "image/") {
+		if exts, err := mime.ExtensionsByType(mediaType); err == nil {
+			for _, ext := range exts {
+				if isStoredImageExtension(ext) {
+					return strings.ToLower(ext)
+				}
+			}
+		}
+	}
+	return ".png"
 }
 
 func (s *Server) walkStoredImages(fn func(path, rel string, st os.FileInfo) error) error {

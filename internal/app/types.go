@@ -120,9 +120,11 @@ type ImageTask struct {
 	ID           string           `json:"id"`
 	ClientTaskID string           `json:"client_task_id,omitempty"`
 	OwnerID      string           `json:"owner_id,omitempty"`
+	OwnerRole    string           `json:"owner_role,omitempty"`
 	Status       string           `json:"status"`
 	Mode         string           `json:"mode"`
 	Model        string           `json:"model,omitempty"`
+	N            int              `json:"n,omitempty"`
 	Size         string           `json:"size,omitempty"`
 	Resolution   string           `json:"resolution,omitempty"`
 	CreatedAt    string           `json:"created_at"`

@@ -161,19 +161,34 @@ func (s *Server) cleanupOldTasks() {
 	}
 }
 
-func (s *Server) updateTaskStatus(id, status, errText string, data []map[string]any) {
+func (s *Server) updateTaskStatus(id, status, errText string, data []map[string]any) bool {
+	updated := false
 	_ = s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
 		for i := range tasks {
 			if tasks[i].ID == id {
+				if !localTaskStatusMutable(tasks[i].Status) {
+					return tasks
+				}
 				tasks[i].Status = status
 				tasks[i].Error = errText
 				tasks[i].Data = data
 				tasks[i].UpdatedAt = nowISO()
+				updated = true
 				return tasks
 			}
 		}
 		return tasks
 	})
+	return updated
+}
+
+func localTaskStatusMutable(status string) bool {
+	switch status {
+	case "", "pending", "queued", "running":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) saveTaskInputImages(taskID string, inputs [][]byte) ([]string, error) {
@@ -586,7 +601,7 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	clientTaskID := strings.TrimSpace(b.ClientTaskID)
-	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, Status: "running", Mode: "generate", Model: b.Model, Size: b.Size, Resolution: b.Resolution, CreatedAt: nowISO(), UpdatedAt: nowISO()}
+	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, OwnerRole: id.Role, Status: "running", Mode: "generate", Model: b.Model, N: b.N, Size: b.Size, Resolution: b.Resolution, CreatedAt: nowISO(), UpdatedAt: nowISO()}
 	callID := s.logCallStart(id, "/api/image-tasks/generations", b.Model, "文生图任务", b.Prompt)
 	if err := s.checkContent(b.Prompt); err != nil {
 		t.Status = "error"
@@ -618,33 +633,52 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		defer s.popTaskCancel(task.ID)
 		defer cancel()
 		data := []map[string]any{}
+		savedRels := []string{}
 		items, err := s.generateImagesWithPool(ctx, b.Prompt, b.Model, b.Size, b.Resolution, nil, b.N)
 		if err != nil {
-			s.refundImage(identity, b.N)
 			if ctx.Err() != nil {
-				s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
+				if s.updateTaskStatus(task.ID, "canceled", "canceled", nil) {
+					s.refundImage(identity, b.N)
+				}
 				s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", errors.New("canceled"), map[string]any{"task_id": task.ID})
 			} else {
-				s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+				if s.updateTaskStatus(task.ID, "error", err.Error(), nil) {
+					s.refundImage(identity, b.N)
+				}
 				s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", err, map[string]any{"task_id": task.ID})
 			}
 			return
 		}
 		for _, res := range items {
-			rel, url, err := s.saveImage(r, res.Bytes)
-			if err != nil {
-				s.refundImage(identity, b.N-len(data))
-				s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+			if ctx.Err() != nil {
+				s.cleanupSavedImages(savedRels)
+				if s.updateTaskStatus(task.ID, "canceled", "canceled", nil) {
+					s.refundImage(identity, b.N)
+				}
 				return
 			}
-			s.recordOwner(identity, rel)
-			s.recordPrompt(rel, b.Prompt, false)
+			rel, url, err := s.saveImage(r, res.Bytes)
+			if err != nil {
+				s.cleanupSavedImages(savedRels)
+				if s.updateTaskStatus(task.ID, "error", err.Error(), nil) {
+					s.refundImage(identity, b.N)
+				}
+				return
+			}
+			savedRels = append(savedRels, rel)
 			data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, b.Prompt)})
+		}
+		if !s.updateTaskStatus(task.ID, "success", "", data) {
+			s.cleanupSavedImages(savedRels)
+			return
 		}
 		if len(data) < b.N {
 			s.refundImage(identity, b.N-len(data))
 		}
-		s.updateTaskStatus(task.ID, "success", "", data)
+		for _, rel := range savedRels {
+			s.recordOwner(identity, rel)
+			s.recordPrompt(rel, b.Prompt, false)
+		}
 		s.logCallSuccess(callID, "/api/image-tasks/generations", b.Model, "文生图任务", map[string]any{"task_id": task.ID, "image_count": len(data)})
 	}(t, id)
 	writeJSON(w, 200, t)
@@ -688,7 +722,7 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientTaskID := strings.TrimSpace(r.FormValue("client_task_id"))
-	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, Status: "running", Mode: "edit", Model: model, Size: r.FormValue("size"), Resolution: r.FormValue("resolution"), CreatedAt: nowISO(), UpdatedAt: nowISO()}
+	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, OwnerRole: id.Role, Status: "running", Mode: "edit", Model: model, N: 1, Size: r.FormValue("size"), Resolution: r.FormValue("resolution"), CreatedAt: nowISO(), UpdatedAt: nowISO()}
 	callID := s.logCallStart(id, "/api/image-tasks/edits", model, "图生图任务", prompt)
 	if err := s.checkContent(prompt); err != nil {
 		t.Status = "error"
@@ -748,30 +782,49 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		items, err := s.generateImageWithPool(ctx, prompt, model, r.FormValue("size"), r.FormValue("resolution"), inputs)
 		if err != nil {
-			s.refundImage(identity, 1)
 			if ctx.Err() != nil {
-				s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
+				if s.updateTaskStatus(task.ID, "canceled", "canceled", nil) {
+					s.refundImage(identity, 1)
+				}
 				s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", errors.New("canceled"), map[string]any{"task_id": task.ID})
 			} else {
-				s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+				if s.updateTaskStatus(task.ID, "error", err.Error(), nil) {
+					s.refundImage(identity, 1)
+				}
 				s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", err, map[string]any{"task_id": task.ID})
 			}
 			return
 		}
 		data := []map[string]any{}
+		savedRels := []string{}
 		for _, res := range items {
-			rel, url, err := s.saveImage(r, res.Bytes)
-			if err != nil {
-				s.refundImage(identity, 1)
-				s.updateTaskStatus(task.ID, "error", err.Error(), nil)
+			if ctx.Err() != nil {
+				s.cleanupSavedImages(savedRels)
+				if s.updateTaskStatus(task.ID, "canceled", "canceled", nil) {
+					s.refundImage(identity, 1)
+				}
 				return
 			}
-			s.recordOwner(identity, rel)
-			s.recordPrompt(rel, prompt, true)
+			rel, url, err := s.saveImage(r, res.Bytes)
+			if err != nil {
+				s.cleanupSavedImages(savedRels)
+				if s.updateTaskStatus(task.ID, "error", err.Error(), nil) {
+					s.refundImage(identity, 1)
+				}
+				return
+			}
+			savedRels = append(savedRels, rel)
 			data = append(data, map[string]any{"url": url, "b64_json": base64.StdEncoding.EncodeToString(res.Bytes), "revised_prompt": firstNonEmpty(res.RevisedPrompt, prompt)})
 			break
 		}
-		s.updateTaskStatus(task.ID, "success", "", data)
+		if !s.updateTaskStatus(task.ID, "success", "", data) {
+			s.cleanupSavedImages(savedRels)
+			return
+		}
+		for _, rel := range savedRels {
+			s.recordOwner(identity, rel)
+			s.recordPrompt(rel, prompt, true)
+		}
 		s.logCallSuccess(callID, "/api/image-tasks/edits", model, "图生图任务", map[string]any{"task_id": task.ID, "image_count": len(data)})
 	}(t, id)
 	writeJSON(w, 200, t)
@@ -837,36 +890,44 @@ func (s *Server) handleImageTaskCancel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"canceled": canceled, "skipped": skipped, "missing_ids": missing})
 		return
 	}
-	tasks := s.store.LoadTasks()
-	for _, id := range ids {
-		idx := -1
-		for i, task := range tasks {
-			if imageTaskMatchesLookup(task, lookupIdentity, id) {
-				idx = i
-				break
+	canceledTasks := []ImageTask{}
+	_ = s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
+		for _, id := range ids {
+			idx := -1
+			for i, task := range tasks {
+				if imageTaskMatchesLookup(task, lookupIdentity, id) {
+					idx = i
+					break
+				}
 			}
+			if idx < 0 {
+				missing = append(missing, id)
+				continue
+			}
+			if tasks[idx].OwnerID != "" && tasks[idx].OwnerID != lookupIdentity.ID && lookupIdentity.Role != "admin" {
+				skipped = append(skipped, id)
+				continue
+			}
+			if !localTaskStatusMutable(tasks[idx].Status) {
+				skipped = append(skipped, id)
+				continue
+			}
+			if cancel := s.popTaskCancel(tasks[idx].ID); cancel != nil {
+				cancel()
+			}
+			tasks[idx].Status = "canceled"
+			tasks[idx].Error = "canceled"
+			tasks[idx].UpdatedAt = nowISO()
+			canceled = append(canceled, tasks[idx].ID)
+			canceledTasks = append(canceledTasks, tasks[idx])
 		}
-		if idx < 0 {
-			missing = append(missing, id)
-			continue
+		return tasks
+	})
+	for _, task := range canceledTasks {
+		if task.OwnerRole != "" {
+			s.refundImage(&Identity{ID: task.OwnerID, Role: task.OwnerRole}, maxInt(task.N, 1))
 		}
-		if tasks[idx].OwnerID != "" && tasks[idx].OwnerID != lookupIdentity.ID && lookupIdentity.Role != "admin" {
-			skipped = append(skipped, id)
-			continue
-		}
-		if tasks[idx].Status != "running" && tasks[idx].Status != "queued" && tasks[idx].Status != "pending" {
-			skipped = append(skipped, id)
-			continue
-		}
-		if cancel := s.popTaskCancel(tasks[idx].ID); cancel != nil {
-			cancel()
-		}
-		tasks[idx].Status = "canceled"
-		tasks[idx].Error = "canceled"
-		tasks[idx].UpdatedAt = nowISO()
-		canceled = append(canceled, tasks[idx].ID)
 	}
-	_ = s.store.SaveTasks(tasks)
 	writeJSON(w, 200, map[string]any{"canceled": canceled, "skipped": skipped, "missing_ids": missing})
 }
 

@@ -131,8 +131,10 @@ export type ImageTask = {
   status: "queued" | "running" | "success" | "error" | "canceled";
   mode: "generate" | "edit";
   model?: ImageModel;
+  n?: number;
   size?: string;
   resolution?: string;
+  response_format?: "url" | "b64_json";
   created_at: string;
   updated_at: string;
   data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;

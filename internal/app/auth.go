@@ -245,15 +245,17 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(parts) > 1 && parts[1] == "regenerate" {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
 		raw := "sk-" + randID(24)
-		if r.Method == http.MethodPost {
-			var b map[string]any
-			if !readBody(w, r, &b) {
-				return
-			}
-			if v := strings.TrimSpace(strAny(b["key"], "")); v != "" {
-				raw = v
-			}
+		var b map[string]any
+		if !readBody(w, r, &b) {
+			return
+		}
+		if v := strings.TrimSpace(strAny(b["key"], "")); v != "" {
+			raw = v
 		}
 		var item UserKey
 		if err := s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {

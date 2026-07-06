@@ -52,6 +52,100 @@ func TestPossibleImageTaskIDsIncludesClientAndDerivedID(t *testing.T) {
 	}
 }
 
+func TestDBImageTaskPublicIncludesStoredTaskMetadata(t *testing.T) {
+	task := DBImageTask{
+		ID:             "task-1",
+		ClientTaskID:   "client-1",
+		OwnerID:        "owner-1",
+		OwnerRole:      "admin",
+		Status:         dbTaskStatusQueued,
+		Mode:           "generate",
+		Model:          "gpt-image-2",
+		Size:           "1:1",
+		Resolution:     "1k",
+		ResponseFormat: "b64_json",
+		N:              3,
+		CreatedAt:      nowISO(),
+		UpdatedAt:      nowISO(),
+	}
+
+	got := task.Public()
+	if got.OwnerRole != task.OwnerRole || got.N != task.N || got.ResponseFormat != task.ResponseFormat {
+		t.Fatalf("public task metadata = %#v, want owner_role=%q n=%d response_format=%q", got, task.OwnerRole, task.N, task.ResponseFormat)
+	}
+}
+
+func TestLocalImageTaskCreateWithDuplicateClientTaskIDReturnsExistingTask(t *testing.T) {
+	store := NewStore(t.TempDir())
+	clientTaskID := "client-task-1"
+	existing := ImageTask{
+		ID:           imageTaskID("admin", clientTaskID),
+		ClientTaskID: clientTaskID,
+		OwnerID:      "admin",
+		OwnerRole:    "admin",
+		Status:       "success",
+		Mode:         "generate",
+		Model:        "gpt-image-2",
+		N:            1,
+		CreatedAt:    nowISO(),
+		UpdatedAt:    nowISO(),
+		Data:         []map[string]any{{"url": "https://example.com/existing.png"}},
+	}
+	if err := store.SaveTasks([]ImageTask{existing}); err != nil {
+		t.Fatalf("save existing task: %v", err)
+	}
+	s := &Server{cfg: Config{AuthKey: "root-key"}, store: store}
+	req := httptest.NewRequest(http.MethodPost, "/api/image-tasks/generations", strings.NewReader(`{"client_task_id":"client-task-1","prompt":"new prompt"}`))
+	req.Header.Set("Authorization", "Bearer root-key")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	s.handleImageTaskGeneration(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var got ImageTask
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	if got.ID != existing.ID || got.Status != existing.Status || len(got.Data) != 1 {
+		t.Fatalf("returned task = %#v, want existing task", got)
+	}
+	tasks := store.LoadTasks()
+	if len(tasks) != 1 || tasks[0].Status != existing.Status || len(tasks[0].Data) != 1 {
+		t.Fatalf("stored tasks = %#v, want unchanged existing task", tasks)
+	}
+}
+
+func TestImageTaskEndpointsRejectWrongMethods(t *testing.T) {
+	s := &Server{cfg: Config{AuthKey: "root-key"}, store: NewStore(t.TempDir())}
+	cases := []struct {
+		name   string
+		method string
+		target string
+		call   func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "list", method: http.MethodPost, target: "/api/image-tasks", call: s.handleImageTasks},
+		{name: "generate", method: http.MethodGet, target: "/api/image-tasks/generations", call: s.handleImageTaskGeneration},
+		{name: "edit", method: http.MethodGet, target: "/api/image-tasks/edits", call: s.handleImageTaskEdit},
+		{name: "cancel", method: http.MethodGet, target: "/api/image-tasks/cancel", call: s.handleImageTaskCancel},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.target, nil)
+			req.Header.Set("Authorization", "Bearer root-key")
+			rr := httptest.NewRecorder()
+
+			tc.call(rr, req)
+
+			if rr.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d body=%s, want 405", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestUpdateTaskStatusDoesNotOverrideCanceledTask(t *testing.T) {
 	store := NewStore(t.TempDir())
 	if err := store.SaveTasks([]ImageTask{{
@@ -466,6 +560,27 @@ func TestImageTagWriteFailureReturnsServerError(t *testing.T) {
 	})
 }
 
+func TestImageTagDeleteRequiresDeleteMethod(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.SaveTags(map[string][]string{"2026/07/05/a.png": []string{"x", "y"}}); err != nil {
+		t.Fatalf("save tags: %v", err)
+	}
+	s := &Server{cfg: Config{AuthKey: "root-key"}, store: store}
+	req := httptest.NewRequest(http.MethodGet, "/api/images/tags/x", nil)
+	req.Header.Set("Authorization", "Bearer root-key")
+	rr := httptest.NewRecorder()
+
+	s.handleImageTagDelete(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d body=%s, want 405", rr.Code, rr.Body.String())
+	}
+	got := store.LoadTags()["2026/07/05/a.png"]
+	if strings.Join(got, ",") != "x,y" {
+		t.Fatalf("tags = %#v, want unchanged tags", got)
+	}
+}
+
 func TestImageManagementFiltersOwnersAndBulkDelete(t *testing.T) {
 	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "")
 	t.Setenv("GPT2API_IMAGE_DATABASE_URL", "")
@@ -856,6 +971,27 @@ func TestCreateAuthUserEndpointCreatesServiceKey(t *testing.T) {
 	}
 	if id.Role != "admin" || id.AccountTier != "premium" {
 		t.Fatalf("created key identity = %#v, want admin premium", id)
+	}
+}
+
+func TestAuthUserRegenerateRequiresPostMethod(t *testing.T) {
+	s := &Server{cfg: Config{AuthKey: "root-key"}, store: NewStore(t.TempDir())}
+	initial := UserKey{ID: "user-a", Name: "User A", Key: "sk-user-a", KeyHash: hashKey("sk-user-a"), Enabled: true}
+	if err := s.store.SaveAuthKeys([]UserKey{initial}); err != nil {
+		t.Fatalf("save auth keys: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/users/user-a/regenerate", nil)
+	req.Header.Set("Authorization", "Bearer root-key")
+	rr := httptest.NewRecorder()
+
+	s.handleAuthUserID(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d body=%s, want 405", rr.Code, rr.Body.String())
+	}
+	keys := s.store.LoadAuthKeys()
+	if len(keys) != 1 || keys[0].KeyHash != initial.KeyHash || keys[0].Key != initial.Key {
+		t.Fatalf("auth keys changed after GET regenerate: %#v", keys)
 	}
 }
 

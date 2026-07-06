@@ -37,6 +37,10 @@ func parseCSV(value string) []string {
 }
 
 func (s *Server) handleImageTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -89,6 +93,40 @@ func (s *Server) handleImageTasks(w http.ResponseWriter, r *http.Request) {
 func (s *Server) saveTask(t ImageTask) error {
 	return s.upsertTask(t)
 }
+
+func (s *Server) loadTaskByID(id string) (ImageTask, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ImageTask{}, false
+	}
+	for _, task := range s.store.LoadTasks() {
+		if task.ID == id {
+			return task, true
+		}
+	}
+	return ImageTask{}, false
+}
+
+func (s *Server) createTaskIfAbsent(t ImageTask) (ImageTask, bool, error) {
+	t.UpdatedAt = nowISO()
+	if t.CreatedAt == "" {
+		t.CreatedAt = t.UpdatedAt
+	}
+	item := t
+	created := false
+	err := s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
+		for _, task := range tasks {
+			if task.ID == t.ID {
+				item = task
+				return tasks
+			}
+		}
+		created = true
+		return append([]ImageTask{t}, tasks...)
+	})
+	return item, created, err
+}
+
 func (s *Server) upsertTask(t ImageTask) error {
 	t.UpdatedAt = nowISO()
 	return s.store.UpdateTasks(func(tasks []ImageTask) []ImageTask {
@@ -569,6 +607,10 @@ func (s *Server) enqueueV1ImageTask(w http.ResponseWriter, r *http.Request, id *
 }
 
 func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
@@ -616,42 +658,61 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	clientTaskID := strings.TrimSpace(b.ClientTaskID)
-	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, OwnerRole: id.Role, Status: "running", Mode: "generate", Model: b.Model, N: b.N, Size: b.Size, Resolution: b.Resolution, CreatedAt: nowISO(), UpdatedAt: nowISO()}
+	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, OwnerRole: id.Role, Status: "running", Mode: "generate", Model: b.Model, N: b.N, Size: b.Size, Resolution: b.Resolution, ResponseFormat: normalizeImageResponseFormat(b.ResponseFormat), CreatedAt: nowISO(), UpdatedAt: nowISO()}
+	if clientTaskID != "" {
+		if existing, ok := s.loadTaskByID(t.ID); ok {
+			writeJSON(w, 200, existing)
+			return
+		}
+	}
 	callID := s.logCallStart(id, "/api/image-tasks/generations", b.Model, "文生图任务", b.Prompt)
 	if err := s.checkContent(b.Prompt); err != nil {
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", err, nil)
-		if !s.saveTaskOrError(w, t) {
+		item, _, saveErr := s.createTaskIfAbsent(t)
+		if saveErr != nil {
+			writeErr(w, http.StatusInternalServerError, saveErr.Error())
 			return
 		}
-		writeJSON(w, 200, t)
+		writeJSON(w, 200, item)
 		return
 	}
 	if err := s.checkImageAccess(id, b.Model, b.Resolution); err != nil {
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", err, nil)
-		if !s.saveTaskOrError(w, t) {
+		item, _, saveErr := s.createTaskIfAbsent(t)
+		if saveErr != nil {
+			writeErr(w, http.StatusInternalServerError, saveErr.Error())
 			return
 		}
-		writeJSON(w, 200, t)
+		writeJSON(w, 200, item)
 		return
 	}
 	if !s.consumeImage(id, b.N) {
 		t.Status = "error"
 		t.Error = "画图额度不足"
-		if !s.saveTaskOrError(w, t) {
+		item, _, saveErr := s.createTaskIfAbsent(t)
+		if saveErr != nil {
+			writeErr(w, http.StatusInternalServerError, saveErr.Error())
 			return
 		}
-		writeJSON(w, 200, t)
+		writeJSON(w, 200, item)
 		return
 	}
-	if err := s.saveTask(t); err != nil {
+	item, created, err := s.createTaskIfAbsent(t)
+	if err != nil {
 		s.refundImage(id, b.N)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !created {
+		s.refundImage(id, b.N)
+		writeJSON(w, 200, item)
+		return
+	}
+	t = item
 	ctx, cancel := context.WithTimeout(context.Background(), s.imageRequestTimeout())
 	s.setTaskCancel(t.ID, cancel)
 	go func(task ImageTask, identity *Identity) {
@@ -731,12 +792,23 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, 200, t)
 }
 func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	id, ok := s.requireIdentity(w, r)
 	if !ok {
 		return
 	}
 	if !parseMultipartFormLimited(w, r) {
 		return
+	}
+	clientTaskID := strings.TrimSpace(r.FormValue("client_task_id"))
+	if clientTaskID != "" {
+		if existing, ok := s.loadTaskByID(newImageTaskID(id.ID, clientTaskID)); ok {
+			writeJSON(w, 200, existing)
+			return
+		}
 	}
 	prompt := strings.TrimSpace(r.FormValue("prompt"))
 	if prompt == "" {
@@ -768,36 +840,41 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, task)
 		return
 	}
-	clientTaskID := strings.TrimSpace(r.FormValue("client_task_id"))
-	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, OwnerRole: id.Role, Status: "running", Mode: "edit", Model: model, N: 1, Size: r.FormValue("size"), Resolution: r.FormValue("resolution"), CreatedAt: nowISO(), UpdatedAt: nowISO()}
+	t := ImageTask{ID: newImageTaskID(id.ID, clientTaskID), ClientTaskID: clientTaskID, OwnerID: id.ID, OwnerRole: id.Role, Status: "running", Mode: "edit", Model: model, N: 1, Size: r.FormValue("size"), Resolution: r.FormValue("resolution"), ResponseFormat: normalizeImageResponseFormat(r.FormValue("response_format")), CreatedAt: nowISO(), UpdatedAt: nowISO()}
 	callID := s.logCallStart(id, "/api/image-tasks/edits", model, "图生图任务", prompt)
 	if err := s.checkContent(prompt); err != nil {
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", err, nil)
-		if !s.saveTaskOrError(w, t) {
+		item, _, saveErr := s.createTaskIfAbsent(t)
+		if saveErr != nil {
+			writeErr(w, http.StatusInternalServerError, saveErr.Error())
 			return
 		}
-		writeJSON(w, 200, t)
+		writeJSON(w, 200, item)
 		return
 	}
 	if err := s.checkImageAccess(id, model, r.FormValue("resolution")); err != nil {
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", err, nil)
-		if !s.saveTaskOrError(w, t) {
+		item, _, saveErr := s.createTaskIfAbsent(t)
+		if saveErr != nil {
+			writeErr(w, http.StatusInternalServerError, saveErr.Error())
 			return
 		}
-		writeJSON(w, 200, t)
+		writeJSON(w, 200, item)
 		return
 	}
 	if !s.consumeImage(id, 1) {
 		t.Status = "error"
 		t.Error = "画图额度不足"
-		if !s.saveTaskOrError(w, t) {
+		item, _, saveErr := s.createTaskIfAbsent(t)
+		if saveErr != nil {
+			writeErr(w, http.StatusInternalServerError, saveErr.Error())
 			return
 		}
-		writeJSON(w, 200, t)
+		writeJSON(w, 200, item)
 		return
 	}
 	inputs := [][]byte{}
@@ -823,17 +900,26 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		s.refundImage(id, 1)
 		t.Status = "error"
 		t.Error = "image file is required"
-		if !s.saveTaskOrError(w, t) {
+		item, _, saveErr := s.createTaskIfAbsent(t)
+		if saveErr != nil {
+			writeErr(w, http.StatusInternalServerError, saveErr.Error())
 			return
 		}
-		writeJSON(w, 200, t)
+		writeJSON(w, 200, item)
 		return
 	}
-	if err := s.saveTask(t); err != nil {
+	item, created, err := s.createTaskIfAbsent(t)
+	if err != nil {
 		s.refundImage(id, 1)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !created {
+		s.refundImage(id, 1)
+		writeJSON(w, 200, item)
+		return
+	}
+	t = item
 	ctx, cancel := context.WithTimeout(context.Background(), s.imageRequestTimeout())
 	s.setTaskCancel(t.ID, cancel)
 	go func(task ImageTask, identity *Identity) {
@@ -911,6 +997,10 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, t)
 }
 func (s *Server) handleImageTaskCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	identity, ok := s.requireIdentity(w, r)
 	if !ok {
 		return

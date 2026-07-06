@@ -116,20 +116,21 @@ type LogItem struct {
 }
 
 type ImageTask struct {
-	ID           string           `json:"id"`
-	ClientTaskID string           `json:"client_task_id,omitempty"`
-	OwnerID      string           `json:"owner_id,omitempty"`
-	OwnerRole    string           `json:"owner_role,omitempty"`
-	Status       string           `json:"status"`
-	Mode         string           `json:"mode"`
-	Model        string           `json:"model,omitempty"`
-	N            int              `json:"n,omitempty"`
-	Size         string           `json:"size,omitempty"`
-	Resolution   string           `json:"resolution,omitempty"`
-	CreatedAt    string           `json:"created_at"`
-	UpdatedAt    string           `json:"updated_at"`
-	Data         []map[string]any `json:"data,omitempty"`
-	Error        string           `json:"error,omitempty"`
+	ID             string           `json:"id"`
+	ClientTaskID   string           `json:"client_task_id,omitempty"`
+	OwnerID        string           `json:"owner_id,omitempty"`
+	OwnerRole      string           `json:"owner_role,omitempty"`
+	Status         string           `json:"status"`
+	Mode           string           `json:"mode"`
+	Model          string           `json:"model,omitempty"`
+	N              int              `json:"n,omitempty"`
+	Size           string           `json:"size,omitempty"`
+	Resolution     string           `json:"resolution,omitempty"`
+	ResponseFormat string           `json:"response_format,omitempty"`
+	CreatedAt      string           `json:"created_at"`
+	UpdatedAt      string           `json:"updated_at"`
+	Data           []map[string]any `json:"data,omitempty"`
+	Error          string           `json:"error,omitempty"`
 }
 
 func nowISO() string { return time.Now().UTC().Format(time.RFC3339Nano) }

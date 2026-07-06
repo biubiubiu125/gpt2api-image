@@ -624,6 +624,10 @@ func (s *Server) handleImageTags(w http.ResponseWriter, r *http.Request) {
 	writeErr(w, 405, "method not allowed")
 }
 func (s *Server) handleImageTagDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}

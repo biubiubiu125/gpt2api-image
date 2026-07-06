@@ -650,17 +650,20 @@ func scanDBTask(scanner interface {
 
 func (t DBImageTask) Public() ImageTask {
 	return ImageTask{
-		ID:           t.ID,
-		ClientTaskID: t.ClientTaskID,
-		OwnerID:      t.OwnerID,
-		Status:       t.Status,
-		Mode:         t.Mode,
-		Model:        normalizeImageModel(t.Model),
-		Size:         t.Size,
-		Resolution:   t.Resolution,
-		CreatedAt:    t.CreatedAt,
-		UpdatedAt:    t.UpdatedAt,
-		Data:         t.ResultData,
-		Error:        t.Error,
+		ID:             t.ID,
+		ClientTaskID:   t.ClientTaskID,
+		OwnerID:        t.OwnerID,
+		OwnerRole:      t.OwnerRole,
+		Status:         t.Status,
+		Mode:           t.Mode,
+		Model:          normalizeImageModel(t.Model),
+		N:              t.N,
+		Size:           t.Size,
+		Resolution:     t.Resolution,
+		ResponseFormat: t.ResponseFormat,
+		CreatedAt:      t.CreatedAt,
+		UpdatedAt:      t.UpdatedAt,
+		Data:           t.ResultData,
+		Error:          t.Error,
 	}
 }

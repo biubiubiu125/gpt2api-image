@@ -48,12 +48,13 @@ const IMAGE_SIZE_STORAGE_KEY = "gpt2api-image:image_last_size";
 const IMAGE_RESOLUTION_STORAGE_KEY = "gpt2api-image:image_last_resolution";
 const IMAGE_COUNT_STORAGE_KEY = "gpt2api-image:image_last_count";
 const HIGH_RESOLUTION_VALUES = new Set(["2k", "4k"]);
+const MAX_IMAGE_COUNT = 8;
 // 每个会话的滚动位置单独存。用 sessionStorage 因为这就是"会话级"的临时位置，
 // 关浏览器后从底部重看更自然；要跨浏览器会话保留改成 localStorage 即可。
 const SCROLL_POSITION_STORAGE_KEY = "gpt2api-image:image_scroll_positions";
 
 function clampImageCount(value: string) {
-  return String(Math.min(100, Math.max(1, Math.floor(Number(value) || 1))));
+  return String(Math.min(MAX_IMAGE_COUNT, Math.max(1, Math.floor(Number(value) || 1))));
 }
 
 function isHighResolution(value: string | null | undefined) {
@@ -397,7 +398,7 @@ async function recoverConversationHistory(items: ImageConversation[]) {
 }
 
 
-function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
+function ImagePageContent({ isRootAdmin }: { isRootAdmin: boolean }) {
   const didLoadQuotaRef = useRef(false);
   const initialLoadCompleteRef = useRef(false);
   const conversationsRef = useRef<ImageConversation[]>([]);
@@ -423,7 +424,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
   const [availableQuota, setAvailableQuota] = useState("加载中...");
-  const [canUseHighResolution, setCanUseHighResolution] = useState(isAdmin);
+  const [canUseHighResolution, setCanUseHighResolution] = useState(isRootAdmin);
   const [lightboxImages, setLightboxImages] = useState<ImageLightboxItem[]>([]);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
@@ -448,10 +449,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const parsedCount = useMemo(() => Number(clampImageCount(imageCount)), [imageCount]);
   // 提交前的乐观额度检查：拦掉那些"已发送对话"成功 toast 后又紧跟着 "额度不足" 错误 toast 的双弹。
-  // 管理员/不限额度/没拿到额度数据时一律放行，让后端兜底。
+  // 根管理员/不限额度/没拿到额度数据时一律放行，让后端兜底。
   const ensureQuotaForRequest = useCallback(
     (count: number) => {
-      if (isAdmin) return true;
+      if (isRootAdmin) return true;
       if (availableQuota === "∞") return true;
       if (availableQuota === "加载中..." || availableQuota === "--") return true;
       const remaining = Number(availableQuota);
@@ -466,7 +467,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       }
       return true;
     },
-    [availableQuota, isAdmin],
+    [availableQuota, isRootAdmin],
   );
   const selectedConversation = useMemo(
     () => conversations.find((item) => item.id === selectedConversationId) ?? null,
@@ -635,10 +636,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, []);
 
   const loadQuota = useCallback(async () => {
-    if (isAdmin) {
-      // 管理员密钥层面是全档不限额，画图能力的真实瓶颈在号池而非密钥额度。
-      // 顶部展示的是"我自己这把密钥的画图额度"，所以直接显示 ∞——
-      // 号池可用量在「号池管理」页有更准确的视图。
+    if (isRootAdmin) {
+      // 根管理员密钥不受用户配额限制；号池可用量在「号池管理」页展示。
       setCanUseHighResolution(true);
       setAvailableQuota("∞");
       return;
@@ -684,7 +683,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     } catch {
       setAvailableQuota((prev) => (prev === "加载中..." ? "--" : prev));
     }
-  }, [isAdmin]);
+  }, [isRootAdmin]);
 
   useEffect(() => {
     if (didLoadQuotaRef.current) {
@@ -701,7 +700,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     return () => {
       window.removeEventListener("focus", handleFocus);
     };
-  }, [isAdmin, loadQuota]);
+  }, [isRootAdmin, loadQuota]);
 
   // 滚动行为：
   // 1) 切换/打开会话首帧 → 同步落到上次记忆的 scrollTop（落不到就到底，无动画）
@@ -1859,5 +1858,5 @@ export default function ImagePage() {
     );
   }
 
-  return <ImagePageContent isAdmin={session.role === "admin"} />;
+  return <ImagePageContent isRootAdmin={session.role === "admin" && session.subjectId === "admin"} />;
 }

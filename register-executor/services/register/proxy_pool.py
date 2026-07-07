@@ -28,10 +28,37 @@ def classify_register_failure(error: object) -> str:
     text = str(error or "").lower()
     if not text:
         return "unknown_error"
+    if (
+        "registered_account_delete_failed" in text
+        or "registered_account_delete_check_failed" in text
+        or "registered_account_delete_not_persisted" in text
+        or "account_delete_failed" in text
+    ):
+        return "account_delete_failed"
+    if "registered_account_refresh_failed" in text or "account_refresh_failed" in text or "/backend-api/me" in text:
+        return "account_refresh_failed"
+    if "registered_account_unusable" in text or "unusable_after_refresh" in text:
+        return "account_unusable_after_refresh"
+    if "register_task_stalled" in text:
+        return "register_task_stalled"
     if "register_task_timeout" in text:
         return "task_timeout"
     if "register_proxy_unavailable" in text:
         return "register_proxy_unavailable"
+    if "create mailbox" in text or "mailbox" in text and "address" in text:
+        return "mail_create_failed"
+    if "mail_code_timeout" in text or "wait code" in text or "验证码超时" in text:
+        return "mail_code_timeout"
+    if "validate_otp" in text or "otp validate" in text or "验证码验证失败" in text:
+        return "otp_validate_failed"
+    if "send_otp" in text or "otp send" in text:
+        return "otp_send_failed"
+    if "platform_authorize" in text or "authorize" in text and "platform" in text:
+        return "platform_authorize_failed"
+    if "token_exchange" in text or "token 交换" in text or "oauth" in text:
+        return "token_exchange_failed"
+    if "create_account_http" in text or "profile" in text and "account" in text:
+        return "account_profile_failed"
     if "unsupported_email" in text or "email you provided is not supported" in text:
         return "unsupported_email"
     if "timed out" in text or "timeout" in text or "curl: (28)" in text:
@@ -42,7 +69,7 @@ def classify_register_failure(error: object) -> str:
         return "maybe_network_failed"
     if "mail" in text or "邮箱" in text or "验证码" in text or "verification" in text:
         return "mail_failed"
-    if "token" in text or "oauth" in text:
+    if "token" in text:
         return "token_exchange_failed"
     if "create_account" in text or "user_register" in text or "failed to create account" in text:
         return "account_create_failed"

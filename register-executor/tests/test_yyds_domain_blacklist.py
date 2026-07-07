@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import os
 import tempfile
 import types
 import unittest
@@ -24,6 +25,10 @@ sys.modules.setdefault("curl_cffi.requests", fake_requests)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fastapi import HTTPException  # noqa: E402
+
+import app as register_executor_app  # noqa: E402
+from services.account_service import AccountService  # noqa: E402
 from services.register import mail_provider, openai_register  # noqa: E402
 
 
@@ -53,6 +58,87 @@ class YYDSDomainBlacklistTest(unittest.TestCase):
                 RuntimeError("user_register_http_500"),
             )
         )
+
+    def test_runtime_resource_writes_return_409_while_register_active(self) -> None:
+        original_service = register_executor_app.register_service
+        original_auth_key = os.environ.get("GPT2API_IMAGE_AUTH_KEY")
+        original_internal_key = os.environ.get("GPT2API_IMAGE_REGISTER_INTERNAL_KEY")
+
+        class ActiveService:
+            def reset_outlook_pool(self, scope="all"):
+                raise register_executor_app.RegisterTaskActiveError("register task is running")
+
+            def add_yyds_domain_blacklist(self, domains):
+                raise register_executor_app.RegisterTaskActiveError("register task is running")
+
+            def remove_yyds_domain_blacklist(self, domains):
+                raise register_executor_app.RegisterTaskActiveError("register task is running")
+
+            def replace_yyds_domain_blacklist(self, domains):
+                raise register_executor_app.RegisterTaskActiveError("register task is running")
+
+            def reset_yyds_domain_blacklist(self):
+                raise register_executor_app.RegisterTaskActiveError("register task is running")
+
+        try:
+            os.environ["GPT2API_IMAGE_AUTH_KEY"] = "test-key"
+            os.environ["GPT2API_IMAGE_REGISTER_INTERNAL_KEY"] = "internal-test-key"
+            register_executor_app.register_service = ActiveService()
+            body = register_executor_app.YYDSDomainBlacklistRequest(domains=["blocked.example"])
+            calls = [
+                lambda: register_executor_app.reset_outlook_pool(register_executor_app.OutlookPoolResetRequest(scope="failed"), x_register_internal_key="internal-test-key", authorization=""),
+                lambda: register_executor_app.add_yyds_domain_blacklist(body, x_register_internal_key="internal-test-key", authorization=""),
+                lambda: register_executor_app.remove_yyds_domain_blacklist(body, x_register_internal_key="internal-test-key", authorization=""),
+                lambda: register_executor_app.replace_yyds_domain_blacklist(body, x_register_internal_key="internal-test-key", authorization=""),
+                lambda: register_executor_app.reset_yyds_domain_blacklist(x_register_internal_key="internal-test-key", authorization=""),
+            ]
+            for call in calls:
+                with self.subTest(call=call):
+                    with self.assertRaises(HTTPException) as raised:
+                        call()
+                    self.assertEqual(raised.exception.status_code, 409)
+            self.assertEqual(mail_provider.yyds_domain_blacklist_items(), [])
+        finally:
+            register_executor_app.register_service = original_service
+            if original_auth_key is None:
+                os.environ.pop("GPT2API_IMAGE_AUTH_KEY", None)
+            else:
+                os.environ["GPT2API_IMAGE_AUTH_KEY"] = original_auth_key
+            if original_internal_key is None:
+                os.environ.pop("GPT2API_IMAGE_REGISTER_INTERNAL_KEY", None)
+            else:
+                os.environ["GPT2API_IMAGE_REGISTER_INTERNAL_KEY"] = original_internal_key
+
+    def test_internal_auth_does_not_fallback_to_auth_key(self) -> None:
+        original_auth_key = os.environ.get("GPT2API_IMAGE_AUTH_KEY")
+        original_internal_key = os.environ.get("GPT2API_IMAGE_REGISTER_INTERNAL_KEY")
+        try:
+            os.environ["GPT2API_IMAGE_AUTH_KEY"] = "test-key"
+            os.environ.pop("GPT2API_IMAGE_REGISTER_INTERNAL_KEY", None)
+
+            with self.assertRaises(HTTPException) as raised:
+                register_executor_app._require_internal("", "Bearer test-key")
+            self.assertEqual(raised.exception.status_code, 401)
+            self.assertNotIn("Authorization", AccountService()._headers())
+
+            os.environ["GPT2API_IMAGE_REGISTER_INTERNAL_KEY"] = "internal-test-key"
+            with self.assertRaises(HTTPException) as raised:
+                register_executor_app._require_internal("", "Bearer test-key")
+            self.assertEqual(raised.exception.status_code, 401)
+
+            register_executor_app._require_internal("", "Bearer internal-test-key")
+            headers = AccountService()._headers()
+            self.assertEqual(headers.get("X-Register-Internal-Key"), "internal-test-key")
+            self.assertNotIn("Authorization", headers)
+        finally:
+            if original_auth_key is None:
+                os.environ.pop("GPT2API_IMAGE_AUTH_KEY", None)
+            else:
+                os.environ["GPT2API_IMAGE_AUTH_KEY"] = original_auth_key
+            if original_internal_key is None:
+                os.environ.pop("GPT2API_IMAGE_REGISTER_INTERNAL_KEY", None)
+            else:
+                os.environ["GPT2API_IMAGE_REGISTER_INTERNAL_KEY"] = original_internal_key
 
     def test_yyds_release_retries_with_api_key_after_mailbox_token_failure(self) -> None:
         provider = object.__new__(mail_provider.YydsMailProvider)

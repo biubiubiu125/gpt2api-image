@@ -12,6 +12,9 @@ const registerSecretPlaceholder = "********"
 
 type RegisterConfig struct {
 	Enabled                 bool                   `json:"enabled"`
+	Lifecycle               string                 `json:"lifecycle,omitempty"`
+	IsRunning               bool                   `json:"is_running,omitempty"`
+	IsStopping              bool                   `json:"is_stopping,omitempty"`
 	Mail                    RegisterMailConfig     `json:"mail"`
 	Proxy                   string                 `json:"proxy"`
 	TaskTimeoutSeconds      int                    `json:"task_timeout_seconds"`
@@ -42,8 +45,11 @@ type RegisterStats struct {
 	JobID            string           `json:"job_id,omitempty"`
 	JobKind          string           `json:"job_kind,omitempty"`
 	Success          int              `json:"success"`
+	UsableSuccess    int              `json:"usable_success"`
 	Fail             int              `json:"fail"`
 	Done             int              `json:"done"`
+	Saved            int              `json:"saved"`
+	RefreshFailed    int              `json:"refresh_failed"`
 	Running          int              `json:"running"`
 	Threads          int              `json:"threads"`
 	ElapsedSeconds   float64          `json:"elapsed_seconds"`
@@ -56,6 +62,10 @@ type RegisterStats struct {
 	FinishedAt       string           `json:"finished_at,omitempty"`
 	Trigger          string           `json:"trigger,omitempty"`
 	Workers          []map[string]any `json:"workers,omitempty"`
+	FailureReasons   map[string]int   `json:"failure_reasons,omitempty"`
+	Lifecycle        string           `json:"lifecycle,omitempty"`
+	IsRunning        bool             `json:"is_running,omitempty"`
+	IsStopping       bool             `json:"is_stopping,omitempty"`
 }
 
 type RegisterLog struct {
@@ -66,7 +76,8 @@ type RegisterLog struct {
 
 func defaultRegisterConfig() RegisterConfig {
 	return RegisterConfig{
-		Enabled: false,
+		Enabled:   false,
+		Lifecycle: "idle",
 		Mail: RegisterMailConfig{
 			RequestTimeout:      30,
 			WaitTimeout:         30,
@@ -92,8 +103,11 @@ func defaultRegisterConfig() RegisterConfig {
 		},
 		Stats: RegisterStats{
 			Success:          0,
+			UsableSuccess:    0,
 			Fail:             0,
 			Done:             0,
+			Saved:            0,
+			RefreshFailed:    0,
 			Running:          0,
 			Threads:          3,
 			ElapsedSeconds:   0,
@@ -101,6 +115,8 @@ func defaultRegisterConfig() RegisterConfig {
 			SuccessRate:      0,
 			CurrentQuota:     0,
 			CurrentAvailable: 0,
+			FailureReasons:   map[string]int{},
+			Lifecycle:        "idle",
 		},
 		Logs: []RegisterLog{},
 		Executor: map[string]any{
@@ -183,6 +199,22 @@ func (s *Server) registerSnapshot() RegisterConfig {
 	cfg := s.store.LoadRegisterConfig()
 	cfg.Stats.CurrentQuota, cfg.Stats.CurrentAvailable = s.registerPoolMetrics()
 	cfg.Stats.Threads = cfg.Threads
+	stopping := !cfg.Enabled && cfg.Stats.Running > 0
+	running := cfg.Enabled
+	lifecycle := "idle"
+	if stopping {
+		lifecycle = "stopping"
+	} else if running && cfg.Stats.JobKind == "repair_abnormal" {
+		lifecycle = "repairing"
+	} else if running {
+		lifecycle = "running"
+	}
+	cfg.Lifecycle = lifecycle
+	cfg.IsRunning = running
+	cfg.IsStopping = stopping
+	cfg.Stats.Lifecycle = lifecycle
+	cfg.Stats.IsRunning = running
+	cfg.Stats.IsStopping = stopping
 	cfg = redactRegisterSecrets(cfg)
 	return cfg
 }

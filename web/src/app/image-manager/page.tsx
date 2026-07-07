@@ -13,13 +13,18 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageOwners, fetchImageTags, fetchManagedImages, setImageTags, type ImageOwner, type ManagedImage } from "@/lib/api";
+import { deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageOwners, fetchImageTags, fetchManagedImages, setImageTags, type ImageOwner, type ManagedImage, type ManagedImageSummary } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
 
 function formatSize(size: number) {
   return size > 1024 * 1024 ? `${(size / 1024 / 1024).toFixed(2)} MB` : `${Math.ceil(size / 1024)} KB`;
+}
+
+function formatPercent(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0%";
+  return `${value.toFixed(value >= 10 ? 1 : 2)}%`;
 }
 
 function imageKey(item: ManagedImage) {
@@ -215,6 +220,7 @@ function OwnerOption({
 // 视觉上是设置页之外最严重的"跳动"页面。
 type ImageManagerCache = {
   items: ManagedImage[];
+  summary: ManagedImageSummary | null;
   allTags: string[];
   owners: ImageOwner[];
   startDate: string;
@@ -256,6 +262,7 @@ function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
 function ImageManagerContent() {
   // 命中缓存时直接拿来当初始 state，避免切回时网格塌缩成空再撑回。
   const [items, setItemsState] = useState<ManagedImage[]>(() => cachedImageManager?.items ?? []);
+  const [summary, setSummaryState] = useState<ManagedImageSummary | null>(() => cachedImageManager?.summary ?? null);
   const [startDate, setStartDate] = useState(() => cachedImageManager?.startDate ?? "");
   const [endDate, setEndDate] = useState(() => cachedImageManager?.endDate ?? "");
   const [owner, setOwner] = useState(() => cachedImageManager?.owner ?? "");
@@ -285,6 +292,7 @@ function ImageManagerContent() {
         const value = typeof next === "function" ? (next as (p: ManagedImage[]) => ManagedImage[])(prev) : next;
         cachedImageManager = {
           items: value,
+          summary: cachedImageManager?.summary ?? null,
           allTags: cachedImageManager?.allTags ?? [],
           owners: cachedImageManager?.owners ?? [],
           startDate,
@@ -302,6 +310,7 @@ function ImageManagerContent() {
         const value = typeof next === "function" ? (next as (p: string[]) => string[])(prev) : next;
         cachedImageManager = {
           items: cachedImageManager?.items ?? [],
+          summary: cachedImageManager?.summary ?? null,
           allTags: value,
           owners: cachedImageManager?.owners ?? [],
           startDate,
@@ -321,8 +330,25 @@ function ImageManagerContent() {
       setOwnersState(safe);
       cachedImageManager = {
         items: cachedImageManager?.items ?? [],
+        summary: cachedImageManager?.summary ?? null,
         allTags: cachedImageManager?.allTags ?? [],
         owners: safe,
+        startDate,
+        endDate,
+        owner,
+      };
+    },
+    [startDate, endDate, owner],
+  );
+  const setSummary = useCallback(
+    (next: ManagedImageSummary | null | undefined) => {
+      const value = next ?? null;
+      setSummaryState(value);
+      cachedImageManager = {
+        items: cachedImageManager?.items ?? [],
+        summary: value,
+        allTags: cachedImageManager?.allTags ?? [],
+        owners: cachedImageManager?.owners ?? [],
         startDate,
         endDate,
         owner,
@@ -370,6 +396,7 @@ function ImageManagerContent() {
         fetchImageOwners(),
       ]);
       setItems(data.items);
+      setSummary(data.summary);
       setAllTags(tagsData.tags);
       setOwners(ownersData.items);
       setSelectedPaths((current) => current.filter((path) => data.items.some((item) => imageKey(item) === path)));
@@ -399,6 +426,7 @@ function ImageManagerContent() {
       await deleteManagedImages({ paths: [deleteTarget.rel] });
       setItems((prev) => prev.filter((item) => item.rel !== deleteTarget.rel));
       setSelectedPaths((prev) => prev.filter((p) => p !== imageKey(deleteTarget)));
+      await loadImages(true);
       toast.success("图片已删除");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "删除失败");
@@ -570,6 +598,25 @@ function ImageManagerContent() {
           </Button>
         </div>
       </div>
+
+      {summary ? (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {[
+            { label: "图片总数", value: summary.total_images, hint: `筛选 ${summary.filtered_images}` },
+            { label: "今日新增", value: summary.today_images, hint: "按文件日期" },
+            { label: "目录占用", value: formatSize(summary.used_bytes), hint: summary.storage_limit_bytes > 0 ? `上限 ${formatSize(summary.storage_limit_bytes)}` : "未设置上限" },
+            { label: "容量比例", value: summary.storage_limit_bytes > 0 ? formatPercent(summary.storage_usage_percent) : "未限制", hint: summary.disk_free_bytes > 0 ? `磁盘可用 ${formatSize(summary.disk_free_bytes)}` : "磁盘信息不可用" },
+          ].map((item) => (
+            <Card key={item.label} className="rounded-xl border-stone-200 bg-white shadow-sm">
+              <CardContent className="flex min-h-[86px] flex-col justify-between p-4">
+                <div className="text-xs font-medium text-stone-500">{item.label}</div>
+                <div className="font-data text-2xl font-semibold tabular-nums text-stone-950">{item.value}</div>
+                <div className="text-xs text-stone-400">{item.hint}</div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      ) : null}
 
       {allTags.length > 0 ? (
         <div className="flex flex-wrap items-center gap-2">

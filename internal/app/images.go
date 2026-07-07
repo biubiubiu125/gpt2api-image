@@ -124,15 +124,7 @@ func (s *Server) cleanupOldImages() int {
 		days = 30
 	}
 	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
-	protected := map[string]bool{}
-	if s.cfg.CleanupProtectUserImages {
-		for rel, owner := range s.store.LoadOwners() {
-			owner = strings.ToLower(strings.TrimSpace(owner))
-			if rel = relClean(rel); rel != "" && owner != "" && owner != "admin" && owner != "__admin__" {
-				protected[rel] = true
-			}
-		}
-	}
+	protected := s.protectedUserImageRels()
 	removed := 0
 	_ = filepath.WalkDir(s.imagesDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -158,6 +150,20 @@ func (s *Server) cleanupOldImages() int {
 	return removed
 }
 
+func (s *Server) protectedUserImageRels() map[string]bool {
+	protected := map[string]bool{}
+	if !s.cfg.CleanupProtectUserImages || s.store == nil {
+		return protected
+	}
+	for rel, owner := range s.store.LoadOwners() {
+		owner = strings.ToLower(strings.TrimSpace(owner))
+		if rel = relClean(rel); rel != "" && owner != "" && owner != "admin" && owner != "__admin__" {
+			protected[rel] = true
+		}
+	}
+	return protected
+}
+
 type storedImageCleanupItem struct {
 	path      string
 	rel       string
@@ -178,7 +184,7 @@ func (s *Server) cleanupImageStorageLimitExcept(protectedRels ...string) int {
 	if limitBytes <= 0 {
 		return 0
 	}
-	protected := map[string]bool{}
+	protected := s.protectedUserImageRels()
 	for _, rel := range protectedRels {
 		if rel = relClean(rel); rel != "" {
 			protected[rel] = true
@@ -444,17 +450,49 @@ func (s *Server) listImages(r *http.Request, filter imageFilter) map[string]any 
 	prompts := s.store.LoadPrompts()
 	tags := s.store.LoadTags()
 	items := []map[string]any{}
+	var totalImages, filteredImages, todayImages int
+	var totalBytes, filteredBytes int64
+	today := time.Now().Format("2006-01-02")
 	_ = s.walkStoredImages(func(path string, rel string, st os.FileInfo) error {
+		totalImages++
+		totalBytes += st.Size()
+		if st.ModTime().Format("2006-01-02") == today {
+			todayImages++
+		}
 		owner := owners[rel]
 		if !filter.matches(owner, st.ModTime()) {
 			return nil
 		}
+		filteredImages++
+		filteredBytes += st.Size()
 		pr := prompts[rel]
 		items = append(items, map[string]any{"rel": rel, "path": rel, "name": filepath.Base(path), "date": st.ModTime().Format("2006-01-02"), "size": st.Size(), "url": s.baseURL(r) + "/images/" + rel, "thumbnail_url": s.baseURL(r) + "/image-thumbnails/" + rel, "created_at": st.ModTime().Format(time.RFC3339), "tags": tags[rel], "owner_id": owner, "is_admin_owner": owner == "admin", "prompt": strAny(pr["prompt"], "")})
 		return nil
 	})
 	sort.Slice(items, func(i, j int) bool { return strAny(items[i]["created_at"], "") > strAny(items[j]["created_at"], "") })
-	return map[string]any{"items": items}
+	limitBytes := int64(0)
+	if s.cfg.ImageMaxStorageMB > 0 {
+		limitBytes = int64(s.cfg.ImageMaxStorageMB) * 1024 * 1024
+	}
+	usagePercent := float64(0)
+	if limitBytes > 0 {
+		usagePercent = float64(totalBytes) * 100 / float64(limitBytes)
+	}
+	diskTotal, diskFree := imageDiskUsage(s.imagesDir)
+	return map[string]any{
+		"items": items,
+		"summary": map[string]any{
+			"total_images":          totalImages,
+			"filtered_images":       filteredImages,
+			"today_images":          todayImages,
+			"used_bytes":            totalBytes,
+			"filtered_bytes":        filteredBytes,
+			"storage_limit_bytes":   limitBytes,
+			"storage_usage_percent": usagePercent,
+			"disk_total_bytes":      diskTotal,
+			"disk_free_bytes":       diskFree,
+		},
+	}
 }
 func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -757,8 +795,13 @@ func (s *Server) handleImageTags(w http.ResponseWriter, r *http.Request) {
 		if !readBody(w, r, &b) {
 			return
 		}
+		rel, err := safeImageRel(b.Path)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if err := s.store.UpdateTags(func(tags map[string][]string) map[string][]string {
-			tags[relClean(b.Path)] = b.Tags
+			tags[rel] = b.Tags
 			return tags
 		}); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())

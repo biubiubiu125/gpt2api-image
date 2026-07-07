@@ -1,32 +1,31 @@
 # gpt2api-image
 
-`gpt2api-image` 是一个面向图片生成接口的本地网关和管理后台。它把图片生成、图片编辑、账号池、图片归档、异步任务、注册执行器和 OpenAI 兼容接口放在同一套服务里，既可以单机运行，也可以用 PostgreSQL（数据库）拆成 API 进程和 Worker（后台任务进程）。
+`gpt2api-image` 是一个面向图片生成链路的 OpenAI 兼容网关和管理后台。项目由 Go API/Worker、Next.js 管理端、Python 注册执行器和 PostgreSQL 任务队列组成，推荐部署在 Linux 服务器上运行。
 
-这个项目只聚焦图片链路。公开的 `/v1/chat/completions` 和 `/v1/responses` 只处理能转换成图片生成的请求，普通文本聊天不会代理到上游文本模型；`/v1/messages` 保持禁用。
+项目只处理图片相关请求。公开的 `/v1/chat/completions` 和 `/v1/responses` 是 image-only（仅图片模式）兼容接口，普通文本聊天不会被代理到上游文本模型；`/v1/messages` 默认禁用。
 
-## 功能概览
+## 功能
 
 - OpenAI 兼容图片接口：`/v1/images/generations`、`/v1/images/edits`、`/v1/models`
-- 图片化兼容接口：image-only `/v1/chat/completions`、image-only `/v1/responses`
-- 图片任务闭环：创建、查询、领取、心跳、执行、保存、取消、超时、失败退款、部分成功退款
-- 双任务模式：无 PostgreSQL 时本地 JSON 任务，有 PostgreSQL 时 API/Worker 队列任务
-- 账号池与路由：支持 web 路由、Codex 路由、单账号并发限制、跨进程账号 lease
-- 图片归档：结果保存到 `data/images`，按需生成 `data/image_thumbnails`
-- 管理后台：账号、API 密钥、图片工作台、图片管理、任务、设置、日志、注册执行器
-- 注册执行器：独立 Python 服务，用于注册和账号补充流程
-- CI（持续集成）与发布：Go 测试、前端构建、PostgreSQL 集成测试、发布包、Docker 镜像发布
+- image-only 兼容接口：`/v1/chat/completions`、`/v1/responses`
+- 图片任务闭环：创建、入队、领取、心跳、执行、保存、取消、超时、失败退款、部分成功退款
+- 账号池：支持 web/codex 两类账号、刷新、导入、并发限制、异常账号清理
+- 图片归档：结果保存到 `data/images`，缩略图保存到 `data/image_thumbnails`
+- 管理后台：账号管理、API 密钥、图片工作台、图片管理、任务、设置、日志、注册机
+- 注册执行器：独立 Python 服务，负责邮箱取码、注册、刷新校验、异常修复和自动补号
+- PostgreSQL 队列：生产部署下 API 和 Worker 分离，支持跨进程领取和续约
 
 ## 架构
 
 ```text
-Web 管理后台 / OpenAI 兼容客户端
+客户端 / 管理后台
   -> Go API 鉴权、校验、扣费
-  -> 同步生成或写入 image_tasks_v3
-  -> Worker 领取任务、心跳续约
+  -> 同步生成，或写入 PostgreSQL image_tasks_v3
+  -> Worker 领取任务并续约
   -> 账号池选择 web/codex 上游账号
-  -> 上游生成/编辑图片
-  -> 保存到 data/images 并记录 owner/prompt metadata
-  -> API 返回 URL / b64_json，或前端轮询任务结果
+  -> 上游生成或编辑图片
+  -> 保存到 data/images 并记录 owner/prompt
+  -> 返回 url / b64_json，或由前端轮询任务结果
 ```
 
 主要目录：
@@ -37,21 +36,21 @@ internal/app/            API、任务、账号、存储、日志、上游、Work
 web/                     Next.js 管理后台
 register-executor/       Python 注册执行器
 scripts/                 安装、打包、集成测试脚本
-.github/workflows/       GitHub Actions 工作流
-assets/                  README 和页面用静态图片
+assets/                  README 和页面静态图
 docs/                    补充文档
 config.example.json      配置模板
-.env.example             Compose 环境变量模板
-docker-compose.yml       生产形态 Compose
+.env.example             Docker Compose 环境变量模板
+docker-compose.yml       服务器部署 Compose
 docker-compose.local.yml 本地调试 Compose
 ```
 
-运行数据默认在 `data/`：
+运行数据默认写入 `data/`：
 
 ```text
 data/accounts.json           上游账号池
 data/auth_keys.json          后台/API 服务密钥
 data/settings.json           运行设置
+data/register.json           注册机配置和统计
 data/images/                 生成图片归档
 data/image_thumbnails/       缩略图缓存
 data/task_inputs/            异步编辑任务输入图
@@ -61,57 +60,77 @@ data/image_prompts.json      图片 prompt 元数据
 data/logs.jsonl              JSONL 日志
 ```
 
-`data/`、`.env`、`config.json`、`bin/`、`web_dist/`、`release/` 等运行数据和构建产物默认不提交。
+## 服务器部署
 
-## 快速启动
+推荐使用 Docker Compose。生产形态会启动 4 个服务：
 
-### Docker Compose
+- `postgres`：PostgreSQL 任务队列
+- `api`：Go HTTP API 和管理后台
+- `worker`：后台图片任务 Worker
+- `register-executor`：Python 注册执行器
 
-生产形态使用 `docker-compose.yml`，默认暴露 `3000`，同时启动 `api`、`worker`、`postgres` 和 `register-executor`。
+### 1. 准备配置
 
-```powershell
-Copy-Item .env.example .env
-Copy-Item config.example.json config.json
-notepad .env
-notepad config.json
-docker compose up -d --build
+```bash
+cd /opt/gpt2api-image
+cp .env.example .env
+cp config.example.json config.json
+
+openssl rand -hex 32
+nano .env
+nano config.json
 ```
 
-至少要设置：
+`.env` 至少设置：
 
 ```env
 GPT2API_IMAGE_AUTH_KEY=replace-with-a-long-random-admin-key
+GPT2API_IMAGE_REGISTER_INTERNAL_KEY=replace-with-a-different-long-random-internal-key
 POSTGRES_PASSWORD=replace-with-a-long-random-postgres-password
-GPT2API_IMAGE_BASE_URL=http://127.0.0.1:3000
+GPT2API_IMAGE_BASE_URL=https://your-api.example.com
 ```
 
-启动后访问：
+说明：
 
-- 管理后台：`http://127.0.0.1:3000`
-- 图片接口：`http://127.0.0.1:3000/v1/images/generations`
-- 系统状态：`http://127.0.0.1:3000/api/system/status`
+- `GPT2API_IMAGE_AUTH_KEY` 是管理后台和根 API 密钥，不能留空，也不能使用默认占位值。
+- `GPT2API_IMAGE_BASE_URL` 用于 Worker 返回图片 URL，生产环境要填外部可访问域名。
+- `GPT2API_IMAGE_REGISTER_INTERNAL_KEY` 是 API 和注册执行器内部通信密钥，启用注册执行器时必填，且不要复用 `GPT2API_IMAGE_AUTH_KEY`。
+- 反向代理只需要转发到 API 暴露端口，注册执行器不要直接暴露到公网。
 
-### 本地 Compose
+### 2. 启动
 
-本地调试使用 `docker-compose.local.yml`，默认暴露 `8000`，PostgreSQL 密码有本地默认值，但仍需要提供 `GPT2API_IMAGE_AUTH_KEY`。
-
-```powershell
-Copy-Item .env.example .env
-Copy-Item config.example.json config.json
-notepad .env
-docker compose -f docker-compose.local.yml up -d --build
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs -f api worker register-executor
 ```
 
-默认地址：
+默认端口：
 
-- 管理后台：`http://127.0.0.1:8000`
-- Worker 返回图片 URL 的基准地址：`http://127.0.0.1:8000`
-- Compose 内部 API 地址：`http://api`
-- Compose 内部注册执行器地址：`http://register-executor:8091`
+- 管理后台：`http://服务器IP:3000`
+- OpenAI 兼容接口：`http://服务器IP:3000/v1`
+- 状态接口：`http://服务器IP:3000/api/system/status`
 
-### 使用已发布 Docker 镜像
+如果使用反向代理，建议把外部 HTTPS 域名写入 `GPT2API_IMAGE_BASE_URL`，并把 `3000` 只开放给反向代理或可信来源。
 
-仓库更新后会自动构建并发布到 GHCR（GitHub Container Registry）。如果不想本地构建，可以在 `.env` 里改成已发布镜像：
+### 3. 更新
+
+```bash
+git pull
+docker compose up -d --build
+docker compose logs -f api worker register-executor
+```
+
+`data/` 和 PostgreSQL volume 会被保留。更新前建议备份：
+
+```bash
+tar -czf backup-data-$(date +%F-%H%M%S).tar.gz data config.json .env
+docker compose exec postgres pg_dump -U gpt2api_image gpt2api_image > backup-db-$(date +%F-%H%M%S).sql
+```
+
+## 使用已发布镜像
+
+如果不想在服务器本地构建镜像，可以把 `.env` 中的镜像名改为已发布镜像：
 
 ```env
 GPT2API_IMAGE_IMAGE=ghcr.io/<owner>/gpt2api-image:latest
@@ -120,420 +139,376 @@ GPT2API_IMAGE_REGISTER_EXECUTOR_IMAGE=ghcr.io/<owner>/gpt2api-image-register-exe
 
 然后运行：
 
-```powershell
+```bash
 docker compose pull
 docker compose up -d
 ```
 
-`docker-compose.yml` 仍保留 `build` 配置，适合本地开发时直接 `docker compose up -d --build`。
+`docker-compose.yml` 仍保留 `build` 配置，所以开发环境也可以继续使用 `docker compose up -d --build`。
 
-### 直接运行 Go 服务
+## 直接运行
 
-```powershell
-Copy-Item config.example.json config.json
-$env:GPT2API_IMAGE_AUTH_KEY="replace-with-a-long-random-admin-key"
-$env:GPT2API_IMAGE_ADDR=":3000"
-go run ./cmd/server
-```
+直接运行适合开发或单机排障，生产仍推荐 Compose。
 
-运行模式通过 `GPT2API_IMAGE_MODE` 或第一个命令行参数指定：
+### Go API
 
-```powershell
-$env:GPT2API_IMAGE_MODE="all"
-go run ./cmd/server
-
+```bash
+cp config.example.json config.json
+export GPT2API_IMAGE_AUTH_KEY="$(openssl rand -hex 32)"
+export GPT2API_IMAGE_ADDR=":3000"
 go run ./cmd/server serve
-go run ./cmd/server worker
-go run ./cmd/server all
 ```
 
-模式说明：
+运行模式：
 
-- `serve`：只启动 HTTP API 和管理后台，默认模式
-- `worker`：只启动 Worker，需要 `GPT2API_IMAGE_DATABASE_URL` 和 `GPT2API_IMAGE_BASE_URL`
-- `all`：API 与 Worker 同进程运行，适合不用 Compose 但仍想跑 PostgreSQL 异步任务的部署
+```bash
+go run ./cmd/server serve   # 只启动 HTTP API 和管理后台
+go run ./cmd/server worker  # 只启动 Worker，需要 PostgreSQL 和 base_url
+go run ./cmd/server all     # API 和 Worker 同进程运行
+```
 
-默认监听地址是 `:3000`。
+`worker` 和 `all` 模式必须设置：
+
+```bash
+export GPT2API_IMAGE_DATABASE_URL="postgresql://user:pass@127.0.0.1:5432/gpt2api_image"
+export GPT2API_IMAGE_BASE_URL="https://your-api.example.com"
+```
+
+### 前端
+
+```bash
+cd web
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm run build
+```
+
+Dockerfile 会自动构建前端并把静态产物复制到 `/app/web_dist`。直接运行 Go 二进制时，如果项目根目录存在 `web_dist/`，后端会同时托管管理后台。
+
+### 注册执行器
+
+```bash
+cd register-executor
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+export GPT2API_IMAGE_API_BASE_URL="http://127.0.0.1:3000"
+export GPT2API_IMAGE_AUTH_KEY="same-as-api-auth-key"
+export GPT2API_IMAGE_REGISTER_INTERNAL_KEY="same-as-go-api-register-internal-key"
+export REGISTER_EXECUTOR_ADDR="0.0.0.0"
+export REGISTER_EXECUTOR_PORT="8091"
+python app.py
+```
+
+注册执行器只应被 Go API 访问，不建议公网暴露。
 
 ## 配置
 
-配置优先级从高到低：
+配置优先级：
 
 1. 环境变量
 2. `config.json`
 3. 代码默认值
 
-`auth-key` 必须设置，不能留空，也不能使用明显的默认占位值。Docker 场景通常用 `GPT2API_IMAGE_AUTH_KEY` 覆盖。
-
-### 常用环境变量
+常用环境变量：
 
 | 变量 | 说明 |
 | --- | --- |
-| `GPT2API_IMAGE_AUTH_KEY` | 管理后台和 API 根密钥 |
-| `GPT2API_IMAGE_ADDR` | HTTP 监听地址，默认 `:3000` |
+| `GPT2API_IMAGE_AUTH_KEY` | 管理后台和根 API 密钥 |
+| `GPT2API_IMAGE_ADDR` | HTTP 监听地址，默认 `:3000`，Compose 内为 `:80` |
 | `GPT2API_IMAGE_MODE` | 运行模式：`serve`、`worker`、`all` |
 | `GPT2API_IMAGE_DATABASE_URL` | PostgreSQL 连接串，启用 DB 任务队列 |
-| `GPT2API_IMAGE_BASE_URL` | 生成图片 URL 的外部基准地址 |
-| `POSTGRES_PASSWORD` | Compose 内 PostgreSQL 密码 |
-| `GPT2API_IMAGE_IMAGE` | API/Worker 镜像名 |
-| `GPT2API_IMAGE_REGISTER_EXECUTOR_IMAGE` | 注册执行器镜像名 |
+| `GPT2API_IMAGE_BASE_URL` | 返回图片 URL 的外部基准地址 |
 | `GPT2API_IMAGE_REGISTER_EXECUTOR_URL` | API 调用注册执行器的地址 |
-| `GPT2API_IMAGE_REGISTER_INTERNAL_KEY` | API 与注册执行器之间的内部密钥 |
-| `GPT2API_IMAGE_WORKER_ID` | Worker 标识，默认自动生成 |
-| `GPT2API_IMAGE_WORKER_CONCURRENCY` | Worker 并发数，默认 `4` |
-| `GPT2API_IMAGE_WORKER_HEARTBEAT_INTERVAL_SECS` | Worker 心跳间隔，默认 `5` |
-| `GPT2API_IMAGE_DB_MAX_OPEN_CONNS` | 每个进程的 DB 最大打开连接数，默认 `20` |
-| `GPT2API_IMAGE_DB_MAX_IDLE_CONNS` | 每个进程的 DB 最大空闲连接数，默认 `10` |
-| `GPT2API_IMAGE_UPSTREAM_TRANSPORT` | 上游传输方式：`tls-client` 或 `curl-impersonate` |
-| `GPT2API_IMAGE_ROUTE_STRATEGY` | 图片路由策略：`web_first`、`web_only`、`codex_first`、`codex_only` |
-| `GPT2API_IMAGE_CURL_IMPERSONATE_BIN` | 手动指定 curl-impersonate 可执行文件 |
-| `GPT2API_IMAGE_CURL_IMPERSONATE_URL` | 手动指定 curl-impersonate 下载地址 |
-| `GPT2API_IMAGE_CURL_IMPERSONATE_AUTO_DOWNLOAD` | 是否允许自动下载 curl-impersonate，默认开启 |
-| `GPT2API_IMAGE_CORS_ALLOWED_ORIGINS` | CORS（跨域资源共享）允许来源，逗号、分号或换行分隔 |
-| `GPT2API_IMAGE_LOG_REQUEST_TEXT` | 是否记录请求文本，默认关闭 |
-| `GPT2API_IMAGE_TRACE` | 开启详细链路日志 |
-| `GPT2API_IMAGE_NETWORK_TRACE` | 开启网络链路日志 |
-| `GPT2API_IMAGE_TLS_PROFILE` | 上游 TLS 指纹配置 |
-| `GPT2API_IMAGE_USER_AGENT` | 覆盖上游请求 User-Agent |
-| `GPT2API_IMAGE_SEC_CH_UA` | 覆盖上游请求 sec-ch-ua |
-| `NEXT_PUBLIC_API_URL` | 前端构建时指定 API 地址，默认同源 |
-| `NEXT_PUBLIC_DEV_BACKEND` | 前端开发模式后端地址，默认 `http://127.0.0.1:8000` |
-| `TZ` | 容器时区 |
+| `GPT2API_IMAGE_REGISTER_INTERNAL_KEY` | API 与注册执行器内部通信密钥；启用注册执行器时必填，不要复用根 API 密钥 |
+| `GPT2API_IMAGE_WORKER_CONCURRENCY` | Worker 并发数 |
+| `GPT2API_IMAGE_WORKER_HEARTBEAT_INTERVAL_SECS` | Worker 续约和取消检查间隔 |
+| `GPT2API_IMAGE_DB_MAX_OPEN_CONNS` | 每个 API/Worker 进程的最大 DB 连接数 |
+| `GPT2API_IMAGE_DB_MAX_IDLE_CONNS` | 每个 API/Worker 进程的空闲 DB 连接数 |
+| `GPT2API_IMAGE_UPSTREAM_TRANSPORT` | 上游传输：`tls-client` 或 `curl-impersonate` |
+| `GPT2API_IMAGE_ROUTE_STRATEGY` | 图片账号路由：`web_first`、`web_only`、`codex_first`、`codex_only` |
+| `GPT2API_IMAGE_CORS_ALLOWED_ORIGINS` | 允许跨域来源，多个用逗号分隔 |
+| `GPT2API_IMAGE_LOG_REQUEST_TEXT` | 是否记录请求 prompt，默认关闭 |
+| `POSTGRES_PASSWORD` | Compose 内 PostgreSQL 密码 |
+| `TZ` | 容器时区，默认 `Asia/Shanghai` |
 
-### `config.json` 字段
+`config.json` 常用字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `auth-key` | 根密钥，必填 |
+| `auth-key` | 管理后台和根 API 密钥 |
 | `database_url` | PostgreSQL 连接串 |
-| `refresh_account_interval_minute` | 账号刷新间隔，默认 `60` |
-| `image_retention_days` | 图片保留天数，默认 `15` |
-| `image_poll_timeout_secs` | 上游图片轮询超时，默认 `120` |
-| `image_poll_interval_secs` | 上游图片轮询间隔，默认 `4` |
-| `image_poll_initial_wait_secs` | 首次轮询等待秒数，默认 `0` |
-| `image_task_timeout_secs` | 异步图片任务超时，默认 `300`，最小 `60` |
-| `image_task_claim_ttl_secs` | Worker 任务 claim TTL，默认 `300`，最小 `15` |
-| `image_worker_poll_interval_secs` | Worker 空闲轮询间隔，默认 `1` |
-| `image_account_concurrency` | 单个上游账号图片并发数，默认 `3` |
-| `auto_remove_rate_limited_accounts` | 自动移除限流账号 |
-| `auto_remove_invalid_accounts` | 自动移除无效账号，默认开启 |
-| `cleanup_protect_user_images` | 清理旧图时保护普通用户归属图片，默认开启 |
-| `log_levels` | 日志等级过滤 |
-| `log_request_text` | 是否记录请求文本 |
-| `cors_allowed_origins` | CORS 允许来源列表 |
-| `proxy` | 默认上游代理地址 |
+| `base_url` | 返回图片 URL 的外部基准地址 |
+| `proxy` | 访问上游的代理 |
 | `upstream_transport` | 上游传输方式 |
 | `image_route_strategy` | 图片账号路由策略 |
-| `base_url` | 图片 URL 外部基准地址 |
-| `sensitive_words` | 本地敏感词列表 |
-| `global_system_prompt` | 全局系统提示词 |
-| `register_executor_url` | 注册执行器地址 |
-| `register_internal_key` | 注册执行器内部密钥 |
+| `image_account_concurrency` | 单账号图片并发上限 |
+| `image_retention_days` | 本地图片保留天数 |
+| `image_max_storage_mb` | 本地图片容量上限，`0` 表示不按容量清理 |
+| `image_task_timeout_secs` | 异步图片任务超时时间 |
+| `image_task_claim_ttl_secs` | Worker 领取任务租约时间 |
+| `image_worker_poll_interval_secs` | Worker 空队列轮询间隔 |
+| `auto_remove_invalid_accounts` | 自动清理无效账号 |
+| `auto_remove_rate_limited_accounts` | 自动清理限流账号 |
+| `cleanup_protect_user_images` | 清理图片时保护普通用户图片 |
+| `sensitive_words` | 请求敏感词 |
+| `global_system_prompt` | 全局提示词 |
+| `cors_allowed_origins` | CORS 白名单 |
+| `log_request_text` | 是否记录请求 prompt |
 
-内容控制目前只做本地 `sensitive_words` 字符串匹配，不等同于完整内容安全系统。
+## API
 
-## 认证与权限
+所有 `/api/*` 管理接口和 `/v1/*` OpenAI 兼容接口都需要鉴权。
 
-所有 API 使用 Bearer Token（持有者令牌）：
-
-```http
-Authorization: Bearer <token>
-```
-
-根密钥来自 `auth-key` 或 `GPT2API_IMAGE_AUTH_KEY`。后台创建的服务密钥也可作为 Bearer Token 使用。当前服务密钥会规范化为 `admin`、`premium`、`unlimited`，也就是拥有后台管理权限和无限额度。
-
-生产环境必须更换根密钥，并避免把 `.env`、`config.json`、数据库文件、导出数据或 `data/` 提交到仓库。
-
-## OpenAI 兼容接口
-
-### 图片生成
+支持的鉴权方式：
 
 ```http
-POST /v1/images/generations
-Authorization: Bearer <token>
-Content-Type: application/json
+Authorization: Bearer <key>
 ```
+
+或：
+
+```http
+x-api-key: <key>
+```
+
+常用端点：
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /api/system/status` | 系统状态、存储类型、传输模式、账号数、任务数 |
+| `GET/POST/DELETE /api/accounts` | 账号列表、导入、删除 |
+| `POST /api/accounts/refresh` | 刷新账号信息 |
+| `GET/POST /api/settings` | 读取和保存设置 |
+| `GET /api/images` | 图片管理列表 |
+| `DELETE /api/images/delete` | 删除图片 |
+| `GET /api/image-tasks` | 图片任务列表 |
+| `POST /api/image-tasks/generations` | 创建异步文生图任务 |
+| `POST /api/image-tasks/edits` | 创建异步编辑任务 |
+| `POST /api/image-tasks/cancel` | 取消图片任务 |
+| `GET/POST /api/register` | 注册机配置 |
+| `POST /api/register/start` | 启动注册任务 |
+| `POST /api/register/stop` | 停止注册任务 |
+| `POST /api/register/reset` | 重置注册统计 |
+| `POST /api/register/repair-abnormal` | 修复异常账号 |
+| `GET /api/register/events` | 注册机 SSE 实时事件 |
+| `GET /api/logs` | 日志查询 |
+| `POST /api/logs/delete` | 删除日志 |
+| `GET /v1/models` | OpenAI 兼容模型列表 |
+| `POST /v1/images/generations` | OpenAI 兼容文生图 |
+| `POST /v1/images/edits` | OpenAI 兼容图片编辑 |
+| `POST /v1/chat/completions` | image-only Chat Completions |
+| `POST /v1/responses` | image-only Responses |
+
+## 账号导入
+
+账号入口支持两种来源：
+
+- `web`：ChatGPT web 账号，通常只需要 `access_token`
+- `codex`：Codex 账号，必须有 `refresh_token`，用于刷新和补全信息
+
+导入流程：
+
+1. 接收 `tokens` 或 `account_records`
+2. 写入 `data/accounts.json`
+3. 立即刷新导入账号
+4. 刷新失败、额度未知、额度为 0、状态不可用或被标记删除时，按无效账号清理逻辑处理
+5. 响应返回 `status`、`added`、`skipped`、`saved`、`refreshed`、`refresh_failed`、`errors`、`items`
 
 示例：
 
-```json
-{
-  "model": "gpt-image-2",
-  "prompt": "a clean product photo",
-  "n": 1,
-  "size": "1024x1024",
-  "resolution": "1k",
-  "response_format": "url"
-}
+```bash
+curl -sS http://127.0.0.1:3000/api/accounts \
+  -H "Authorization: Bearer $GPT2API_IMAGE_AUTH_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"source_type":"web","tokens":["access-token-1","access-token-2"]}'
 ```
 
-说明：
+Codex 账号示例：
 
-- `model` 会归一化到项目公开图片模型 `gpt-image-2`
-- `n` 会限制在 `1` 到 `4`
-- `response_format` 支持 `url` 和 `b64_json`，默认 `b64_json`
-- `stream: true` 返回 SSE（Server-Sent Events，服务器发送事件）
-- 有 PostgreSQL 且传入 `client_task_id` 时创建异步任务并返回 `202`
-- 没有 PostgreSQL 或没有 `client_task_id` 时同步执行
-
-### 图片编辑
-
-```http
-POST /v1/images/edits
-Authorization: Bearer <token>
-Content-Type: multipart/form-data
+```bash
+curl -sS http://127.0.0.1:3000/api/accounts \
+  -H "Authorization: Bearer $GPT2API_IMAGE_AUTH_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_type": "codex",
+    "account_records": [
+      {
+        "access_token": "access-token",
+        "refresh_token": "refresh-token",
+        "account_id": "chatgpt-account-id",
+        "client_id": "client-id"
+      }
+    ]
+  }'
 ```
 
-字段：
+## 注册机
 
-- `prompt`
-- `image` 或 `image[]`
-- `model`
-- `n`
-- `size`
-- `resolution`
-- `response_format`
-- `client_task_id`
+注册机由 Go API 代理管理端请求，再调用 `register-executor` 执行真实注册流程。
 
-异步编辑任务会把输入图片暂存到 `data/task_inputs/`，任务完成、失败、取消或超时后会清理。
+当前注册闭环规则：
 
-### 模型列表
+- 注册成功后先写入账号，再立即调用 API 刷新账号信息。
+- 只有刷新成功、读回状态正常、额度已知且额度大于 0 的账号才计入 `usable_success`。
+- 刷新失败、刷新返回错误、读回不可用、额度未知、额度为 0 或状态异常时，会删除刚写入账号并计失败。
+- 不保留不可用注册结果；注册机账号成本低，运营口径以“可用账号数”和“可用额度”为准。
+- `refresh_failed` 统计刷新失败次数，`failure_reasons` 统计失败原因。
+- `/api/register/events` 提供 SSE 实时状态，前端注册页面会持续显示运行状态和日志。
 
-```http
-GET /v1/models
-Authorization: Bearer <token>
+注册机常用操作：
+
+```bash
+curl -sS http://127.0.0.1:3000/api/register \
+  -H "Authorization: Bearer $GPT2API_IMAGE_AUTH_KEY"
+
+curl -sS -X POST http://127.0.0.1:3000/api/register/start \
+  -H "Authorization: Bearer $GPT2API_IMAGE_AUTH_KEY"
+
+curl -sS -X POST http://127.0.0.1:3000/api/register/stop \
+  -H "Authorization: Bearer $GPT2API_IMAGE_AUTH_KEY"
+
+curl -sS -X POST http://127.0.0.1:3000/api/register/repair-abnormal \
+  -H "Authorization: Bearer $GPT2API_IMAGE_AUTH_KEY"
 ```
 
-服务优先返回上游动态模型列表；上游不可用时返回内置图片模型列表。
-
-### 图片化 Chat/Responses
-
-```http
-POST /v1/chat/completions
-POST /v1/responses
-```
-
-这两个接口只接受能识别为图片生成的请求。可通过 `client_task_id` 创建异步图片任务。普通文本请求会返回禁用提示。
-
-```http
-POST /v1/messages
-```
-
-该接口保持禁用。
-
-## 任务 API
-
-后台图片工作台使用任务 API，每张前端图片都有稳定的 `client_task_id`，便于刷新恢复、轮询、取消和失败重试。
-
-| 接口 | 方法 | 说明 |
-| --- | --- | --- |
-| `/api/image-tasks` | `GET` | 查询任务列表或按 `ids` 查询 |
-| `/api/image-tasks/generations` | `POST` | 创建文生图任务 |
-| `/api/image-tasks/edits` | `POST` | 创建图生图任务 |
-| `/api/image-tasks/cancel` | `POST` | 取消 queued/running 任务 |
-
-PostgreSQL 模式下，任务写入 `image_tasks_v3`，Worker 用 `FOR UPDATE SKIP LOCKED` 领取任务。取消、超时、保存失败、metadata 写入失败都会退回对应图片额度。多图任务部分成功时，只退回失败数量。
-
-无 PostgreSQL 时，本地任务保存到 `data/image_tasks.json`，并在 API 进程内执行，适合单机调试，不适合作为多进程队列。
-
-## 图片归档 API
-
-生成图片保存路径：
+邮箱域名黑名单相关接口：
 
 ```text
-data/images/YYYY/MM/DD/<timestamp>_<random>_<md5>.<ext>
+GET  /api/register/yyds-domain-blacklist
+POST /api/register/yyds-domain-blacklist
+POST /api/register/yyds-domain-blacklist/remove
+POST /api/register/yyds-domain-blacklist/replace
+POST /api/register/yyds-domain-blacklist/reset
 ```
 
-公开访问路径：
+## 图片任务
 
-```text
-/images/<relative-path>
-/image-thumbnails/<relative-path>
-```
+无 PostgreSQL 时，任务存储在 `data/image_tasks.json`，适合单进程调试。
 
-支持的扩展名按图片内容识别，包括 `png`、`jpg`、`jpeg`、`gif`、`webp`、`avif`、`bmp`、`tif`、`tiff`。
+配置 `GPT2API_IMAGE_DATABASE_URL` 后，任务写入 PostgreSQL：
 
-管理接口：
+- API 进程创建任务、扣费、保存任务输入图
+- Worker 进程领取任务并定期心跳
+- 任务取消或租约失效时停止保存结果
+- 失败或超时时退款并清理输入图
+- 部分成功时按缺失数量退款
 
-| 接口 | 方法 | 权限 | 说明 |
-| --- | --- | --- | --- |
-| `/api/images` | `GET` | admin | 查询图库 |
-| `/api/me/images` | `GET` | 登录用户 | 查询自己的图片 |
-| `/api/images/owners` | `GET` | admin | 查询图片归属统计 |
-| `/api/images/delete` | `POST` | 登录用户 | 删除图片，普通用户只能删自己的图片 |
-| `/api/images/download` | `POST` | admin | 批量打包下载 |
-| `/api/images/download/<path>` | `GET` | admin | 单图下载 |
-| `/api/images/tags` | `GET/POST` | admin | 查询或设置标签 |
-| `/api/images/tags/<tag>` | `DELETE` | admin | 删除标签 |
+Worker 模式必须配置 `GPT2API_IMAGE_BASE_URL`，否则生成结果无法返回稳定 URL。
 
-路径会经过 `safeImageRel` 校验，防止目录穿越。`/images/` 是公开结果 URL，用于让外部客户端直接访问生成结果。
+## 图片管理
 
-## 管理后台 API
+图片文件保存在 `data/images/YYYY/MM/DD/`。管理后台的“图片管理”页面会读取图片归属、prompt、标签、缩略图和文件信息。
 
-| 接口 | 说明 |
-| --- | --- |
-| `/auth/login` | 登录验证 |
-| `/api/auth/me` | 当前身份和额度 |
-| `/api/auth/users` | 服务密钥管理 |
-| `/api/accounts` | 上游账号导入、删除、列表 |
-| `/api/accounts/refresh` | 刷新账号状态 |
-| `/api/accounts/update` | 更新账号状态、类型、额度 |
-| `/api/settings` | 运行配置读取和保存 |
-| `/api/storage/info` | 存储后端状态 |
-| `/api/system/status` | 系统状态 |
-| `/api/transport/status` | 上游传输状态 |
-| `/api/proxy` | 代理配置 |
-| `/api/proxy/test` | 代理测试 |
-| `/api/logs` | 日志查询 |
-| `/api/logs/delete` | 日志删除 |
-| `/version` | 版本号 |
+清理策略：
 
-## 注册执行器
+- `image_retention_days`：按时间清理旧图片
+- `image_max_storage_mb`：按容量清理最旧图片
+- `cleanup_protect_user_images`：清理时保护普通用户图片
 
-Compose 中包含独立 `register-executor` 服务。API 通过下面配置调用它：
+删除图片时会同步清理 owner 和 prompt 元数据。
 
-```env
-GPT2API_IMAGE_REGISTER_EXECUTOR_URL=http://register-executor:8091
-GPT2API_IMAGE_REGISTER_INTERNAL_KEY=<internal-key>
-```
+## 测试和检查
 
-相关接口：
+Linux/WSL 下常用检查：
 
-| 接口 | 说明 |
-| --- | --- |
-| `/api/register` | 注册执行器配置和状态 |
-| `/api/register/start` | 启动注册任务 |
-| `/api/register/stop` | 停止注册任务 |
-| `/api/register/reset` | 重置注册状态 |
-| `/api/register/repair-abnormal` | 修复异常注册任务 |
-| `/api/register/outlook-pool/reset` | 重置 Outlook 邮箱池 |
-| `/api/register/outlook-pool/test` | 测试 Outlook 邮箱池 |
-| `/api/register/events` | 注册事件流 |
-| `/internal/register/accounts` | 注册执行器回写账号 |
-| `/internal/register/accounts/refresh` | 注册执行器刷新账号 |
-| `/internal/register/accounts/delete` | 注册执行器删除账号 |
+```bash
+go test ./internal/app ./cmd/...
 
-`/internal/*` 接口只应在可信网络内使用。生产环境应设置内部密钥，并且不要把注册执行器直接暴露到公网。
-
-## 前端开发
-
-管理后台位于 `web/`，使用 Next.js（React 框架）静态导出。
-
-```powershell
 cd web
 corepack enable
 pnpm install --frozen-lockfile
-pnpm run dev
+pnpm run typecheck
+cd ..
+
+python3 -m venv register-executor/.venv
+source register-executor/.venv/bin/activate
+pip install -r register-executor/requirements.txt
+python -m unittest discover -s register-executor/tests -v
+python -m py_compile \
+  register-executor/app.py \
+  register-executor/services/register_service.py \
+  register-executor/services/register/openai_register.py \
+  register-executor/services/register/proxy_pool.py
 ```
 
-构建：
+完整 Go 检查：
 
-```powershell
-cd web
-pnpm run typecheck
-pnpm run build
+```bash
+make test
+make verify
 ```
 
-运行镜像构建时会执行前端类型检查和静态导出，并把 `web/out` 复制进镜像内的 `/app/web_dist`。
+PostgreSQL 集成测试需要设置测试库：
 
-## 构建、测试和发布
-
-常用验证命令：
-
-```powershell
-# Go 单元测试
-go test ./cmd/... ./internal/...
-
-# Go 静态检查
-go vet ./cmd/... ./internal/...
-
-# race 检查
-go test -race ./internal/app
-
-# 前端类型检查和构建
-cd web
-pnpm run typecheck
-pnpm run build
-
-# Python 和 shell 脚本语法检查
-python -m compileall -q register-executor
-bash -n start.sh scripts/package_release.sh scripts/install_latest.sh scripts/run_pg_integration.sh
-
-# PostgreSQL 集成测试
+```bash
+export GPT2API_IMAGE_TEST_DATABASE_URL="postgresql://user:pass@127.0.0.1:5432/gpt2api_image_test"
 bash scripts/run_pg_integration.sh
 ```
 
-`scripts/run_pg_integration.sh` 默认会用 Docker 启动临时 PostgreSQL；没有 Docker daemon 时，可以设置 `GPT2API_IMAGE_TEST_DATABASE_URL` 指向现有 PostgreSQL。
+## 打包
 
-打包脚本：
+构建前端：
 
 ```bash
-bash scripts/package_release.sh --web
+make web
+```
+
+打包 Linux 发布包：
+
+```bash
+scripts/package_release.sh --web
+```
+
+从 GitHub Release 安装或更新：
+
+```bash
 bash scripts/install_latest.sh --dir /opt/gpt2api-image
 ```
 
-发布包启动脚本：
+从源码构建安装：
 
 ```bash
-./start.sh --port 3000 --mode all
-./start.sh --port 3000 --worker
-./start.sh --curl
-./start.sh --tls
+bash scripts/install_latest.sh --dir /opt/gpt2api-image --from-source --web
 ```
 
-## GitHub Actions
+## 排障
 
-`.github/workflows/build.yml`：
+查看容器状态：
 
-- push 到 `main`、创建 `v*` tag、PR 到 `main` 时运行
-- 执行 Go 测试、前端类型检查和构建、PostgreSQL 集成测试
-- `v*` tag 会打包 release assets 并上传 GitHub Release
-
-`.github/workflows/docker-publish.yml`：
-
-- 每次 push 任意分支都会构建并推送 Docker 镜像到 GHCR
-- `v*` tag 会额外生成 semver 标签
-- 默认分支和 `v*` tag 会生成 `latest`
-- 同时发布两个镜像：
-
-```text
-ghcr.io/<owner>/gpt2api-image
-ghcr.io/<owner>/gpt2api-image-register-executor
+```bash
+docker compose ps
+docker compose logs -f api
+docker compose logs -f worker
+docker compose logs -f register-executor
 ```
 
-默认标签包括分支名、commit sha、tag、semver 和 `latest`。
+检查系统状态：
 
-## 安全注意
+```bash
+curl -sS http://127.0.0.1:3000/api/system/status \
+  -H "Authorization: Bearer $GPT2API_IMAGE_AUTH_KEY"
+```
 
-- 生产环境必须更换 `auth-key`、`POSTGRES_PASSWORD` 和注册执行器内部密钥
-- 服务密钥当前是 admin/unlimited 级别，不要发给不可信调用方
-- 只在确实需要跨域时配置 `cors_allowed_origins`
-- `log_request_text` 默认关闭，开启后可能记录 prompt、图片意图等敏感内容
-- `sensitive_words` 只是本地字符串过滤，不是完整内容安全系统
-- 不要提交 `.env`、`config.json`、`data/`、数据库文件、日志、导出数据、构建产物或 release 包
-- 反向代理只暴露必要 HTTP 入口，PostgreSQL 和 register-executor 不应直接暴露公网
-- 如果公开 `/images/`，要理解它是生成结果 URL 的公开访问面
+常见问题：
 
-## 排障入口
+- 启动时报 `auth-key 未设置`：设置 `GPT2API_IMAGE_AUTH_KEY` 或修改 `config.json` 的 `auth-key`。
+- 注册执行器代理返回 `register_internal_key is required`：设置 `GPT2API_IMAGE_REGISTER_INTERNAL_KEY`，并保证 API 与注册执行器使用同一个内部密钥。
+- Worker 启动失败：确认 `GPT2API_IMAGE_DATABASE_URL` 和 `GPT2API_IMAGE_BASE_URL` 已设置。
+- 返回图片 URL 不对：检查 `GPT2API_IMAGE_BASE_URL` 是否是外部访问域名。
+- 注册页面没有实时状态：检查 `register-executor` 容器是否运行，以及 `/api/register/events` 是否能返回 SSE。
+- 注册结果多失败：看注册日志里的 `failure_reasons`，再检查邮箱服务、代理、验证码等待时间和上游账号刷新结果。
+- 导入账号后没有可用数：检查 `/api/accounts` 返回的 `refresh_failed` 和 `errors`，以及账号是否额度未知、0 额度或状态异常。
+- 上游连接失败：检查 `proxy`、`GPT2API_IMAGE_UPSTREAM_TRANSPORT` 和 `/api/proxy/test`。
+- 管理后台白屏：确认前端已构建到 `web_dist/`，或 Docker 镜像构建阶段 `pnpm run build` 成功。
 
-常用检查点：
+## 安全
 
-- 服务状态：`/api/system/status`
-- 上游传输状态：`/api/transport/status`
-- 日志：`/api/logs`
-- 图片任务：`/api/image-tasks`
-- 图片归档：`/api/images`
-- 本地日志文件：`data/logs.jsonl`
-- 图片文件：`data/images`
-- PostgreSQL 任务表：`image_tasks_v3`
-
-建议顺序：
-
-1. 确认 API 端口和反向代理是否正常
-2. 确认 `auth-key`、Bearer Token 和后台登录是否一致
-3. 确认 PostgreSQL 是否可连接
-4. 确认 Worker 是否运行并能领取任务
-5. 确认上游账号、账号类型、代理和传输方式是否可用
-6. 查看 `/api/logs`、`data/logs.jsonl` 和 trace 日志
-7. 查看 `data/images` 是否成功写入图片
-8. 查看任务是否卡在 queued/running、是否被取消或超时
+- 不要提交 `.env`、`config.json`、`data/`、日志、导出账号、密钥或令牌。
+- `GPT2API_IMAGE_AUTH_KEY`、注册机内部密钥、邮箱服务密钥和账号 token 必须保存在服务器配置中。
+- 注册执行器不要直接暴露公网，只允许 API 容器或内网访问。
+- 默认关闭 `GPT2API_IMAGE_LOG_REQUEST_TEXT`，只有排障时再临时开启。
+- 反向代理建议启用 HTTPS，并限制管理后台访问来源。
+- 备份文件不要放在 Web 可访问目录下。

@@ -232,7 +232,7 @@ export function UserKeysCard() {
                 后端调用密钥
               </div>
               <p className="text-xs text-muted-foreground">
-                所有密钥都是服务密钥，可用于 newapi 或其他下游渠道调用和管理本后端。
+                默认创建的是服务密钥，可用于 newapi 或其他下游渠道调用；管理员密钥可管理本后端。
               </p>
             </div>
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -270,11 +270,11 @@ export function UserKeysCard() {
                     <div className="flex flex-wrap items-center gap-2">
                       <div className="truncate text-sm font-semibold text-foreground">{item.name || "API 密钥"}</div>
                       <Badge variant={item.enabled ? "success" : "secondary"}>{item.enabled ? "启用" : "停用"}</Badge>
-                      <Badge variant="info" className="gap-1">
+                      <Badge variant={item.role === "admin" ? "info" : "secondary"} className="gap-1">
                         <ShieldCheck className="size-3" />
-                        管理员权限
+                        {item.role === "admin" ? "管理员权限" : "普通密钥"}
                       </Badge>
-                      <Badge variant="outline">不限额</Badge>
+                      <Badge variant="outline">{formatImageQuotaBadge(item)}</Badge>
                     </div>
                     <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                       <span className="font-data">ID: {item.id}</span>
@@ -489,4 +489,31 @@ function formatDate(value?: string | null) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function formatImageQuotaBadge(item: UserKey) {
+  if (item.image_daily_unlimited && item.image_monthly_unlimited && item.image_total_unlimited) {
+    return "不限额";
+  }
+  const candidates: number[] = [];
+  if (!item.image_daily_unlimited) {
+    candidates.push(resolveRemainingQuota(item.image_daily_quota, item.image_daily_used, item.image_daily_remaining));
+  }
+  if (!item.image_monthly_unlimited) {
+    candidates.push(resolveRemainingQuota(item.image_monthly_quota, item.image_monthly_used, item.image_monthly_remaining));
+  }
+  if (!item.image_total_unlimited) {
+    candidates.push(resolveRemainingQuota(item.image_total_quota, item.image_total_used, item.image_total_remaining));
+  }
+  if (candidates.length === 0) {
+    return "按配额";
+  }
+  return `剩余 ${Math.min(...candidates)}`;
+}
+
+function resolveRemainingQuota(quota: number, used: number, remaining: number | null) {
+  if (typeof remaining === "number" && Number.isFinite(remaining)) {
+    return Math.max(0, remaining);
+  }
+  return Math.max(0, quota - used);
 }

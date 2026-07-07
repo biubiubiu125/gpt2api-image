@@ -33,36 +33,37 @@ type Config struct {
 }
 
 type Account struct {
-	AccessToken       string            `json:"access_token"`
-	Type              string            `json:"type"`
-	SourceType        string            `json:"source_type,omitempty"`
-	ExportType        string            `json:"export_type,omitempty"`
-	Status            string            `json:"status"`
-	Quota             int               `json:"quota"`
-	InitialQuota      int               `json:"initial_quota,omitempty"`
-	ImageQuotaUnknown bool              `json:"image_quota_unknown,omitempty"`
-	Email             *string           `json:"email,omitempty"`
-	UserID            *string           `json:"user_id,omitempty"`
-	LimitsProgress    []map[string]any  `json:"limits_progress,omitempty"`
-	DefaultModelSlug  *string           `json:"default_model_slug,omitempty"`
-	RestoreAt         *string           `json:"restore_at,omitempty"`
-	RateLimitedAt     *string           `json:"rate_limited_at,omitempty"`
-	RateLimitResetAt  *string           `json:"rate_limit_reset_at,omitempty"`
-	PendingDelete     bool              `json:"pending_delete,omitempty"`
-	DeleteReason      *string           `json:"delete_reason,omitempty"`
-	DeleteMarkedAt    *string           `json:"delete_marked_at,omitempty"`
-	Success           int               `json:"success"`
-	Fail              int               `json:"fail"`
-	LastUsedAt        *string           `json:"last_used_at,omitempty"`
-	Mailbox           map[string]any    `json:"mailbox,omitempty"`
-	Password          *string           `json:"password,omitempty"`
-	RefreshToken      *string           `json:"refresh_token,omitempty"`
-	IDToken           *string           `json:"id_token,omitempty"`
-	AccountID         *string           `json:"account_id,omitempty"`
-	ExpiresAt         any               `json:"expires_at,omitempty"`
-	ClientID          *string           `json:"client_id,omitempty"`
-	CreatedAt         *string           `json:"created_at,omitempty"`
-	FP                map[string]string `json:"fp,omitempty"`
+	AccessToken              string            `json:"access_token"`
+	Type                     string            `json:"type"`
+	SourceType               string            `json:"source_type,omitempty"`
+	ExportType               string            `json:"export_type,omitempty"`
+	Status                   string            `json:"status"`
+	Quota                    int               `json:"quota"`
+	InitialQuota             int               `json:"initial_quota,omitempty"`
+	ImageQuotaUnknown        bool              `json:"image_quota_unknown,omitempty"`
+	RefreshValidationPending bool              `json:"refresh_validation_pending,omitempty"`
+	Email                    *string           `json:"email,omitempty"`
+	UserID                   *string           `json:"user_id,omitempty"`
+	LimitsProgress           []map[string]any  `json:"limits_progress,omitempty"`
+	DefaultModelSlug         *string           `json:"default_model_slug,omitempty"`
+	RestoreAt                *string           `json:"restore_at,omitempty"`
+	RateLimitedAt            *string           `json:"rate_limited_at,omitempty"`
+	RateLimitResetAt         *string           `json:"rate_limit_reset_at,omitempty"`
+	PendingDelete            bool              `json:"pending_delete,omitempty"`
+	DeleteReason             *string           `json:"delete_reason,omitempty"`
+	DeleteMarkedAt           *string           `json:"delete_marked_at,omitempty"`
+	Success                  int               `json:"success"`
+	Fail                     int               `json:"fail"`
+	LastUsedAt               *string           `json:"last_used_at,omitempty"`
+	Mailbox                  map[string]any    `json:"mailbox,omitempty"`
+	Password                 *string           `json:"password,omitempty"`
+	RefreshToken             *string           `json:"refresh_token,omitempty"`
+	IDToken                  *string           `json:"id_token,omitempty"`
+	AccountID                *string           `json:"account_id,omitempty"`
+	ExpiresAt                any               `json:"expires_at,omitempty"`
+	ClientID                 *string           `json:"client_id,omitempty"`
+	CreatedAt                *string           `json:"created_at,omitempty"`
+	FP                       map[string]string `json:"fp,omitempty"`
 }
 
 type UserKey struct {
@@ -97,6 +98,7 @@ type UserKey struct {
 	ChatTotalQuota        int     `json:"chat_total_quota"`
 	ChatTotalUsed         int     `json:"chat_total_used"`
 	ChatTotalUnlimited    bool    `json:"chat_total_unlimited"`
+	QuotaConfigured       bool    `json:"quota_configured,omitempty"`
 }
 
 type Identity struct {
@@ -106,6 +108,7 @@ type Identity struct {
 	AccountTier             string `json:"account_tier"`
 	CanUsePaidImageAccounts bool   `json:"can_use_paid_image_accounts"`
 	CanUseHighResolution    bool   `json:"can_use_high_resolution"`
+	Root                    bool   `json:"-"`
 }
 
 type LogItem struct {

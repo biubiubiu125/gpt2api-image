@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from services.config import config
 from services.outlook_check import check_outlook_pool
 from services.register import mail_provider
-from services.register_service import register_service
+from services.register_service import RegisterTaskActiveError, register_service
 
 
 app = FastAPI(title="gpt2api-image register executor")
@@ -39,7 +39,7 @@ class YYDSDomainBlacklistRequest(BaseModel):
 
 
 def _require_internal(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)) -> None:
-    expected = config.register_internal_key or config.auth_key
+    expected = config.register_internal_key
     if not expected:
         raise HTTPException(status_code=401, detail="register executor internal key is required")
     bearer = ""
@@ -49,6 +49,10 @@ def _require_internal(x_register_internal_key: str | None = Header(default=None)
     if secrets.compare_digest(header_key, expected) or secrets.compare_digest(bearer, expected):
         return
     raise HTTPException(status_code=401, detail="register executor unauthorized")
+
+
+def _raise_task_active(exc: RegisterTaskActiveError) -> None:
+    raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.on_event("startup")
@@ -76,7 +80,10 @@ def get_register(x_register_internal_key: str | None = Header(default=None), aut
 @app.post("/api/register")
 def update_register(body: RegisterConfigRequest, x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
-    return {"register": register_service.update(body.model_dump(exclude_none=True))}
+    try:
+        return {"register": register_service.update(body.model_dump(exclude_none=True))}
+    except RegisterTaskActiveError as exc:
+        _raise_task_active(exc)
 
 
 @app.post("/api/register/start")
@@ -100,13 +107,19 @@ def stop_register(x_register_internal_key: str | None = Header(default=None), au
 @app.post("/api/register/reset")
 def reset_register(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
-    return {"register": register_service.reset()}
+    try:
+        return {"register": register_service.reset()}
+    except RegisterTaskActiveError as exc:
+        _raise_task_active(exc)
 
 
 @app.post("/api/register/outlook-pool/reset")
 def reset_outlook_pool(body: OutlookPoolResetRequest, x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
-    return {"register": register_service.reset_outlook_pool(body.scope or "all")}
+    try:
+        return {"register": register_service.reset_outlook_pool(body.scope or "all")}
+    except RegisterTaskActiveError as exc:
+        _raise_task_active(exc)
 
 
 @app.post("/api/register/outlook-pool/test")
@@ -127,8 +140,10 @@ def add_yyds_domain_blacklist(body: YYDSDomainBlacklistRequest, x_register_inter
     domains = list(body.domains or [])
     if body.domain:
         domains.append(body.domain)
-    added = sum(1 for domain in domains if mail_provider.add_yyds_domain_blacklist(domain))
-    return {"items": mail_provider.yyds_domain_blacklist_items(), "added": added}
+    try:
+        return register_service.add_yyds_domain_blacklist(domains)
+    except RegisterTaskActiveError as exc:
+        _raise_task_active(exc)
 
 
 @app.post("/api/register/yyds-domain-blacklist/remove")
@@ -137,8 +152,10 @@ def remove_yyds_domain_blacklist(body: YYDSDomainBlacklistRequest, x_register_in
     domains = list(body.domains or [])
     if body.domain:
         domains.append(body.domain)
-    removed = sum(1 for domain in domains if mail_provider.remove_yyds_domain_blacklist(domain))
-    return {"items": mail_provider.yyds_domain_blacklist_items(), "removed": removed}
+    try:
+        return register_service.remove_yyds_domain_blacklist(domains)
+    except RegisterTaskActiveError as exc:
+        _raise_task_active(exc)
 
 
 @app.post("/api/register/yyds-domain-blacklist/replace")
@@ -147,15 +164,19 @@ def replace_yyds_domain_blacklist(body: YYDSDomainBlacklistRequest, x_register_i
     domains = list(body.domains or [])
     if body.domain:
         domains.append(body.domain)
-    items = mail_provider.replace_yyds_domain_blacklist(domains)
-    return {"items": items, "replaced": len(items)}
+    try:
+        return register_service.replace_yyds_domain_blacklist(domains)
+    except RegisterTaskActiveError as exc:
+        _raise_task_active(exc)
 
 
 @app.post("/api/register/yyds-domain-blacklist/reset")
 def reset_yyds_domain_blacklist(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
-    cleared = mail_provider.reset_yyds_domain_blacklist()
-    return {"items": mail_provider.yyds_domain_blacklist_items(), "cleared": cleared}
+    try:
+        return register_service.reset_yyds_domain_blacklist()
+    except RegisterTaskActiveError as exc:
+        _raise_task_active(exc)
 
 
 @app.get("/api/register/events")

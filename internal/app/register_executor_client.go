@@ -19,23 +19,34 @@ func (s *Server) registerExecutorConfigured() bool {
 	return s.registerExecutorURL() != ""
 }
 
+func (s *Server) registerExecutorInternalKey() string {
+	return strings.TrimSpace(s.cfg.RegisterInternalKey)
+}
+
+func (s *Server) requireRegisterExecutorInternalKey(w http.ResponseWriter) bool {
+	if s.registerExecutorInternalKey() != "" {
+		return true
+	}
+	writeErr(w, 500, "register_internal_key is required when register executor is configured")
+	return false
+}
+
 func (s *Server) registerExecutorHeaders(req *http.Request) http.Header {
 	h := http.Header{}
 	if ct := req.Header.Get("Content-Type"); ct != "" {
 		h.Set("Content-Type", ct)
 	}
-	if key := strings.TrimSpace(s.cfg.RegisterInternalKey); key != "" {
+	if key := s.registerExecutorInternalKey(); key != "" {
 		h.Set("X-Register-Internal-Key", key)
-		h.Set("Authorization", "Bearer "+key)
-		return h
-	}
-	if key := strings.TrimSpace(s.cfg.AuthKey); key != "" {
 		h.Set("Authorization", "Bearer "+key)
 	}
 	return h
 }
 
 func (s *Server) proxyRegisterExecutorJSON(w http.ResponseWriter, r *http.Request, path string) {
+	if !s.requireRegisterExecutorInternalKey(w) {
+		return
+	}
 	target := s.registerExecutorURL() + path
 	var body io.Reader
 	if r.Body != nil {
@@ -87,6 +98,9 @@ func registerExecutorTimeout(path string) time.Duration {
 }
 
 func (s *Server) proxyRegisterExecutorEvents(w http.ResponseWriter, r *http.Request) {
+	if !s.requireRegisterExecutorInternalKey(w) {
+		return
+	}
 	target := s.registerExecutorURL() + "/api/register/events"
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
@@ -125,6 +139,9 @@ func (s *Server) proxyRegisterExecutorEvents(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *Server) postRegisterExecutor(path string, body any) (map[string]any, error) {
+	if s.registerExecutorInternalKey() == "" {
+		return nil, fmt.Errorf("register_internal_key is required when register executor is configured")
+	}
 	payload, _ := json.Marshal(body)
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
@@ -133,10 +150,8 @@ func (s *Server) postRegisterExecutor(path string, body any) (map[string]any, er
 		return nil, err
 	}
 	req.Header = http.Header{"Content-Type": []string{"application/json"}}
-	if key := strings.TrimSpace(s.cfg.RegisterInternalKey); key != "" {
+	if key := s.registerExecutorInternalKey(); key != "" {
 		req.Header.Set("X-Register-Internal-Key", key)
-		req.Header.Set("Authorization", "Bearer "+key)
-	} else if key := strings.TrimSpace(s.cfg.AuthKey); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	resp, err := http.DefaultClient.Do(req)

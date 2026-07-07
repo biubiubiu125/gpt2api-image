@@ -16,6 +16,7 @@ import {
   type RegisterConfig,
   type SettingsConfig,
 } from "@/lib/api";
+import { getRegisterRuntimeState } from "@/lib/register-runtime";
 
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
   return {
@@ -68,13 +69,28 @@ function normalizeRegister(config: RegisterConfig): RegisterConfig {
     stats: {
       ...(config.stats || {}),
       success: Number(config.stats?.success || 0),
+      usable_success: Number(config.stats?.usable_success ?? config.stats?.success ?? 0),
       fail: Number(config.stats?.fail || 0),
       done: Number(config.stats?.done || 0),
+      saved: Number(config.stats?.saved || 0),
+      refresh_failed: Number(config.stats?.refresh_failed || 0),
       running: Number(config.stats?.running || 0),
       threads: Number(config.stats?.threads || config.threads || 1),
+      failure_reasons: config.stats?.failure_reasons || {},
+      lifecycle: String(config.stats?.lifecycle || config.lifecycle || "idle"),
+      is_running: Boolean(config.stats?.is_running ?? config.is_running),
+      is_stopping: Boolean(config.stats?.is_stopping ?? config.is_stopping),
     },
     logs: Array.isArray(config.logs) ? config.logs : [],
   };
+}
+
+function isRegisterDraining(config: RegisterConfig | null) {
+  return getRegisterRuntimeState(config).isStopping;
+}
+
+function isRegisterActive(config: RegisterConfig | null) {
+  return getRegisterRuntimeState(config).isActive;
 }
 
 type SettingsStore = {
@@ -384,6 +400,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   saveRegister: async () => {
     const { registerConfig } = get();
     if (!registerConfig) return;
+    if (isRegisterActive(registerConfig)) {
+      toast.warning("注册任务未结束，暂不能保存配置");
+      return;
+    }
     set({ isSavingRegister: true });
     try {
       const data = await updateRegisterConfig({
@@ -417,9 +437,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   toggleRegister: async () => {
     const { registerConfig } = get();
     if (!registerConfig) return;
+    const runtime = getRegisterRuntimeState(registerConfig);
+    if (runtime.isStopping) {
+      toast.warning("注册任务正在停止清理中，请等待完成后再启动");
+      return;
+    }
     set({ isSavingRegister: true });
     try {
-      if (!registerConfig.enabled) {
+      if (!runtime.isRunning) {
         await updateRegisterConfig({
           mail: registerConfig.mail,
           proxy: registerConfig.proxy.trim(),
@@ -440,9 +465,19 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           },
         });
       }
-      const data = registerConfig.enabled ? await stopRegister() : await startRegister();
-      set({ registerConfig: normalizeRegister(data.register) });
-      toast.success(registerConfig.enabled ? "注册任务已停止" : "已请求启动注册任务");
+      const data = runtime.isRunning ? await stopRegister() : await startRegister();
+      const nextRegister = normalizeRegister(data.register);
+      const nextRuntime = getRegisterRuntimeState(nextRegister);
+      set({ registerConfig: nextRegister });
+      if (runtime.isRunning) {
+        toast.success("已请求停止注册任务");
+      } else if (nextRuntime.isStopping) {
+        toast.warning("注册任务仍在停止清理中，请稍后再启动");
+      } else if (nextRuntime.isRunning) {
+        toast.success("已请求启动注册任务");
+      } else {
+        toast.warning("注册任务未启动，请检查注册执行器日志");
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "切换注册状态失败");
     } finally {
@@ -451,6 +486,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   resetRegister: async () => {
+    const { registerConfig } = get();
+    if (isRegisterActive(registerConfig)) {
+      toast.warning("注册任务未结束，暂不能重置统计");
+      return;
+    }
     set({ isSavingRegister: true });
     try {
       const data = await resetRegisterApi();
@@ -466,9 +506,18 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   repairAbnormalRegisterAccounts: async () => {
     const { registerConfig } = get();
     if (!registerConfig) return;
+    const runtime = getRegisterRuntimeState(registerConfig);
+    if (runtime.isStopping) {
+      toast.warning("注册任务正在停止清理中，请等待完成后再操作");
+      return;
+    }
+    if (runtime.isRunning && !runtime.isRepairing) {
+      toast.warning("注册任务运行中，不能同时启动异常账号修复");
+      return;
+    }
     set({ isSavingRegister: true });
     try {
-      if (registerConfig.enabled && registerConfig.stats?.job_kind === "repair_abnormal") {
+      if (runtime.isRepairing) {
         const data = await stopRegister();
         set({ registerConfig: normalizeRegister(data.register) });
         toast.success("已请求停止异常账号修复");

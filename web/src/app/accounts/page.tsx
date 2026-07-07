@@ -94,6 +94,15 @@ function imageQuotaUnknown(account: Account) {
   return Boolean(account.image_quota_unknown);
 }
 
+function isUsableAccount(account: Account) {
+  return (
+    account.status === "正常" &&
+    !account.pending_delete &&
+    !account.image_quota_unknown &&
+    account.quota > 0
+  );
+}
+
 function formatCompact(value: number) {
   if (value >= 1000) {
     return `${(value / 1000).toFixed(1)}k`;
@@ -144,12 +153,9 @@ function formatDateTime(value?: string | null) {
 }
 
 function formatQuotaSummary(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status === "正常");
+  const availableAccounts = accounts.filter(isUsableAccount);
   if (availableAccounts.some(isUnlimitedImageQuotaAccount)) {
     return "∞";
-  }
-  if (availableAccounts.some(imageQuotaUnknown)) {
-    return "未知";
   }
   return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
 }
@@ -197,6 +203,13 @@ const STATUS_BADGE_CLASS: Record<AccountStatus, string> = {
   异常: "border-rose-200 bg-rose-50 text-rose-700",
   禁用: "border-stone-200 bg-stone-100 text-stone-600",
 };
+
+function statusDotClass(account: Account) {
+  if (account.status === "正常") return "bg-emerald-500 ring-emerald-500/15";
+  if (account.status === "限流") return "bg-amber-500 ring-amber-500/15";
+  if (account.status === "异常") return "bg-rose-500 ring-rose-500/15";
+  return "bg-stone-400 ring-stone-400/15";
+}
 
 function quotaUpperBound(account: Account) {
   // 优先用注册时拿到的总额度（后端 _normalize_account 维护）；
@@ -534,7 +547,7 @@ function AccountsPageContent() {
 
   const summary = useMemo(() => {
     const total = accounts.length;
-    const active = accounts.filter((item) => item.status === "正常").length;
+    const active = accounts.filter(isUsableAccount).length;
     const limited = accounts.filter((item) => item.status === "限流").length;
     const abnormal = accounts.filter((item) => item.status === "异常").length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
@@ -605,11 +618,18 @@ function AccountsPageContent() {
       const data = await refreshAccounts(accessTokens);
       setAccounts(data.items);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      const removedUnusable = data.removed_unusable ?? 0;
+      const cleanupRemoved = data.cleanup_removed ?? 0;
+      const cleanupSummary = removedUnusable > 0 || cleanupRemoved > 0
+        ? `，本次清理不可用 ${removedUnusable} 个，历史清理 ${cleanupRemoved} 个`
+        : "";
       if (data.errors.length > 0) {
         const firstError = data.errors[0]?.error;
         toast.error(
-          `刷新成功 ${data.refreshed} 个，失败 ${data.errors.length} 个${firstError ? `，首个错误：${firstError}` : ""}`,
+          `刷新成功 ${data.refreshed} 个，失败 ${data.errors.length} 个${cleanupSummary}${firstError ? `，首个错误：${firstError}` : ""}`,
         );
+      } else if (cleanupSummary) {
+        toast.warning(`刷新成功 ${data.refreshed} 个账户${cleanupSummary}`);
       } else {
         toast.success(`刷新成功 ${data.refreshed} 个账户`);
       }
@@ -1032,10 +1052,7 @@ function AccountsPageContent() {
                             <span
                               className={cn(
                                 "size-2 rounded-full ring-[3px]",
-                                account.status === "正常" && "bg-emerald-500 ring-emerald-500/15",
-                                account.status === "限流" && "bg-amber-500 ring-amber-500/15",
-                                account.status === "异常" && "bg-rose-500 ring-rose-500/15",
-                                account.status === "禁用" && "bg-stone-400 ring-stone-400/15",
+                                statusDotClass(account),
                               )}
                             />
                             <span className="text-sm font-medium text-foreground">{account.status}</span>

@@ -15,6 +15,7 @@ export type Account = {
   quota: number;
   initial_quota?: number;
   image_quota_unknown?: boolean;
+  refresh_validation_pending?: boolean;
   email?: string | null;
   user_id?: string | null;
   client_id?: string | null;
@@ -25,6 +26,7 @@ export type Account = {
   }>;
   default_model_slug?: string | null;
   restore_at?: string | null;
+  pending_delete?: boolean;
   success: number;
   fail: number;
   last_used_at?: string | null;
@@ -46,16 +48,25 @@ type AccountListResponse = {
 
 type AccountMutationResponse = {
   items: Account[];
+  status?: "ok" | "partial" | string;
   added?: number;
   skipped?: number;
+  write_attempted?: number;
+  saved?: number;
+  validated_saved?: number;
   removed?: number;
   refreshed?: number;
+  refresh_failed?: number;
+  removed_unusable?: number;
+  cleanup_removed?: number;
   errors?: Array<{ access_token: string; error: string }>;
 };
 
 type AccountRefreshResponse = {
   items: Account[];
   refreshed: number;
+  removed_unusable?: number;
+  cleanup_removed?: number;
   errors: Array<{ access_token: string; error: string }>;
 };
 
@@ -103,6 +114,18 @@ export type ManagedImage = {
   // 生成时记下来的 prompt 原文（image_prompts.json）。老数据为空字符串。
   // 给图片管理和一键复用使用；为空时前端按无提示词处理。
   prompt?: string;
+};
+
+export type ManagedImageSummary = {
+  total_images: number;
+  filtered_images: number;
+  today_images: number;
+  used_bytes: number;
+  filtered_bytes: number;
+  storage_limit_bytes: number;
+  storage_usage_percent: number;
+  disk_total_bytes: number;
+  disk_free_bytes: number;
 };
 
 export type ImageOwner = {
@@ -237,6 +260,9 @@ export type AuthIdentity = {
 
 export type RegisterConfig = {
   enabled: boolean;
+  lifecycle?: string;
+  is_running?: boolean;
+  is_stopping?: boolean;
   mail: {
     request_timeout: number;
     wait_timeout: number;
@@ -264,8 +290,11 @@ export type RegisterConfig = {
     job_id?: string;
     job_kind?: string;
     success: number;
+    usable_success?: number;
     fail: number;
     done: number;
+    saved?: number;
+    refresh_failed?: number;
     running: number;
     threads: number;
     elapsed_seconds?: number;
@@ -278,7 +307,11 @@ export type RegisterConfig = {
     finished_at?: string;
     trigger?: string;
     workers?: Array<Record<string, unknown>>;
+    failure_reasons?: Record<string, number>;
     proxy_pool?: Record<string, unknown>;
+    lifecycle?: string;
+    is_running?: boolean;
+    is_stopping?: boolean;
   };
   logs?: Array<{
     time: string;
@@ -472,7 +505,7 @@ export async function fetchManagedImages(filters: { start_date?: string; end_dat
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
   if (filters.owner) params.set("owner", filters.owner);
-  return httpRequest<{ items: ManagedImage[]; groups: Array<{ date: string; items: ManagedImage[] }> }>(
+  return httpRequest<{ items: ManagedImage[]; summary?: ManagedImageSummary; groups?: Array<{ date: string; items: ManagedImage[] }> }>(
     `/api/images${params.toString() ? `?${params.toString()}` : ""}`,
   );
 }
@@ -561,23 +594,46 @@ export async function fetchImageModels() {
   return httpRequest<{ object?: string; data: ImageModelListItem[] }>("/v1/models");
 }
 
-export type UserKeyCreatePayload = {
-  name?: string;
-  key?: string;
+export type UserKeyQuotaPayload = {
+  image_daily_quota?: number;
+  image_daily_unlimited?: boolean;
+  image_monthly_quota?: number;
+  image_monthly_unlimited?: boolean;
+  image_total_quota?: number;
+  image_total_unlimited?: boolean;
+  chat_daily_quota?: number;
+  chat_daily_unlimited?: boolean;
+  chat_monthly_quota?: number;
+  chat_monthly_unlimited?: boolean;
+  chat_total_quota?: number;
+  chat_total_unlimited?: boolean;
 };
 
-export type UserKeyUpdatePayload = {
-  enabled?: boolean;
+export type UserKeyCreatePayload = UserKeyQuotaPayload & {
   name?: string;
   key?: string;
+  role?: AuthRole;
+  account_tier?: AccountTier;
+};
+
+export type UserKeyUpdatePayload = UserKeyCreatePayload & {
+  enabled?: boolean;
+  reset_image_daily_used?: boolean;
+  reset_image_monthly_used?: boolean;
+  reset_image_total_used?: boolean;
+  reset_chat_daily_used?: boolean;
+  reset_chat_monthly_used?: boolean;
+  reset_chat_total_used?: boolean;
 };
 
 export async function createUserKey(payload: UserKeyCreatePayload) {
+  const { key, ...rest } = payload;
   return httpRequest<{ item: UserKey; key: string; items: UserKey[] }>("/api/auth/users", {
     method: "POST",
     body: {
+      ...rest,
       name: payload.name ?? "",
-      ...(payload.key ? { key: payload.key } : {}),
+      ...(key ? { key } : {}),
     },
   });
 }

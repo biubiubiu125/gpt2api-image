@@ -16,8 +16,6 @@ class AccountService:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if config.register_internal_key:
             headers["X-Register-Internal-Key"] = config.register_internal_key
-        elif config.auth_key:
-            headers["Authorization"] = f"Bearer {config.auth_key}"
         return headers
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:

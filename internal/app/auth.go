@@ -39,21 +39,68 @@ func normalizeServiceKey(k UserKey) UserKey {
 	if k.ChatMonthlyResetAt == "" {
 		k.ChatMonthlyResetAt = monthKey()
 	}
-	k.Role = "admin"
-	k.AccountTier = "premium"
-	k.ImageDailyQuota = 0
-	k.ImageMonthlyQuota = 0
-	k.ImageTotalQuota = 0
-	k.ChatDailyQuota = 0
-	k.ChatMonthlyQuota = 0
-	k.ChatTotalQuota = 0
-	k.ImageDailyUnlimited = true
-	k.ImageMonthlyUnlimited = true
-	k.ImageTotalUnlimited = true
-	k.ChatDailyUnlimited = true
-	k.ChatMonthlyUnlimited = true
-	k.ChatTotalUnlimited = true
+	k.Role = normalizeAuthRole(k.Role)
+	k.AccountTier = normalizeAccountTier(k.AccountTier)
+	if !k.QuotaConfigured && !hasQuotaState(k) {
+		k.ImageDailyUnlimited = true
+		k.ImageMonthlyUnlimited = true
+		k.ImageTotalUnlimited = true
+		k.ChatDailyUnlimited = true
+		k.ChatMonthlyUnlimited = true
+		k.ChatTotalUnlimited = true
+	}
 	return k
+}
+
+func normalizeAuthRole(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "user":
+		return "user"
+	default:
+		return "admin"
+	}
+}
+
+func normalizeAccountTier(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "free":
+		return "free"
+	default:
+		return "premium"
+	}
+}
+
+func hasQuotaState(k UserKey) bool {
+	return k.ImageDailyQuota != 0 || k.ImageDailyUsed != 0 || k.ImageDailyUnlimited ||
+		k.ImageMonthlyQuota != 0 || k.ImageMonthlyUsed != 0 || k.ImageMonthlyUnlimited ||
+		k.ImageTotalQuota != 0 || k.ImageTotalUsed != 0 || k.ImageTotalUnlimited ||
+		k.ChatDailyQuota != 0 || k.ChatDailyUsed != 0 || k.ChatDailyUnlimited ||
+		k.ChatMonthlyQuota != 0 || k.ChatMonthlyUsed != 0 || k.ChatMonthlyUnlimited ||
+		k.ChatTotalQuota != 0 || k.ChatTotalUsed != 0 || k.ChatTotalUnlimited
+}
+
+func serviceKeyIdentity(k UserKey) *Identity {
+	k = normalizeServiceKey(k)
+	return &Identity{
+		ID:                      k.ID,
+		Name:                    k.Name,
+		Role:                    k.Role,
+		AccountTier:             k.AccountTier,
+		CanUsePaidImageAccounts: keyCanUsePaidImageAccounts(k),
+		CanUseHighResolution:    keyCanUseHighResolution(k),
+	}
+}
+
+func isRootIdentity(id *Identity) bool {
+	return id != nil && id.Root
+}
+
+func keyCanUsePaidImageAccounts(k UserKey) bool {
+	return k.Role == "admin" || k.AccountTier == "premium"
+}
+
+func keyCanUseHighResolution(k UserKey) bool {
+	return k.Role == "admin" || k.AccountTier == "premium"
 }
 
 func (s *Server) bearer(r *http.Request) string {
@@ -72,7 +119,7 @@ func (s *Server) requireIdentity(w http.ResponseWriter, r *http.Request) (*Ident
 		return nil, false
 	}
 	if token == s.cfg.AuthKey {
-		return &Identity{ID: "admin", Name: "管理员", Role: "admin", AccountTier: "premium", CanUsePaidImageAccounts: true, CanUseHighResolution: true}, true
+		return &Identity{ID: "admin", Name: "管理员", Role: "admin", AccountTier: "premium", CanUsePaidImageAccounts: true, CanUseHighResolution: true, Root: true}, true
 	}
 	keys := s.store.LoadAuthKeys()
 	h := hashKey(token)
@@ -92,7 +139,7 @@ func (s *Server) requireIdentity(w http.ResponseWriter, r *http.Request) (*Ident
 				}
 				return keys
 			})
-			return &Identity{ID: k.ID, Name: k.Name, Role: "admin", AccountTier: "premium", CanUsePaidImageAccounts: true, CanUseHighResolution: true}, true
+			return serviceKeyIdentity(k), true
 		}
 	}
 	writeErr(w, 401, "密钥无效或已失效，请重新登录")
@@ -112,7 +159,7 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (*Identity
 }
 
 func (s *Server) checkImageAccess(id *Identity, model, resolution string) error {
-	if id == nil || id.Role == "admin" {
+	if id == nil || isRootIdentity(id) {
 		return nil
 	}
 	res := normalizeResolution(resolution)
@@ -127,7 +174,7 @@ func (s *Server) checkImageAccess(id *Identity, model, resolution string) error 
 
 func publicKey(k UserKey) map[string]any {
 	k = normalizeServiceKey(k)
-	res := map[string]any{"id": k.ID, "name": k.Name, "role": "admin", "enabled": k.Enabled, "created_at": k.CreatedAt, "last_used_at": k.LastUsedAt, "account_tier": "premium", "can_use_paid_image_accounts": true, "can_use_high_resolution": true, "key_visible": k.Key != ""}
+	res := map[string]any{"id": k.ID, "name": k.Name, "role": k.Role, "enabled": k.Enabled, "created_at": k.CreatedAt, "last_used_at": k.LastUsedAt, "account_tier": k.AccountTier, "can_use_paid_image_accounts": keyCanUsePaidImageAccounts(k), "can_use_high_resolution": keyCanUseHighResolution(k), "key_visible": k.Key != ""}
 	add := func(prefix string, quota, used int, unl bool) {
 		res[prefix+"_quota"] = quota
 		res[prefix+"_used"] = used
@@ -164,7 +211,7 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if id.Role == "admin" {
+	if isRootIdentity(id) {
 		payload := map[string]any{"id": id.ID, "name": id.Name, "role": "admin", "account_tier": "premium", "can_use_paid_image_accounts": true, "can_use_high_resolution": true}
 		for _, k := range []string{"image_daily", "image_monthly", "image_total", "chat_daily", "chat_monthly", "chat_total"} {
 			payload[k+"_quota"] = 0
@@ -205,6 +252,7 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			raw = "sk-" + randID(24)
 		}
 		k := normalizeServiceKey(UserKey{ID: randID(6), Name: strings.TrimSpace(strAny(body["name"], "API 密钥")), KeyHash: hashKey(raw), Key: raw, Enabled: true, CreatedAt: nowISO()})
+		applyAuthKeyUpdate(&k, body)
 		if err := s.store.UpdateAuthKeys(func(keys []UserKey) []UserKey {
 			return append(keys, k)
 		}); err != nil {
@@ -315,6 +363,7 @@ func (s *Server) handleAuthUserID(w http.ResponseWriter, r *http.Request) {
 					k.KeyHash = hashKey(v)
 				}
 				k = normalizeServiceKey(k)
+				applyAuthKeyUpdate(&k, b)
 				keys[i] = k
 				break
 			}
@@ -336,42 +385,69 @@ func (s *Server) publicUserKeys() []map[string]any {
 	}
 	return out
 }
+
+func applyAuthKeyUpdate(k *UserKey, b map[string]any) {
+	if v, ok := b["role"]; ok {
+		k.Role = normalizeAuthRole(strAny(v, k.Role))
+	}
+	if v, ok := b["account_tier"]; ok {
+		k.AccountTier = normalizeAccountTier(strAny(v, k.AccountTier))
+	}
+	applyQuotaUpdate(k, b)
+}
+
 func applyQuotaUpdate(k *UserKey, b map[string]any) {
+	quotaTouched := false
 	if v, ok := b["image_daily_quota"]; ok {
 		k.ImageDailyQuota = intAny(v, k.ImageDailyQuota)
+		quotaTouched = true
 	}
 	if v, ok := b["image_daily_unlimited"]; ok {
 		k.ImageDailyUnlimited = boolAny(v, k.ImageDailyUnlimited)
+		quotaTouched = true
 	}
 	if v, ok := b["image_monthly_quota"]; ok {
 		k.ImageMonthlyQuota = intAny(v, k.ImageMonthlyQuota)
+		quotaTouched = true
 	}
 	if v, ok := b["image_monthly_unlimited"]; ok {
 		k.ImageMonthlyUnlimited = boolAny(v, k.ImageMonthlyUnlimited)
+		quotaTouched = true
 	}
 	if v, ok := b["image_total_quota"]; ok {
 		k.ImageTotalQuota = intAny(v, k.ImageTotalQuota)
+		quotaTouched = true
 	}
 	if v, ok := b["image_total_unlimited"]; ok {
 		k.ImageTotalUnlimited = boolAny(v, k.ImageTotalUnlimited)
+		quotaTouched = true
 	}
 	if v, ok := b["chat_daily_quota"]; ok {
 		k.ChatDailyQuota = intAny(v, k.ChatDailyQuota)
+		quotaTouched = true
 	}
 	if v, ok := b["chat_daily_unlimited"]; ok {
 		k.ChatDailyUnlimited = boolAny(v, k.ChatDailyUnlimited)
+		quotaTouched = true
 	}
 	if v, ok := b["chat_monthly_quota"]; ok {
 		k.ChatMonthlyQuota = intAny(v, k.ChatMonthlyQuota)
+		quotaTouched = true
 	}
 	if v, ok := b["chat_monthly_unlimited"]; ok {
 		k.ChatMonthlyUnlimited = boolAny(v, k.ChatMonthlyUnlimited)
+		quotaTouched = true
 	}
 	if v, ok := b["chat_total_quota"]; ok {
 		k.ChatTotalQuota = intAny(v, k.ChatTotalQuota)
+		quotaTouched = true
 	}
 	if v, ok := b["chat_total_unlimited"]; ok {
 		k.ChatTotalUnlimited = boolAny(v, k.ChatTotalUnlimited)
+		quotaTouched = true
+	}
+	if quotaTouched {
+		k.QuotaConfigured = true
 	}
 	if boolAny(b["reset_image_daily_used"], false) {
 		k.ImageDailyUsed = 0
@@ -398,13 +474,13 @@ func applyQuotaUpdate(k *UserKey, b map[string]any) {
 }
 
 func (s *Server) consumeImage(id *Identity, n int) bool {
-	if id.Role == "admin" {
+	if isRootIdentity(id) {
 		return true
 	}
 	return s.consumeQuota(id.ID, n, true)
 }
 func (s *Server) consumeChat(id *Identity, n int) bool {
-	if id.Role == "admin" {
+	if isRootIdentity(id) {
 		return true
 	}
 	return s.consumeQuota(id.ID, n, false)
@@ -444,13 +520,13 @@ func (s *Server) consumeQuota(id string, n int, image bool) bool {
 	return consumed
 }
 func (s *Server) refundImage(id *Identity, n int) {
-	if id == nil || id.Role == "admin" || n <= 0 {
+	if id == nil || isRootIdentity(id) || n <= 0 {
 		return
 	}
 	s.refundQuota(id.ID, n, true)
 }
 func (s *Server) refundChat(id *Identity, n int) {
-	if id == nil || id.Role == "admin" || n <= 0 {
+	if id == nil || isRootIdentity(id) || n <= 0 {
 		return
 	}
 	s.refundQuota(id.ID, n, false)

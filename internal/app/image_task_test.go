@@ -629,6 +629,36 @@ func TestImageTagWriteFailureReturnsServerError(t *testing.T) {
 	})
 }
 
+func TestImageTagsRejectInvalidPath(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{name: "empty", path: ""},
+		{name: "traversal", path: "../outside.png"},
+		{name: "trimmed traversal", path: "/../outside.png"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewStore(t.TempDir())
+			s := &Server{cfg: Config{AuthKey: "root-key"}, store: store}
+			body := `{"path":"` + tc.path + `","tags":["x"]}`
+			req := httptest.NewRequest(http.MethodPost, "/api/images/tags", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer root-key")
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+
+			s.handleImageTags(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s, want 400", rr.Code, rr.Body.String())
+			}
+			if got := store.LoadTags(); len(got) != 0 {
+				t.Fatalf("tags = %#v, want empty", got)
+			}
+		})
+	}
+}
+
 func TestImageTagDeleteRequiresDeleteMethod(t *testing.T) {
 	store := NewStore(t.TempDir())
 	if err := store.SaveTags(map[string][]string{"2026/07/05/a.png": []string{"x", "y"}}); err != nil {
@@ -989,6 +1019,37 @@ func TestV1ChatAndResponsesWithoutClientTaskIDStaySynchronousWithDB(t *testing.T
 	}
 }
 
+func TestChatStreamImageWithoutClientTaskIDStaysSynchronousWithDB(t *testing.T) {
+	s, _ := newV1ImageCleanupTestServer(t)
+	s.taskStore = &PGTaskStore{}
+	generateCalls := 0
+	s.imageGenerator = func(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+		generateCalls++
+		return []upstreamImageResult{{Bytes: []byte("generated-image"), RevisedPrompt: prompt}}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/chat/stream", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw a cat"}`))
+	req.Header.Set("Authorization", "Bearer test")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "image_task.queued") {
+		t.Fatalf("body = %s, want synchronous image stream without queued task event", body)
+	}
+	if !strings.Contains(body, "conversation.delta") || !strings.Contains(body, "conversation.done") {
+		t.Fatalf("body = %s, want synchronous conversation stream events", body)
+	}
+	if generateCalls != 1 {
+		t.Fatalf("image generation calls = %d, want 1", generateCalls)
+	}
+}
+
 func TestImageTaskEditRejectsEmptyPromptBeforeReadingInputs(t *testing.T) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -1035,21 +1096,24 @@ func TestFreeUserHighResolutionRejectedBeforeDBTaskCreate(t *testing.T) {
 	}
 }
 
-func TestStoredAuthKeyBecomesServiceAdminKey(t *testing.T) {
+func TestStoredAuthKeyPreservesRoleAndQuota(t *testing.T) {
 	s := &Server{
 		cfg:   Config{AuthKey: "root-key"},
 		store: NewStore(t.TempDir()),
 	}
 	if err := s.store.SaveAuthKeys([]UserKey{{
-		ID:                  "newapi",
-		Name:                "newapi",
-		Role:                "user",
-		Key:                 "sk-newapi",
-		KeyHash:             hashKey("sk-newapi"),
-		AccountTier:         "free",
-		Enabled:             true,
-		ImageTotalQuota:     1,
-		ImageTotalUnlimited: false,
+		ID:                    "newapi",
+		Name:                  "newapi",
+		Role:                  "user",
+		Key:                   "sk-newapi",
+		KeyHash:               hashKey("sk-newapi"),
+		AccountTier:           "free",
+		Enabled:               true,
+		ImageDailyUnlimited:   true,
+		ImageMonthlyUnlimited: true,
+		ImageTotalQuota:       1,
+		ImageTotalUnlimited:   false,
+		QuotaConfigured:       true,
 	}}); err != nil {
 		t.Fatalf("save auth keys: %v", err)
 	}
@@ -1057,23 +1121,25 @@ func TestStoredAuthKeyBecomesServiceAdminKey(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
 	req.Header.Set("Authorization", "Bearer sk-newapi")
 	rr := httptest.NewRecorder()
-	id, ok := s.requireAdmin(rr, req)
+	id, ok := s.requireIdentity(rr, req)
 	if !ok {
-		t.Fatalf("service key should pass admin auth, status=%d body=%s", rr.Code, rr.Body.String())
+		t.Fatalf("service key should authenticate, status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if id.ID != "newapi" || id.Role != "admin" || id.AccountTier != "premium" {
-		t.Fatalf("identity = %#v, want newapi admin premium", id)
+	if id.ID != "newapi" || id.Role != "user" || id.AccountTier != "free" {
+		t.Fatalf("identity = %#v, want newapi user free", id)
 	}
-	if !id.CanUseHighResolution || !id.CanUsePaidImageAccounts {
-		t.Fatalf("service key should have full image access: %#v", id)
+	if id.CanUseHighResolution || id.CanUsePaidImageAccounts {
+		t.Fatalf("free user key should not have paid image access: %#v", id)
 	}
-
+	if !s.consumeImage(id, 1) {
+		t.Fatal("first image quota consume failed")
+	}
+	if s.consumeImage(id, 1) {
+		t.Fatal("second image quota consume should fail")
+	}
 	keys := s.store.LoadAuthKeys()
-	if len(keys) != 1 {
-		t.Fatalf("keys len = %d, want 1", len(keys))
-	}
-	if keys[0].Role != "admin" || keys[0].AccountTier != "premium" || !keys[0].ImageTotalUnlimited {
-		t.Fatalf("stored key normalized = %#v, want admin premium unlimited", keys[0])
+	if len(keys) != 1 || keys[0].Role != "user" || keys[0].AccountTier != "free" || keys[0].ImageTotalUsed != 1 {
+		t.Fatalf("stored key = %#v, want user free with one used image quota", keys)
 	}
 }
 
@@ -1100,6 +1166,181 @@ func TestCreateAuthUserEndpointCreatesServiceKey(t *testing.T) {
 	}
 	if id.Role != "admin" || id.AccountTier != "premium" {
 		t.Fatalf("created key identity = %#v, want admin premium", id)
+	}
+	if !s.consumeImage(id, 1) {
+		t.Fatal("default service key should have unlimited image quota")
+	}
+}
+
+func TestCreateAuthUserEndpointAppliesRoleAndQuota(t *testing.T) {
+	s := &Server{
+		cfg:   Config{AuthKey: "root-key"},
+		store: NewStore(t.TempDir()),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/users", strings.NewReader(`{"name":"limited","key":"sk-limited","role":"user","account_tier":"free","image_total_quota":1,"image_total_unlimited":false}`))
+	req.Header.Set("Authorization", "Bearer root-key")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.handleAuthUsers(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create key status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	req.Header.Set("Authorization", "Bearer sk-limited")
+	rr = httptest.NewRecorder()
+	id, ok := s.requireIdentity(rr, req)
+	if !ok {
+		t.Fatalf("created limited key should authenticate, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if id.Role != "user" || id.AccountTier != "free" || id.CanUseHighResolution || id.CanUsePaidImageAccounts {
+		t.Fatalf("created limited key identity = %#v, want user free without paid image access", id)
+	}
+	if !s.consumeImage(id, 1) {
+		t.Fatal("first limited key image quota consume failed")
+	}
+	if s.consumeImage(id, 1) {
+		t.Fatal("second limited key image quota consume should fail")
+	}
+	keys := s.store.LoadAuthKeys()
+	if len(keys) != 1 || !keys[0].QuotaConfigured || !keys[0].ImageDailyUnlimited || !keys[0].ImageMonthlyUnlimited || keys[0].ImageTotalUnlimited || keys[0].ImageTotalUsed != 1 {
+		t.Fatalf("created limited key quota = %#v, want daily/monthly unlimited and one used limited total quota", keys)
+	}
+}
+
+func TestAdminServiceKeyCanManageButImageQuotaIsEnforced(t *testing.T) {
+	s := &Server{
+		cfg:   Config{AuthKey: "root-key"},
+		store: NewStore(t.TempDir()),
+	}
+	if err := s.store.SaveAuthKeys([]UserKey{{
+		ID:                    "service",
+		Name:                  "service",
+		Role:                  "admin",
+		Key:                   "sk-service",
+		KeyHash:               hashKey("sk-service"),
+		AccountTier:           "premium",
+		Enabled:               true,
+		ImageDailyUnlimited:   true,
+		ImageMonthlyUnlimited: true,
+		ImageTotalQuota:       1,
+		ImageTotalUnlimited:   false,
+		QuotaConfigured:       true,
+	}}); err != nil {
+		t.Fatalf("save auth keys: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req.Header.Set("Authorization", "Bearer sk-service")
+	rr := httptest.NewRecorder()
+	id, ok := s.requireAdmin(rr, req)
+	if !ok {
+		t.Fatalf("service key should pass admin auth, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !s.consumeImage(id, 1) {
+		t.Fatal("first image quota consume failed")
+	}
+	if s.consumeImage(id, 1) {
+		t.Fatal("second image quota consume should fail")
+	}
+	if s.consumeImage(&Identity{ID: "admin", Role: "admin", Root: true}, 1000) != true {
+		t.Fatal("root admin should stay unlimited")
+	}
+	keys := s.store.LoadAuthKeys()
+	if len(keys) != 1 || keys[0].ImageTotalUsed != 1 || keys[0].ImageTotalUnlimited {
+		t.Fatalf("stored key quota = %#v, want one used limited total quota", keys)
+	}
+}
+
+func TestAdminIDServiceKeyDoesNotBecomeRoot(t *testing.T) {
+	s := &Server{
+		cfg:   Config{AuthKey: "root-key"},
+		store: NewStore(t.TempDir()),
+	}
+	if err := s.store.SaveAuthKeys([]UserKey{{
+		ID:                    "admin",
+		Name:                  "manual admin id",
+		Role:                  "admin",
+		Key:                   "sk-admin-id",
+		KeyHash:               hashKey("sk-admin-id"),
+		AccountTier:           "premium",
+		Enabled:               true,
+		ImageDailyUnlimited:   true,
+		ImageMonthlyUnlimited: true,
+		ImageTotalQuota:       1,
+		ImageTotalUnlimited:   false,
+		QuotaConfigured:       true,
+	}}); err != nil {
+		t.Fatalf("save auth keys: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req.Header.Set("Authorization", "Bearer sk-admin-id")
+	rr := httptest.NewRecorder()
+	id, ok := s.requireAdmin(rr, req)
+	if !ok {
+		t.Fatalf("service key should pass admin auth, status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if isRootIdentity(id) {
+		t.Fatalf("service key identity should not be root: %#v", id)
+	}
+	if !s.consumeImage(id, 1) {
+		t.Fatal("first image quota consume failed")
+	}
+	if s.consumeImage(id, 1) {
+		t.Fatal("service key with admin id should still obey image quota")
+	}
+}
+
+func TestRegisterInternalRequiresDedicatedKey(t *testing.T) {
+	s := &Server{
+		cfg:   Config{AuthKey: "root-key"},
+		store: NewStore(t.TempDir()),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/register/accounts", nil)
+	req.Header.Set("Authorization", "Bearer root-key")
+	rr := httptest.NewRecorder()
+	s.handleInternalRegisterAccounts(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s, want 401 when internal key is unset", rr.Code, rr.Body.String())
+	}
+
+	s.cfg.RegisterInternalKey = "internal-key"
+	req = httptest.NewRequest(http.MethodGet, "/internal/register/accounts", nil)
+	req.Header.Set("Authorization", "Bearer root-key")
+	rr = httptest.NewRecorder()
+	s.handleInternalRegisterAccounts(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s, want 401 for root key on internal register route", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/internal/register/accounts", nil)
+	req.Header.Set("X-Register-Internal-Key", "internal-key")
+	rr = httptest.NewRecorder()
+	s.handleInternalRegisterAccounts(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200 with dedicated internal key", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRegisterExecutorProxyRequiresDedicatedInternalKey(t *testing.T) {
+	s := &Server{
+		cfg: Config{
+			AuthKey:             "root-key",
+			RegisterExecutorURL: "http://127.0.0.1:1",
+		},
+		store: NewStore(t.TempDir()),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/register", nil)
+	req.Header.Set("Authorization", "Bearer root-key")
+	rr := httptest.NewRecorder()
+
+	s.handleRegister(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s, want 500", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "register_internal_key is required") {
+		t.Fatalf("body = %s, want missing internal key error", rr.Body.String())
 	}
 }
 

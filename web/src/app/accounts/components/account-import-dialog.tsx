@@ -182,14 +182,19 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       setOpen(false);
       resetState();
 
-      if ((data.errors?.length ?? 0) > 0) {
+      const attempted = data.write_attempted ?? ((data.added ?? 0) + (data.skipped ?? 0));
+      const saved = data.saved ?? attempted;
+      const validatedSaved = data.validated_saved ?? saved;
+      const refreshFailed = data.refresh_failed ?? data.errors?.length ?? 0;
+      const unavailable = Math.max(0, attempted - validatedSaved);
+      if ((data.errors?.length ?? 0) > 0 || unavailable > 0 || data.status === "partial") {
         const firstError = data.errors?.[0]?.error;
-        toast.error(
-          `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，已刷新 ${data.refreshed ?? 0} 个，失败 ${data.errors?.length ?? 0} 个${firstError ? `，首个错误：${firstError}` : ""}`,
+        toast.warning(
+          `${successText ?? "导入完成"}，已保存 ${saved} 个，可用 ${validatedSaved} 个，新增 ${data.added ?? 0} 个，已刷新 ${data.refreshed ?? 0} 个，刷新失败 ${refreshFailed} 个${unavailable > 0 ? `，不可用/已清理 ${unavailable} 个` : ""}${firstError ? `，首个错误：${firstError}` : ""}`,
         );
       } else {
         toast.success(
-          `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项，已自动刷新账号信息`,
+          `${successText ?? "导入完成"}，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项，可用 ${validatedSaved} 个，已自动刷新账号信息`,
         );
       }
     } catch (error) {

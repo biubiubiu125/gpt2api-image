@@ -18,6 +18,11 @@ from services.register.proxy_pool import register_proxy_pool
 REGISTER_FILE = DATA_DIR / "register.json"
 REGISTER_STALL_FAILURE_REASON = "register_task_stalled"
 SECRET_PLACEHOLDER = "********"
+REGISTER_RUNTIME_FIELDS = {"enabled", "stats", "logs", "executor", "lifecycle", "is_running", "is_stopping"}
+
+
+class RegisterTaskActiveError(RuntimeError):
+    pass
 
 
 def _is_secret_key(key: object) -> bool:
@@ -125,6 +130,18 @@ def _int_or_default(value: object, default: int) -> int:
         return default
 
 
+def _failure_reason_key(value: object, default: str = "unknown_error") -> str:
+    reason = str(value or "").strip()
+    return reason if reason else default
+
+
+def _bump_failure_reason(counts: dict[str, int], reason: object, amount: int = 1) -> None:
+    key = _failure_reason_key(reason)
+    if amount <= 0:
+        return
+    counts[key] = counts.get(key, 0) + amount
+
+
 def _image_account_usable(item: dict) -> bool:
     return (
         str(item.get("status") or "正常") == "正常"
@@ -132,6 +149,15 @@ def _image_account_usable(item: dict) -> bool:
         and not bool(item.get("image_quota_unknown"))
         and _int_or_default(item.get("quota"), 0) > 0
     )
+
+
+def _delete_account_or_raise(token: str) -> None:
+    token = str(token or "").strip()
+    if not token:
+        return
+    account_service.delete_accounts([token])
+    if account_service.get_account(token) is not None:
+        raise RuntimeError("account_delete_not_persisted")
 
 
 def _default_config() -> dict:
@@ -146,8 +172,11 @@ def _default_config() -> dict:
         "enabled": False,
         "stats": {
             "success": 0,
+            "usable_success": 0,
             "fail": 0,
             "done": 0,
+            "saved": 0,
+            "refresh_failed": 0,
             "running": 0,
             "threads": openai_register.config["threads"],
             "elapsed_seconds": 0,
@@ -155,13 +184,14 @@ def _default_config() -> dict:
             "success_rate": 0,
             "current_quota": 0,
             "current_available": 0,
+            "failure_reasons": {},
         },
     }
 
 
 def _normalize(raw: dict) -> dict:
     cfg = _default_config()
-    cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
+    cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs", "lifecycle", "is_running", "is_stopping"}})
     cfg["total"] = max(1, int(cfg.get("total") or 1))
     cfg["threads"] = max(1, int(cfg.get("threads") or 1))
     cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
@@ -199,6 +229,8 @@ def _normalize(raw: dict) -> dict:
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
+    for runtime_key in ("lifecycle", "is_running", "is_stopping"):
+        stats.pop(runtime_key, None)
     cfg["stats"] = stats
     return cfg
 
@@ -228,10 +260,43 @@ class RegisterService:
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
         self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    def _runtime_state_locked(self) -> dict:
+        running = bool(self._runner and self._runner.is_alive())
+        stopping = bool(running and self._stop_event and self._stop_event.is_set())
+        stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
+        if stopping:
+            lifecycle = "stopping"
+        elif running and stats.get("job_kind") == "repair_abnormal":
+            lifecycle = "repairing"
+        elif running:
+            lifecycle = "running"
+        else:
+            lifecycle = "idle"
+        return {"lifecycle": lifecycle, "is_running": running, "is_stopping": stopping}
+
+    @staticmethod
+    def _attach_runtime_state(snapshot: dict, runtime: dict) -> None:
+        stats = snapshot.get("stats")
+        if not isinstance(stats, dict):
+            stats = {}
+            snapshot["stats"] = stats
+        for key, value in runtime.items():
+            snapshot[key] = value
+            stats[key] = value
+
+    def _require_idle_locked(self, action: str) -> None:
+        if self._runner and self._runner.is_alive():
+            raise RegisterTaskActiveError(f"register task is running; stop and wait for cleanup before {action}")
+
+    def ensure_idle(self, action: str = "changing register runtime resources") -> None:
+        with self._lock:
+            self._require_idle_locked(action)
+
     def get(self, redact: bool = True) -> dict:
         with self._lock:
             self._refresh_proxy_pool_state_locked(force=False)
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
+            self._attach_runtime_state(snapshot, self._runtime_state_locked())
         if redact:
             self._redact_secrets(snapshot)
         return snapshot
@@ -358,6 +423,8 @@ class RegisterService:
 
     def update(self, updates: dict) -> dict:
         with self._lock:
+            self._require_idle_locked("updating config")
+            updates = {k: v for k, v in dict(updates or {}).items() if k not in REGISTER_RUNTIME_FIELDS}
             self._preserve_redacted_secrets(updates)
             self._merge_outlook_pools(updates)
             next_config = _normalize({**self._config, **updates})
@@ -413,10 +480,14 @@ class RegisterService:
                 "job_id": job_id,
                 "job_kind": "repair_abnormal",
                 "success": 0,
+                "usable_success": 0,
                 "fail": 0,
                 "done": 0,
+                "saved": 0,
+                "refresh_failed": 0,
                 "running": 1,
                 "threads": 1,
+                "failure_reasons": {},
                 **metrics,
                 "started_at": _now(),
                 "updated_at": _now(),
@@ -494,10 +565,14 @@ class RegisterService:
             self._config["stats"] = {
                 "job_id": job_id,
                 "success": 0,
+                "usable_success": 0,
                 "fail": 0,
                 "done": 0,
+                "saved": 0,
+                "refresh_failed": 0,
                 "running": 0,
                 "threads": run_config["threads"],
+                "failure_reasons": {},
                 **metrics,
                 "started_at": _now(),
                 "updated_at": _now(),
@@ -509,7 +584,7 @@ class RegisterService:
             }
             self._sync_openai_register_config(run_config)
             with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
+                openai_register.stats.update({"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "start_time": time.time()})
             self._save()
             openai_register.set_active_run_id(job_id)
             self._runner = threading.Thread(target=self._run, args=(run_config, trigger, self._stop_event, job_id), daemon=True, name="openai-register")
@@ -541,22 +616,11 @@ class RegisterService:
         with self._lock:
             self._config["enabled"] = False
             job_id = str(self._run_id or self._config.get("stats", {}).get("job_id") or "")
-            stop_event = self._stop_event
-            futures: set = set()
             if self._stop_event is not None:
                 self._stop_event.set()
-            if job_id or futures:
-                self._invalidate_running_workers(
-                    run_id=job_id,
-                    stop_event=stop_event,
-                    futures=set(),
-                    reason="register_task_stopped",
-                    error="register task stopped by user",
-                    failed=False,
-                )
-            job_id = str(self._config.get("stats", {}).get("job_id") or "")
             if job_id:
-                openai_register.clear_active_run_id(job_id)
+                active_indexes = self._worker_indexes(self._active_worker_states())
+                openai_register.mark_worker_states_stopping_for_run(active_indexes, job_id, "register task stopping by user")
             self._config["stats"]["updated_at"] = _now()
             self._save()
             self._append_log(
@@ -567,10 +631,11 @@ class RegisterService:
 
     def reset(self) -> dict:
         with self._lock:
+            self._require_idle_locked("resetting stats")
             self._logs = []
-            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
+            self._config["stats"] = {"success": 0, "usable_success": 0, "fail": 0, "done": 0, "saved": 0, "refresh_failed": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "failure_reasons": {}, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
+                openai_register.stats.update({"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "start_time": 0.0})
             self._save()
             return self.get()
 
@@ -580,21 +645,45 @@ class RegisterService:
 
     def reset_outlook_pool(self, scope: str = "all") -> dict:
         scope = str(scope or "all").strip().lower()
-        if scope == "unused":
-            with self._lock:
+        with self._lock:
+            self._require_idle_locked("resetting Outlook mailbox pool")
+            if scope == "unused":
                 removed = self._prune_unused_outlook_pools()
                 self._sync_openai_register_config(self._config)
                 self._save()
                 self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
-            return self.get()
-        scope = "failed" if str(scope) == "failed" else "all"
-        cleared = mail_provider.reset_outlook_token_pool_state(scope)
-        with self._lock:
+                return self.get()
+            scope = "failed" if str(scope) == "failed" else "all"
+            cleared = mail_provider.reset_outlook_token_pool_state(scope)
             self._append_log(
                 f"已重置 Outlook 邮箱池状态（范围={'仅失败/占用' if scope == 'failed' else '全部'}），清除 {cleared} 条记录",
                 "yellow",
             )
         return self.get()
+
+    def add_yyds_domain_blacklist(self, domains: list[object]) -> dict:
+        with self._lock:
+            self._require_idle_locked("changing YYDS domain blacklist")
+            added = sum(1 for domain in domains if mail_provider.add_yyds_domain_blacklist(domain))
+            return {"items": mail_provider.yyds_domain_blacklist_items(), "added": added}
+
+    def remove_yyds_domain_blacklist(self, domains: list[object]) -> dict:
+        with self._lock:
+            self._require_idle_locked("changing YYDS domain blacklist")
+            removed = sum(1 for domain in domains if mail_provider.remove_yyds_domain_blacklist(domain))
+            return {"items": mail_provider.yyds_domain_blacklist_items(), "removed": removed}
+
+    def replace_yyds_domain_blacklist(self, domains: list[object]) -> dict:
+        with self._lock:
+            self._require_idle_locked("changing YYDS domain blacklist")
+            items = mail_provider.replace_yyds_domain_blacklist(domains)
+            return {"items": items, "replaced": len(items)}
+
+    def reset_yyds_domain_blacklist(self) -> dict:
+        with self._lock:
+            self._require_idle_locked("changing YYDS domain blacklist")
+            cleared = mail_provider.reset_yyds_domain_blacklist()
+            return {"items": mail_provider.yyds_domain_blacklist_items(), "cleared": cleared}
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
@@ -654,8 +743,20 @@ class RegisterService:
 
     def _bump(self, **updates) -> None:
         with self._lock:
+            workers = openai_register.get_worker_states()
             updates.setdefault("proxy_pool", register_proxy_pool.state())
-            updates.setdefault("workers", openai_register.get_worker_states())
+            updates.setdefault("workers", workers)
+            if "failure_reasons" in updates:
+                raw_reasons = updates.get("failure_reasons") if isinstance(updates.get("failure_reasons"), dict) else {}
+                updates["failure_reasons"] = {
+                    _failure_reason_key(reason): int(count)
+                    for reason, count in raw_reasons.items()
+                    if _failure_reason_key(reason) and int(count or 0) > 0
+                }
+            else:
+                current_reasons = self._config.get("stats", {}).get("failure_reasons")
+                if isinstance(current_reasons, dict):
+                    updates["failure_reasons"] = dict(current_reasons)
             self._config["stats"].update(updates)
             stats = self._config["stats"]
             started_at = str(stats.get("started_at") or "")
@@ -666,10 +767,11 @@ class RegisterService:
                     elapsed = 0.0
                 done = int(stats.get("done") or 0)
                 success = int(stats.get("success") or 0)
+                usable_success = int(stats.get("usable_success") or 0)
                 fail = int(stats.get("fail") or 0)
                 stats["elapsed_seconds"] = round(elapsed, 1)
                 stats["avg_seconds"] = round(elapsed / success, 1) if success else 0
-                stats["success_rate"] = round(success * 100 / max(1, success + fail), 1)
+                stats["success_rate"] = round(usable_success * 100 / max(1, success + fail), 1)
             self._config["stats"]["updated_at"] = _now()
             self._save()
 
@@ -718,6 +820,17 @@ class RegisterService:
                 indexes.append(int(raw_index))
         return indexes
 
+    @staticmethod
+    def _cancel_pending_futures(futures: set) -> tuple[set, int]:
+        remaining = set()
+        cancelled = 0
+        for future in list(futures):
+            if future.cancel():
+                cancelled += 1
+            else:
+                remaining.add(future)
+        return remaining, cancelled
+
     def _invalidate_running_workers(
         self,
         *,
@@ -727,19 +840,17 @@ class RegisterService:
         reason: str,
         error: str,
         failed: bool = False,
-    ) -> int:
+    ) -> tuple[set, int]:
         openai_register.clear_active_run_id(run_id)
         if stop_event is not None:
             stop_event.set()
         active_workers = self._active_worker_states()
         active_indexes = self._worker_indexes(active_workers)
         if failed:
-            openai_register.mark_worker_states_failed_for_run(active_indexes, run_id, reason, error)
+            openai_register.mark_worker_states_failed_for_run(active_indexes, run_id, reason, error, terminal=False)
         else:
-            openai_register.mark_worker_states_stopped_for_run(active_indexes, run_id, error)
-        for future in list(futures):
-            future.cancel()
-        return len(futures)
+            openai_register.mark_worker_states_stopping_for_run(active_indexes, run_id, error)
+        return self._cancel_pending_futures(futures)
 
     def _run(
         self,
@@ -750,37 +861,62 @@ class RegisterService:
     ) -> None:
         base_config = dict(run_config or self.get(redact=False))
         threads = int(base_config["threads"])
-        submitted, done, success, fail = 0, 0, 0, 0
+        submitted, done, success, usable_success, fail = 0, 0, 0, 0, 0
+        saved, refresh_failed = 0, 0
+        failure_reasons: dict[str, int] = {}
         stall_logged = False
+        shutdown_requested = False
+        stopped_failure_reason = ""
         stop_event = stop_event or threading.Event()
         executor = ThreadPoolExecutor(max_workers=threads)
         shutdown_wait = True
+
+        def record_worker_result(result: dict) -> None:
+            nonlocal success, usable_success, fail, saved, refresh_failed
+            if result.get("refresh_failed"):
+                refresh_failed += 1
+            if result.get("ok"):
+                success += 1
+                if result.get("usable"):
+                    usable_success += 1
+                if result.get("saved"):
+                    saved += 1
+            elif result.get("stopped"):
+                if stopped_failure_reason:
+                    fail += 1
+                    _bump_failure_reason(failure_reasons, stopped_failure_reason)
+            else:
+                fail += 1
+                _bump_failure_reason(failure_reasons, result.get("reason"))
+
         try:
             futures = set()
             while True:
                 cfg = dict(base_config if trigger == "auto_refill" else self.get(redact=False))
                 self._set_active_futures(futures)
                 if stop_event and stop_event.is_set():
-                    cancelled_count = self._invalidate_running_workers(
-                        run_id=run_id,
-                        stop_event=stop_event,
-                        futures=futures,
-                        reason="register_task_stopped",
-                        error="register task stopped by user",
-                        failed=False,
-                    )
-                    done += cancelled_count
-                    futures.clear()
-                    shutdown_wait = False
-                    self._append_log(
-                        f"注册任务已停止，已取消未开始任务 {cancelled_count} 个",
-                        "yellow",
-                    )
-                    break
-                stalled_workers = self._stalling_worker_states(int(cfg.get("task_stall_timeout_seconds") or 0))
-                if stalled_workers and not stop_event.is_set():
-                    shutdown_wait = False
-                    cancelled_count = self._invalidate_running_workers(
+                    if not shutdown_requested:
+                        futures, cancelled_count = self._invalidate_running_workers(
+                            run_id=run_id,
+                            stop_event=stop_event,
+                            futures=futures,
+                            reason="register_task_stopped",
+                            error="register task stopped by user",
+                            failed=False,
+                        )
+                        done += cancelled_count
+                        shutdown_requested = True
+                        stopped_failure_reason = ""
+                        self._append_log(
+                            f"注册任务已停止，已取消未开始任务 {cancelled_count} 个，等待运行中任务完成清理",
+                            "yellow",
+                        )
+                        self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons))
+                    if not futures:
+                        break
+                stalled_workers = [] if shutdown_requested else self._stalling_worker_states(int(cfg.get("task_stall_timeout_seconds") or 0))
+                if stalled_workers:
+                    futures, cancelled_count = self._invalidate_running_workers(
                         run_id=run_id,
                         stop_event=stop_event,
                         futures=futures,
@@ -790,7 +926,9 @@ class RegisterService:
                     )
                     fail += cancelled_count
                     done += cancelled_count
-                    futures.clear()
+                    _bump_failure_reason(failure_reasons, REGISTER_STALL_FAILURE_REASON, cancelled_count)
+                    shutdown_requested = True
+                    stopped_failure_reason = REGISTER_STALL_FAILURE_REASON
                     if not stall_logged:
                         worker_refs = ", ".join(
                             f"#{worker.get('index')} {worker.get('status')} {worker.get('step') or worker.get('last_error') or ''}".strip()
@@ -801,7 +939,9 @@ class RegisterService:
                             "red",
                         )
                         stall_logged = True
-                    break
+                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons))
+                    if not futures:
+                        break
                 while (
                     self.get()["enabled"]
                     and not (stop_event and stop_event.is_set())
@@ -811,7 +951,7 @@ class RegisterService:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted, stop_event, None, cfg.get("task_timeout_seconds"), run_id))
                     self._set_active_futures(futures)
-                self._bump(running=len(futures), done=done, success=success, fail=fail)
+                self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons))
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break
                 if not futures:
@@ -822,23 +962,21 @@ class RegisterService:
                     continue
                 finished, futures = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
                 if not finished:
-                    self._bump(running=len(futures), done=done, success=success, fail=fail)
+                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons))
                     continue
                 for future in finished:
                     done += 1
                     try:
                         result = future.result()
-                        if result.get("ok"):
-                            success += 1
-                        elif not result.get("stopped"):
-                            fail += 1
-                    except Exception:
+                        record_worker_result(result if isinstance(result, dict) else {"ok": False, "reason": "invalid_worker_result"})
+                    except Exception as exc:
                         fail += 1
+                        _bump_failure_reason(failure_reasons, exc)
         finally:
             self._set_active_futures(set())
             executor.shutdown(wait=shutdown_wait, cancel_futures=True)
             openai_register.clear_active_run_id(run_id)
-        self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
+        self._bump(running=0, done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons), finished_at=_now())
         with self._lock:
             self._config["enabled"] = False
             if self._stop_event is stop_event:
@@ -849,7 +987,8 @@ class RegisterService:
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 
     def _run_repair_abnormal(self, stop_event: threading.Event, run_id: str) -> None:
-        success, fail, done = 0, 0, 0
+        success, usable_success, fail, done = 0, 0, 0, 0
+        failure_reasons: dict[str, int] = {}
         try:
             accounts = account_service.list_accounts()
             candidates = [
@@ -875,28 +1014,50 @@ class RegisterService:
                     errors = result.get("errors") if isinstance(result.get("errors"), list) else []
                     if errors:
                         fail += 1
+                        _bump_failure_reason(failure_reasons, "account_refresh_failed")
                         self._append_log(f"{email} 刷新失败，已按状态尝试移除：{errors}", "red")
                     elif removed:
                         fail += 1
+                        _bump_failure_reason(failure_reasons, "account_unusable_after_refresh")
                         self._append_log(f"{email} 刷新后仍不可用，已移除", "yellow")
                     else:
+                        refreshed_account = account_service.get_account(token)
+                        if not _image_account_usable(refreshed_account or {}):
+                            fail += 1
+                            if refreshed_account is None:
+                                _bump_failure_reason(failure_reasons, "account_unusable_after_refresh")
+                                self._append_log(f"{email} 刷新后账号不存在，未恢复", "yellow")
+                            else:
+                                try:
+                                    _delete_account_or_raise(token)
+                                    _bump_failure_reason(failure_reasons, "account_unusable_after_refresh")
+                                    self._append_log(f"{email} 刷新后仍不可用，已删除", "yellow")
+                                except Exception as delete_exc:
+                                    _bump_failure_reason(failure_reasons, "account_delete_failed")
+                                    self._append_log(f"{email} 刷新后仍不可用，删除失败：{delete_exc}", "red")
+                            continue
                         success += 1
+                        usable_success += 1
                         self._append_log(f"{email} 刷新恢复正常", "green")
                 except Exception as exc:
                     fail += 1
+                    _bump_failure_reason(failure_reasons, "repair_account_failed")
                     self._append_log(f"{email} 修复失败：{exc}", "red")
                 finally:
                     done += 1
-                    self._bump(done=done, success=success, fail=fail, running=1)
+                    self._bump(done=done, success=success, usable_success=usable_success, fail=fail, running=1, failure_reasons=dict(failure_reasons))
         except Exception as exc:
             fail += 1
             done += 1
+            _bump_failure_reason(failure_reasons, "repair_abnormal_failed")
             self._append_log(f"异常账号修复任务失败：{exc}", "red")
             self._bump(
                 done=done,
                 success=success,
+                usable_success=usable_success,
                 fail=fail,
                 running=0,
+                failure_reasons=dict(failure_reasons),
                 workers=[
                     {
                         "index": 1,
@@ -908,7 +1069,7 @@ class RegisterService:
                 ],
             )
         finally:
-            self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
+            self._bump(running=0, done=done, success=success, usable_success=usable_success, fail=fail, failure_reasons=dict(failure_reasons), finished_at=_now())
             with self._lock:
                 self._config["enabled"] = False
                 if self._stop_event is stop_event:

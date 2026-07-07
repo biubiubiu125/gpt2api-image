@@ -20,9 +20,6 @@ func (s *Server) requireRegisterInternal(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 401, "register internal key is invalid")
 		return false
 	}
-	if bearer != "" && subtle.ConstantTimeCompare([]byte(bearer), []byte(s.cfg.AuthKey)) == 1 {
-		return true
-	}
 	writeErr(w, 401, "register internal key is required")
 	return false
 }
@@ -76,27 +73,8 @@ func (s *Server) addAccountRecords(records []map[string]any) (int, int, string, 
 	if msg := validateAccountRecordsForSource(tokset, "web", s.store.LoadAccounts()); msg != "" {
 		return 0, 0, msg, nil
 	}
-	added, skipped := 0, 0
-	if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
-		existing := map[string]int{}
-		for i, a := range accounts {
-			existing[a.AccessToken] = i
-		}
-		for token, rec := range tokset {
-			source := accountRecordSource("web", rec)
-			a := accountFromRecord(token, source, rec)
-			if idx, ok := existing[token]; ok {
-				cur := accounts[idx]
-				mergeAccount(&cur, a)
-				accounts[idx] = cur
-				skipped++
-			} else {
-				accounts = append(accounts, a)
-				added++
-			}
-		}
-		return accounts
-	}); err != nil {
+	added, skipped, err := s.upsertAccountRecordsForRefresh(tokset, "web")
+	if err != nil {
 		return 0, 0, "", err
 	}
 	return added, skipped, "", nil
@@ -120,16 +98,12 @@ func (s *Server) handleInternalRegisterAccountsRefresh(w http.ResponseWriter, r 
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 	before := s.store.LoadAccounts()
-	refreshed, errs := s.refreshAccountInfos(ctx, body.AccessTokens)
-	removed := 0
-	if !body.DeferInvalidRemoval {
-		removed = s.removeRegisterUnusableAccounts(body.AccessTokens, errs)
-	}
+	refreshed, errs, removed, cleanupRemoved := s.refreshAccountInfos(ctx, body.AccessTokens, body.DeferInvalidRemoval)
 	accounts := s.store.LoadAccounts()
 	if s.logSvc != nil {
-		s.logSvc.add("account", "注册机刷新账号", map[string]any{"refreshed": refreshed, "errors": len(errs), "removed_unusable": removed, "emails": accountEmailsForRefreshLog(before, accounts, body.AccessTokens)})
+		s.logSvc.add("account", "注册机刷新账号", map[string]any{"refreshed": refreshed, "errors": len(errs), "removed_unusable": removed, "cleanup_removed": cleanupRemoved, "emails": accountEmailsForRefreshLog(before, accounts, body.AccessTokens)})
 	}
-	writeJSON(w, 200, map[string]any{"refreshed": refreshed, "errors": errs, "removed_unusable": removed, "items": accounts})
+	writeJSON(w, 200, map[string]any{"refreshed": refreshed, "errors": errs, "removed_unusable": removed, "cleanup_removed": cleanupRemoved, "items": accounts})
 }
 
 func (s *Server) handleInternalRegisterAccountsDelete(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +182,7 @@ func (s *Server) removeRegisterUnusableAccounts(tokens []string, errs []map[stri
 		if !targets[account.AccessToken] {
 			continue
 		}
-		if reason, ok := imageAccountRecordRemovalReason(account); ok {
+		if reason, ok := registerImageAccountRemovalReason(account); ok {
 			if ok, err := s.removeOrMarkImageAccount(account.AccessToken, reason); err == nil && ok {
 				changed++
 			}

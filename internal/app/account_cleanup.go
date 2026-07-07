@@ -12,6 +12,8 @@ const (
 	accountStatusDisabled = "禁用"
 	accountStatusInvalid  = "异常"
 	accountStatusLimited  = "限流"
+
+	accountRefreshValidationGracePeriod = 10 * time.Minute
 )
 
 func isAccountStatus(status, want string) bool {
@@ -28,6 +30,14 @@ func isAccountInvalidStatus(status string) bool {
 }
 
 func imageAccountRecordRemovalReason(a Account) (string, bool) {
+	return imageAccountRemovalReason(a, false)
+}
+
+func registerImageAccountRemovalReason(a Account) (string, bool) {
+	return imageAccountRemovalReason(a, true)
+}
+
+func imageAccountRemovalReason(a Account, includePendingRefreshValidation bool) (string, bool) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return "", false
 	}
@@ -40,6 +50,9 @@ func imageAccountRecordRemovalReason(a Account) (string, bool) {
 	if isAccountInvalidStatus(a.Status) {
 		return "account_status_invalid", true
 	}
+	if a.RefreshValidationPending && !includePendingRefreshValidation && accountRefreshValidationRecentlyStarted(a) {
+		return "", false
+	}
 	if a.ImageQuotaUnknown {
 		return "image_quota_unknown", true
 	}
@@ -47,6 +60,24 @@ func imageAccountRecordRemovalReason(a Account) (string, bool) {
 		return "image_quota_empty", true
 	}
 	return "", false
+}
+
+func accountRefreshValidationRecentlyStarted(a Account) bool {
+	if !a.RefreshValidationPending || a.CreatedAt == nil {
+		return false
+	}
+	createdAt := strings.TrimSpace(*a.CreatedAt)
+	if createdAt == "" {
+		return false
+	}
+	startedAt, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		startedAt, err = time.Parse(time.RFC3339, createdAt)
+	}
+	if err != nil {
+		return false
+	}
+	return time.Since(startedAt) < accountRefreshValidationGracePeriod
 }
 
 func imageAccountErrorRemovalReason(err error) (string, bool) {

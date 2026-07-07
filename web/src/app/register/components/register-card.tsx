@@ -26,6 +26,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { fetchYYDSDomainBlacklist, replaceYYDSDomainBlacklist, resetYYDSDomainBlacklist } from "@/lib/api";
+import { getRegisterRuntimeState } from "@/lib/register-runtime";
 import { cn } from "@/lib/utils";
 
 import { useSettingsStore } from "../../settings/store";
@@ -112,8 +113,17 @@ export function RegisterCard() {
   if (!config) return null;
 
   const stats = config.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads };
+  const runtime = getRegisterRuntimeState(config);
+  const runningCount = Number(stats.running || 0);
+  const isDraining = runtime.isStopping;
+  const isTaskActive = runtime.isActive;
+  const statusLabel = isDraining ? "停止中" : runtime.isRepairing ? "修复中" : runtime.isRunning ? "运行中" : "空闲";
   const providers = config.mail.providers || [];
-  const isRepairingAbnormal = config.enabled && stats.job_kind === "repair_abnormal";
+  const isRepairingAbnormal = runtime.isRepairing;
+  const failureReasons = Object.entries(stats.failure_reasons || {})
+    .filter(([, count]) => Number(count) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .slice(0, 4);
 
   const targetTotal =
     config.mode === "quota"
@@ -132,12 +142,15 @@ export function RegisterCard() {
 
   const kpis: { label: string; value: string | number; tone?: "ok" | "warn" | "error" | "muted" }[] = [
     { label: "成功", value: stats.success, tone: "ok" },
+    { label: "可用成功", value: stats.usable_success ?? stats.success, tone: "ok" },
     { label: "失败", value: stats.fail, tone: stats.fail > 0 ? "error" : "muted" },
+    { label: "保存", value: stats.saved || 0, tone: "ok" },
+    { label: "刷新失败", value: stats.refresh_failed || 0, tone: (stats.refresh_failed || 0) > 0 ? "warn" : "muted" },
     { label: "完成", value: stats.done },
     { label: "线程", value: `${stats.running}/${stats.threads}` },
     { label: "平均", value: `${stats.avg_seconds || 0}s` },
     { label: "已运行", value: `${stats.elapsed_seconds || 0}s` },
-    { label: "成功率", value: `${stats.success_rate || 0}%`, tone: (stats.success_rate || 0) >= 80 ? "ok" : "warn" },
+    { label: "可用率", value: `${stats.success_rate || 0}%`, tone: (stats.success_rate || 0) >= 80 ? "ok" : "warn" },
     { label: "额度", value: stats.current_quota || 0, tone: "muted" },
   ];
   const updateProviderType = (index: number, type: string) => {
@@ -194,15 +207,17 @@ export function RegisterCard() {
             <span
               className={cn(
                 "relative grid size-10 place-items-center rounded-lg border",
-                config.enabled
-                  ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                  : "border-border bg-secondary text-muted-foreground",
+                isDraining
+                  ? "border-amber-200 bg-amber-50 text-amber-700"
+                  : runtime.isRunning
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                    : "border-border bg-secondary text-muted-foreground",
               )}
             >
-              {config.enabled ? (
+              {isTaskActive ? (
                 <>
-                  <span className="absolute inset-0 animate-ping rounded-lg bg-emerald-400/20" />
-                  <span className="relative size-2 rounded-full bg-emerald-500" />
+                  <span className={cn("absolute inset-0 animate-ping rounded-lg", isDraining ? "bg-amber-400/20" : "bg-emerald-400/20")} />
+                  <span className={cn("relative size-2 rounded-full", isDraining ? "bg-amber-500" : "bg-emerald-500")} />
                 </>
               ) : (
                 <span className="size-2 rounded-full bg-muted-foreground/50" />
@@ -213,10 +228,10 @@ export function RegisterCard() {
                 <span
                   className={cn(
                     "font-data text-[10px] font-bold tracking-[0.22em] uppercase",
-                    config.enabled ? "text-emerald-600" : "text-muted-foreground",
+                    isDraining ? "text-amber-600" : runtime.isRunning ? "text-emerald-600" : "text-muted-foreground",
                   )}
                 >
-                  {config.enabled ? "运行中" : "空闲"}
+                  {statusLabel}
                 </span>
                 <span className="h-px w-6 bg-border" />
                 <span className="font-data text-[10px] font-medium tracking-wider text-muted-foreground uppercase">
@@ -238,21 +253,25 @@ export function RegisterCard() {
             <Button
               className={cn(
                 "h-10 cursor-pointer rounded-lg px-5 text-[13px] font-medium transition",
-                config.enabled
-                  ? "bg-rose-500 text-white shadow-sm shadow-rose-500/30 hover:bg-rose-600"
-                  : "bg-foreground text-background shadow-sm hover:bg-foreground/90",
+                isDraining
+                  ? "bg-amber-500 text-white shadow-sm shadow-amber-500/20"
+                  : runtime.isRunning
+                    ? "bg-rose-500 text-white shadow-sm shadow-rose-500/30 hover:bg-rose-600"
+                    : "bg-foreground text-background shadow-sm hover:bg-foreground/90",
               )}
               onClick={() => void toggle()}
-              disabled={isSaving}
+              disabled={isSaving || isDraining}
             >
               {isSaving ? (
                 <LoaderCircle className="size-4 animate-spin" />
-              ) : config.enabled ? (
+              ) : isDraining ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : runtime.isRunning ? (
                 <Square className="size-4 fill-current" />
               ) : (
                 <Play className="size-4 fill-current" />
               )}
-              {config.enabled ? "停止" : "启动"}
+              {isDraining ? "清理中" : runtime.isRunning ? "停止" : "启动"}
             </Button>
             <Button
               variant="outline"
@@ -263,7 +282,7 @@ export function RegisterCard() {
                   : "bg-background text-foreground",
               )}
               onClick={() => void repairAbnormal()}
-              disabled={isSaving || (config.enabled && !isRepairingAbnormal)}
+              disabled={isSaving || isDraining || (runtime.isRunning && !isRepairingAbnormal)}
               title={isRepairingAbnormal ? "停止修复" : "修复异常账号"}
             >
               {isSaving ? (
@@ -279,7 +298,7 @@ export function RegisterCard() {
               variant="outline"
               className="h-10 cursor-pointer rounded-lg border-border bg-background px-3 text-foreground"
               onClick={() => void reset()}
-              disabled={isSaving || config.enabled}
+              disabled={isSaving || isTaskActive}
               title="重置"
             >
               <RotateCcw className="size-4" />
@@ -292,9 +311,11 @@ export function RegisterCard() {
             <div
               className={cn(
                 "absolute inset-y-0 left-0 rounded-full transition-all duration-500",
-                config.enabled
-                  ? "bg-gradient-to-r from-emerald-400 to-emerald-500"
-                  : "bg-gradient-to-r from-muted-foreground/40 to-muted-foreground/60",
+                isDraining
+                  ? "bg-gradient-to-r from-amber-400 to-amber-500"
+                  : runtime.isRunning
+                    ? "bg-gradient-to-r from-emerald-400 to-emerald-500"
+                    : "bg-gradient-to-r from-muted-foreground/40 to-muted-foreground/60",
               )}
               style={{ width: `${progress}%` }}
             />
@@ -305,7 +326,7 @@ export function RegisterCard() {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-px overflow-hidden bg-border md:grid-cols-4 lg:grid-cols-8">
+        <div className="grid grid-cols-2 gap-px overflow-hidden bg-border md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-12">
           {kpis.map((kpi) => (
             <div key={kpi.label} className="flex flex-col gap-1 bg-card px-4 py-3">
               <span className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">
@@ -326,9 +347,19 @@ export function RegisterCard() {
             </div>
           ))}
         </div>
+        {failureReasons.length > 0 ? (
+          <div className="flex flex-wrap gap-2 border-t border-border bg-card px-5 py-3 text-xs text-muted-foreground">
+            <span className="font-semibold text-foreground">失败原因</span>
+            {failureReasons.map(([reason, count]) => (
+              <span key={reason} className="rounded-md border border-border bg-secondary px-2 py-1 font-data">
+                {reason}: {count}
+              </span>
+            ))}
+          </div>
+        ) : null}
       </section>
 
-      {!config.enabled ? (
+      {!isTaskActive ? (
         <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
           <AlertTriangle className="size-4 shrink-0" />
           <span>启动前先保存配置。配置面板在最下方，支持折叠展开。</span>
@@ -411,7 +442,7 @@ export function RegisterCard() {
                 event.stopPropagation();
                 void save();
               }}
-              disabled={isSaving || config.enabled}
+              disabled={isSaving || isTaskActive}
             >
               {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
               保存
@@ -435,7 +466,7 @@ export function RegisterCard() {
                 <h2 className="text-[15px] font-semibold tracking-tight text-foreground">注册配置</h2>
               </div>
             </div>
-            <Button className="h-9 cursor-pointer rounded-lg bg-foreground px-4 text-background hover:bg-foreground/90" onClick={() => void save()} disabled={isSaving || config.enabled}>
+            <Button className="h-9 cursor-pointer rounded-lg bg-foreground px-4 text-background hover:bg-foreground/90" onClick={() => void save()} disabled={isSaving || isTaskActive}>
               {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
               保存配置
             </Button>
@@ -444,7 +475,7 @@ export function RegisterCard() {
           <div className="grid gap-3 md:grid-cols-3">
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">注册模式</label>
-              <Select value={config.mode || "total"} onValueChange={(value) => setMode(value as "total" | "quota" | "available")} disabled={config.enabled}>
+              <Select value={config.mode || "total"} onValueChange={(value) => setMode(value as "total" | "quota" | "available")} disabled={isTaskActive}>
                 <SelectTrigger className="h-10 rounded-lg border-border bg-background">
                   <SelectValue />
                 </SelectTrigger>
@@ -457,55 +488,55 @@ export function RegisterCard() {
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">注册总数</label>
-              <Input value={String(config.total)} onChange={(event) => setTotal(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || config.mode !== "total"} />
+              <Input value={String(config.total)} onChange={(event) => setTotal(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive || config.mode !== "total"} />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">线程数</label>
-              <Input value={String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled} />
+              <Input value={String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive} />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">注册代理</label>
-              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} />
+              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive} />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">目标剩余额度</label>
-              <Input value={String(config.target_quota || "")} onChange={(event) => setTargetQuota(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || config.mode !== "quota"} />
+              <Input value={String(config.target_quota || "")} onChange={(event) => setTargetQuota(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive || config.mode !== "quota"} />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">目标可用账号</label>
-              <Input value={String(config.target_available || "")} onChange={(event) => setTargetAvailable(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || config.mode !== "available"} />
+              <Input value={String(config.target_available || "")} onChange={(event) => setTargetAvailable(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive || config.mode !== "available"} />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">检查间隔（秒）</label>
-              <Input value={String(config.check_interval || "")} onChange={(event) => setCheckInterval(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || config.mode === "total"} />
+              <Input value={String(config.check_interval || "")} onChange={(event) => setCheckInterval(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive || config.mode === "total"} />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">指定账号密码</label>
-              <Input type="password" value={String(config.fixed_password || "")} onChange={(event) => setFixedPassword(event.target.value)} placeholder="留空=随机生成" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} autoComplete="new-password" />
+              <Input type="password" value={String(config.fixed_password || "")} onChange={(event) => setFixedPassword(event.target.value)} placeholder="留空=随机生成" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive} autoComplete="new-password" />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">单任务超时（秒）</label>
-              <Input value={String(config.task_timeout_seconds || "")} onChange={(event) => setTaskTimeout(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled} />
+              <Input value={String(config.task_timeout_seconds || "")} onChange={(event) => setTaskTimeout(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive} />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">无进度超时（秒）</label>
-              <Input value={String(config.task_stall_timeout_seconds || "")} onChange={(event) => setTaskStallTimeout(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled} />
+              <Input value={String(config.task_stall_timeout_seconds || "")} onChange={(event) => setTaskStallTimeout(event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive} />
             </div>
             <label className="flex items-center gap-2.5 pt-7 text-sm text-foreground">
-              <Checkbox checked={Boolean(config.auto_refill?.enabled)} onCheckedChange={(checked) => setAutoRefillField("enabled", Boolean(checked))} disabled={config.enabled} />
+              <Checkbox checked={Boolean(config.auto_refill?.enabled)} onCheckedChange={(checked) => setAutoRefillField("enabled", Boolean(checked))} disabled={isTaskActive} />
               <span>启用自动补号</span>
             </label>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">补号阈值</label>
-              <Input value={String(config.auto_refill?.min_available || "")} onChange={(event) => setAutoRefillField("min_available", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || !config.auto_refill?.enabled} />
+              <Input value={String(config.auto_refill?.min_available || "")} onChange={(event) => setAutoRefillField("min_available", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive || !config.auto_refill?.enabled} />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">每轮补号数量</label>
-              <Input value={String(config.auto_refill?.batch_total || "")} onChange={(event) => setAutoRefillField("batch_total", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || !config.auto_refill?.enabled} />
+              <Input value={String(config.auto_refill?.batch_total || "")} onChange={(event) => setAutoRefillField("batch_total", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive || !config.auto_refill?.enabled} />
             </div>
             <div className="space-y-1.5">
               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">补号检查间隔</label>
-              <Input value={String(config.auto_refill?.check_interval || "")} onChange={(event) => setAutoRefillField("check_interval", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled || !config.auto_refill?.enabled} />
+              <Input value={String(config.auto_refill?.check_interval || "")} onChange={(event) => setAutoRefillField("check_interval", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive || !config.auto_refill?.enabled} />
             </div>
           </div>
 
@@ -520,7 +551,7 @@ export function RegisterCard() {
                   {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : <MailCheck className="size-4" />}
                   Outlook 检测
                 </Button>
-                <Button type="button" variant="outline" className="h-9 cursor-pointer rounded-lg border-border bg-background px-3 text-foreground" onClick={addProvider} disabled={config.enabled}>
+                <Button type="button" variant="outline" className="h-9 cursor-pointer rounded-lg border-border bg-background px-3 text-foreground" onClick={addProvider} disabled={isTaskActive}>
                   <Plus className="size-4" />
                   添加
                 </Button>
@@ -530,19 +561,19 @@ export function RegisterCard() {
             <div className="grid gap-3 md:grid-cols-3">
               <div className="space-y-1.5">
                 <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">请求超时</label>
-                <Input value={String(config.mail.request_timeout || "")} onChange={(event) => setMailField("request_timeout", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled} />
+                <Input value={String(config.mail.request_timeout || "")} onChange={(event) => setMailField("request_timeout", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive} />
               </div>
               <div className="space-y-1.5">
                 <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">等待验证码超时</label>
-                <Input value={String(config.mail.wait_timeout || "")} onChange={(event) => setMailField("wait_timeout", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled} />
+                <Input value={String(config.mail.wait_timeout || "")} onChange={(event) => setMailField("wait_timeout", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive} />
               </div>
               <div className="space-y-1.5">
                 <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">轮询间隔</label>
-                <Input value={String(config.mail.wait_interval || "")} onChange={(event) => setMailField("wait_interval", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={config.enabled} />
+                <Input value={String(config.mail.wait_interval || "")} onChange={(event) => setMailField("wait_interval", event.target.value)} className="h-10 rounded-lg border-border bg-background font-data tabular-nums" disabled={isTaskActive} />
               </div>
             </div>
             <label className="flex items-center gap-2.5 text-sm text-foreground">
-              <Checkbox checked={Boolean(config.mail.api_use_register_proxy ?? true)} onCheckedChange={(checked) => setMailUseRegisterProxy(Boolean(checked))} disabled={config.enabled} />
+              <Checkbox checked={Boolean(config.mail.api_use_register_proxy ?? true)} onCheckedChange={(checked) => setMailUseRegisterProxy(Boolean(checked))} disabled={isTaskActive} />
               <span>邮箱 API 请求使用注册代理</span>
             </label>
 
@@ -556,10 +587,10 @@ export function RegisterCard() {
                   <div key={index} className="space-y-3 rounded-lg border border-border bg-secondary/30 p-3">
                     <div className="flex items-center justify-between gap-3">
                       <label className="flex items-center gap-2.5 text-sm text-foreground">
-                        <Checkbox checked={Boolean(provider.enable)} onCheckedChange={(checked) => updateProvider(index, { enable: Boolean(checked) })} disabled={config.enabled} />
+                        <Checkbox checked={Boolean(provider.enable)} onCheckedChange={(checked) => updateProvider(index, { enable: Boolean(checked) })} disabled={isTaskActive} />
                         <span>启用</span>
                       </label>
-                      <button type="button" className="cursor-pointer rounded-md p-1.5 text-muted-foreground transition hover:bg-rose-50 hover:text-rose-500 disabled:opacity-50" onClick={() => deleteProvider(index)} disabled={config.enabled || providers.length <= 1} title="删除 provider">
+                      <button type="button" className="cursor-pointer rounded-md p-1.5 text-muted-foreground transition hover:bg-rose-50 hover:text-rose-500 disabled:opacity-50" onClick={() => deleteProvider(index)} disabled={isTaskActive || providers.length <= 1} title="删除 provider">
                         <Trash2 className="size-4" />
                       </button>
                     </div>
@@ -567,7 +598,7 @@ export function RegisterCard() {
                     <div className="grid gap-3 md:grid-cols-2">
                       <div className="space-y-1.5">
                         <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">类型</label>
-                        <Select value={type} onValueChange={(value) => updateProviderType(index, value)} disabled={config.enabled}>
+                        <Select value={type} onValueChange={(value) => updateProviderType(index, value)} disabled={isTaskActive}>
                           <SelectTrigger className="h-10 rounded-lg border-border bg-background">
                             <SelectValue />
                           </SelectTrigger>
@@ -588,23 +619,23 @@ export function RegisterCard() {
                         <>
                           <div className="space-y-1.5">
                             <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">API Base</label>
-                            <Input value={String(provider.api_base || "")} onChange={(event) => updateProvider(index, { api_base: event.target.value })} placeholder={type === "cloudmail" ? "https://your-cloudmail.com/api" : ""} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} />
+                            <Input value={String(provider.api_base || "")} onChange={(event) => updateProvider(index, { api_base: event.target.value })} placeholder={type === "cloudmail" ? "https://your-cloudmail.com/api" : ""} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive} />
                           </div>
                           {type === "cloudflare_temp_email" ? (
                             <div className="space-y-1.5">
                               <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">Admin Password</label>
-                              <Input value={String(provider.admin_password || "")} onChange={(event) => updateProvider(index, { admin_password: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} />
+                              <Input value={String(provider.admin_password || "")} onChange={(event) => updateProvider(index, { admin_password: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive} />
                             </div>
                           ) : null}
                           {type === "cloudmail" ? (
                             <>
                               <div className="space-y-1.5">
                                 <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">Admin Email</label>
-                                <Input value={String(provider.admin_email || "")} onChange={(event) => updateProvider(index, { admin_email: event.target.value })} placeholder="admin@example.com" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} />
+                                <Input value={String(provider.admin_email || "")} onChange={(event) => updateProvider(index, { admin_email: event.target.value })} placeholder="admin@example.com" className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive} />
                               </div>
                               <div className="space-y-1.5">
                                 <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">Admin Password</label>
-                                <Input type="password" value={String(provider.admin_password || "")} onChange={(event) => updateProvider(index, { admin_password: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} />
+                                <Input type="password" value={String(provider.admin_password || "")} onChange={(event) => updateProvider(index, { admin_password: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive} />
                               </div>
                             </>
                           ) : null}
@@ -612,30 +643,30 @@ export function RegisterCard() {
                       ) : null}
                       {type === "inbucket" ? (
                         <label className="flex items-center gap-2.5 pt-7 text-sm text-foreground">
-                          <Checkbox checked={Boolean(provider.random_subdomain ?? true)} onCheckedChange={(checked) => updateProvider(index, { random_subdomain: Boolean(checked) })} disabled={config.enabled} />
+                          <Checkbox checked={Boolean(provider.random_subdomain ?? true)} onCheckedChange={(checked) => updateProvider(index, { random_subdomain: Boolean(checked) })} disabled={isTaskActive} />
                           <span>启用随机子域名</span>
                         </label>
                       ) : null}
                       {type === "tempmail_lol" || type === "moemail" || type === "duckmail" || type === "gptmail" || type === "yyds_mail" ? (
                         <div className="space-y-1.5">
                           <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">API Key</label>
-                          <Input value={String(provider.api_key || "")} onChange={(event) => updateProvider(index, { api_key: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} />
+                          <Input value={String(provider.api_key || "")} onChange={(event) => updateProvider(index, { api_key: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive} />
                         </div>
                       ) : null}
                       {type === "duckmail" || type === "gptmail" ? (
                         <div className="space-y-1.5">
                           <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">Default Domain</label>
-                          <Input value={String(provider.default_domain || "")} onChange={(event) => updateProvider(index, { default_domain: event.target.value })} placeholder={type === "duckmail" ? "duckmail.sbs" : ""} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} />
+                          <Input value={String(provider.default_domain || "")} onChange={(event) => updateProvider(index, { default_domain: event.target.value })} placeholder={type === "duckmail" ? "duckmail.sbs" : ""} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive} />
                         </div>
                       ) : null}
                       {type === "yyds_mail" ? (
                         <>
                           <div className="space-y-1.5">
                             <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">Subdomain</label>
-                            <Input value={String(provider.subdomain || "")} onChange={(event) => updateProvider(index, { subdomain: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled} />
+                            <Input value={String(provider.subdomain || "")} onChange={(event) => updateProvider(index, { subdomain: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive} />
                           </div>
                           <label className="flex items-center gap-2.5 pt-7 text-sm text-foreground">
-                            <Checkbox checked={Boolean(provider.wildcard)} onCheckedChange={(checked) => updateProvider(index, { wildcard: Boolean(checked) })} disabled={config.enabled} />
+                            <Checkbox checked={Boolean(provider.wildcard)} onCheckedChange={(checked) => updateProvider(index, { wildcard: Boolean(checked) })} disabled={isTaskActive} />
                             <span>Wildcard</span>
                           </label>
                         </>
@@ -644,7 +675,7 @@ export function RegisterCard() {
                         <>
                           <div className="space-y-1.5">
                             <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">读取模式</label>
-                            <Select value={String(provider.mode || "auto")} onValueChange={(value) => updateProvider(index, { mode: value })} disabled={config.enabled}>
+                            <Select value={String(provider.mode || "auto")} onValueChange={(value) => updateProvider(index, { mode: value })} disabled={isTaskActive}>
                               <SelectTrigger className="h-10 rounded-lg border-border bg-background">
                                 <SelectValue />
                               </SelectTrigger>
@@ -657,7 +688,7 @@ export function RegisterCard() {
                           </div>
                           <div className="space-y-1.5">
                             <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">IMAP Host</label>
-                            <Input value={String(provider.imap_host || "outlook.office365.com")} onChange={(event) => updateProvider(index, { imap_host: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={config.enabled || String(provider.mode || "auto") === "graph"} />
+                            <Input value={String(provider.imap_host || "outlook.office365.com")} onChange={(event) => updateProvider(index, { imap_host: event.target.value })} className="h-10 rounded-lg border-border bg-background font-data text-[13px]" disabled={isTaskActive || String(provider.mode || "auto") === "graph"} />
                           </div>
                         </>
                       ) : null}
@@ -666,7 +697,7 @@ export function RegisterCard() {
                     {type === "tempmail_lol" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "cloudmail" ? (
                       <div className="space-y-1.5">
                         <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">{type === "inbucket" ? "基础域名列表" : "Domain"}</label>
-                        <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) })} placeholder={type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : type === "cloudmail" ? "每行一个域名，支持多域名轮询，可加 @ 前缀" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-lg border-border bg-background font-data text-[12px]" disabled={config.enabled} />
+                        <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) })} placeholder={type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : type === "cloudmail" ? "每行一个域名，支持多域名轮询，可加 @ 前缀" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-lg border-border bg-background font-data text-[12px]" disabled={isTaskActive} />
                       </div>
                     ) : null}
                     {type === "yyds_mail" ? (
@@ -678,7 +709,7 @@ export function RegisterCard() {
                             onChange={(event) => updateProvider(index, { domain_blacklist: event.target.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) })}
                             placeholder="每行一个域名后缀，会和自动黑名单一起跳过"
                             className="min-h-16 rounded-lg border-amber-200 bg-white font-data text-[12px]"
-                            disabled={config.enabled}
+                            disabled={isTaskActive}
                           />
                         </div>
                         <div className="flex items-center justify-between gap-3">
@@ -695,13 +726,13 @@ export function RegisterCard() {
                           onChange={(event) => setYydsDomainBlacklistText(event.target.value)}
                           placeholder="每行一个域名后缀，例如 example.com"
                           className="min-h-20 rounded-lg border-amber-200 bg-white font-data text-[12px]"
-                          disabled={config.enabled || isYydsDomainBlacklistLoading}
+                          disabled={isTaskActive || isYydsDomainBlacklistLoading}
                         />
                         <div className="flex items-center gap-2">
-                          <Button type="button" variant="outline" className="h-8 cursor-pointer rounded-lg border-amber-200 bg-white px-3 text-xs text-amber-800" onClick={() => void saveYYDSDomainBlacklist()} disabled={config.enabled || isYydsDomainBlacklistLoading}>
+                          <Button type="button" variant="outline" className="h-8 cursor-pointer rounded-lg border-amber-200 bg-white px-3 text-xs text-amber-800" onClick={() => void saveYYDSDomainBlacklist()} disabled={isTaskActive || isYydsDomainBlacklistLoading}>
                             保存禁用域名
                           </Button>
-                          <Button type="button" variant="outline" className="h-8 cursor-pointer rounded-lg border-border bg-white px-3 text-xs text-muted-foreground" onClick={() => void clearYYDSDomainBlacklist()} disabled={config.enabled || isYydsDomainBlacklistLoading || !yydsDomainBlacklistText.trim()}>
+                          <Button type="button" variant="outline" className="h-8 cursor-pointer rounded-lg border-border bg-white px-3 text-xs text-muted-foreground" onClick={() => void clearYYDSDomainBlacklist()} disabled={isTaskActive || isYydsDomainBlacklistLoading || !yydsDomainBlacklistText.trim()}>
                             清空
                           </Button>
                         </div>
@@ -710,7 +741,7 @@ export function RegisterCard() {
                     {type === "outlook_token" ? (
                       <div className="space-y-1.5">
                         <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">Outlook 邮箱 Token</label>
-                        <Textarea value={outlookMailboxes} onChange={(event) => updateProvider(index, { mailboxes: event.target.value })} placeholder="email----password----client_id----refresh_token&#10;留空保存不会清空已导入邮箱池" className="min-h-28 rounded-lg border-border bg-background font-data text-[12px]" disabled={config.enabled} />
+                        <Textarea value={outlookMailboxes} onChange={(event) => updateProvider(index, { mailboxes: event.target.value })} placeholder="email----password----client_id----refresh_token&#10;留空保存不会清空已导入邮箱池" className="min-h-28 rounded-lg border-border bg-background font-data text-[12px]" disabled={isTaskActive} />
                         {Array.isArray(provider.mailboxes_preview) && provider.mailboxes_preview.length > 0 ? (
                           <div className="font-data text-[11px] text-muted-foreground">已导入 {Number(provider.mailboxes_count || provider.mailboxes_preview.length)} 个：{provider.mailboxes_preview.map(String).slice(0, 6).join("、")}</div>
                         ) : null}

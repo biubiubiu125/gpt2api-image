@@ -45,6 +45,37 @@ def _saved_image_account_usable(item: dict | None) -> bool:
     )
 
 
+def _delete_saved_account_or_raise(access_token: str) -> None:
+    token = str(access_token or "").strip()
+    if not token:
+        return
+    try:
+        account_service.delete_accounts([token])
+    except Exception as exc:
+        raise RegisteredAccountValidationError(f"registered_account_delete_failed: {exc}") from exc
+    try:
+        remaining = account_service.get_account(token)
+    except Exception as exc:
+        raise RegisteredAccountValidationError(f"registered_account_delete_check_failed: {exc}") from exc
+    if remaining is not None:
+        raise RegisteredAccountValidationError("registered_account_delete_not_persisted")
+
+
+def _refresh_failed_validation_error(access_token: str, refresh_error: object) -> tuple[RegisteredAccountValidationError, bool]:
+    try:
+        _delete_saved_account_or_raise(access_token)
+    except Exception as cleanup_exc:
+        err = RegisteredAccountValidationError(
+            f"registered_account_refresh_failed: {refresh_error}; registered_account_delete_failed: {cleanup_exc}"
+        )
+        err.refresh_failed = True
+        err.failure_reason = "account_delete_failed"
+        return err, False
+    err = RegisteredAccountValidationError(f"registered_account_refresh_failed: {refresh_error}")
+    err.refresh_failed = True
+    return err, True
+
+
 base_dir = Path(__file__).resolve().parent
 config = {
     "mail": {
@@ -84,7 +115,7 @@ sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0
 default_timeout = 30
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
-stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
+stats = {"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "start_time": 0.0}
 register_log_sink = None
 worker_state_lock = threading.Lock()
 worker_states: dict[str, dict[str, Any]] = {}
@@ -154,7 +185,11 @@ def _set_worker_state(index: int, **updates: Any) -> None:
                 return
         if current.get("terminal") and not force:
             return
-        if current.get("failure_reason") == "register_task_stalled" and updates.get("failure_reason") != "register_task_stalled":
+        if (
+            current.get("failure_reason") == "register_task_stalled"
+            and updates.get("failure_reason") != "register_task_stalled"
+            and not (updates.get("status") == "failed" and updates.get("failure_reason"))
+        ):
             return
         current["index"] = index
         if update_run_id:
@@ -205,14 +240,19 @@ def mark_worker_states_stopped(indexes: list[int], error: str) -> None:
         _set_worker_state(index, status="stopped", last_error=error, _terminal=True)
 
 
-def mark_worker_states_failed_for_run(indexes: list[int], run_id: str, reason: str, error: str) -> None:
+def mark_worker_states_failed_for_run(indexes: list[int], run_id: str, reason: str, error: str, terminal: bool = True) -> None:
     for index in indexes:
-        _set_worker_state(index, status="failed", failure_reason=reason, last_error=error, run_id=run_id, _terminal=True)
+        _set_worker_state(index, status="failed", failure_reason=reason, last_error=error, run_id=run_id, _terminal=terminal)
 
 
-def mark_worker_states_stopped_for_run(indexes: list[int], run_id: str, error: str) -> None:
+def mark_worker_states_stopped_for_run(indexes: list[int], run_id: str, error: str, terminal: bool = True) -> None:
     for index in indexes:
-        _set_worker_state(index, status="stopped", last_error=error, run_id=run_id, _terminal=True)
+        _set_worker_state(index, status="stopped", last_error=error, run_id=run_id, _terminal=terminal)
+
+
+def mark_worker_states_stopping_for_run(indexes: list[int], run_id: str, error: str) -> None:
+    for index in indexes:
+        _set_worker_state(index, status="stopping", last_error=error, run_id=run_id)
 
 common_headers = {
     "accept": "application/json",
@@ -1383,29 +1423,39 @@ def worker(
             _check_task_control(stop_event, deadline)
             _check_run_active(run_id)
         except RegisterStopped:
-            account_service.delete_accounts([access_token])
+            _delete_saved_account_or_raise(access_token)
             saved_access_token = ""
             raise
         try:
             refresh_result = account_service.refresh_accounts([access_token], defer_invalid_removal=False)
             _check_run_active(run_id)
         except RegisterStopped:
-            account_service.delete_accounts([access_token])
+            _delete_saved_account_or_raise(access_token)
             saved_access_token = ""
             raise
+        except Exception as exc:
+            refresh_error = str(exc)
+            step(index, f"账号保存成功，但刷新账号信息异常：{refresh_error}", "yellow")
+            err, cleaned = _refresh_failed_validation_error(access_token, refresh_error)
+            if cleaned:
+                saved_access_token = ""
+                step(index, "刷新异常，已删除刚保存的账号", "yellow")
+            else:
+                step(index, "刷新异常，但刚保存的账号删除失败，请在账号列表检查", "red")
+            raise err from exc
         if refresh_result.get("errors"):
-            refresh_error = str(refresh_result["errors"])
-            refresh_reason = classify_register_failure(refresh_error)
             step(index, f"账号保存成功，但刷新账号信息失败：{refresh_result['errors']}", "yellow")
-            removed = account_service.delete_accounts([access_token]).get("removed", 0)
-            saved_access_token = ""
-            if removed:
-                step(index, "刷新失败，已删除刚保存的账号，避免额度 0 账号残留", "yellow")
-            register_proxy_pool.report(selection, ok=False, reason=refresh_reason, error=refresh_error)
-            proxy_reported = True
-            raise RegisteredAccountValidationError(f"registered_account_refresh_failed: {refresh_result['errors']}")
+            err, cleaned = _refresh_failed_validation_error(access_token, refresh_result["errors"])
+            if cleaned:
+                saved_access_token = ""
+                step(index, "刷新失败，已删除刚保存的账号", "yellow")
+            else:
+                step(index, "刷新失败，但刚保存的账号删除失败，请在账号列表检查", "red")
+            raise err
         if not _saved_image_account_usable(account_service.get_account(access_token)):
             step(index, "账号保存后未通过额度校验，已被移除或标记清退，不计入成功", "yellow")
+            _delete_saved_account_or_raise(access_token)
+            saved_access_token = ""
             register_proxy_pool.report(selection, ok=True)
             proxy_reported = True
             raise RegisteredAccountValidationError("registered_account_unusable_after_refresh")
@@ -1415,14 +1465,27 @@ def worker(
         with stats_lock:
             stats["done"] += 1
             stats["success"] += 1
+            stats["usable_success"] = int(stats.get("usable_success") or 0) + 1
+            stats["saved"] = int(stats.get("saved") or 0) + 1
             avg = (time.time() - stats["start_time"]) / stats["success"] if stats.get("success") else 0
         _set_worker_state(index, status="success", elapsed_seconds=round(cost, 1), email=result.get("email"), last_error="", failure_reason="")
         log(f'{result["email"]} 注册成功，耗时 {cost:.1f}s，平均 {avg:.1f}s', "green")
-        return {"ok": True, "index": index, "result": result}
+        return {"ok": True, "index": index, "result": result, "saved": True, "usable": True}
     except RegisterStopped as e:
         cost = time.time() - start
         if saved_access_token:
-            account_service.delete_accounts([saved_access_token])
+            try:
+                _delete_saved_account_or_raise(saved_access_token)
+            except Exception as cleanup_exc:
+                reason = classify_register_failure(cleanup_exc)
+                if not proxy_reported:
+                    register_proxy_pool.report(selection, ok=False, reason=reason, error=cleanup_exc)
+                with stats_lock:
+                    stats["done"] += 1
+                    stats["fail"] += 1
+                _set_worker_state(index, status="failed", elapsed_seconds=round(cost, 1), last_error=str(cleanup_exc), failure_reason=reason)
+                log(f"任务{index} 停止后清理账号失败，耗时 {cost:.1f}s，原因={reason}，错误：{cleanup_exc}", "red")
+                return {"ok": False, "index": index, "error": str(cleanup_exc), "reason": reason}
         if not proxy_reported:
             register_proxy_pool.report(selection, ok=False, reason="stopped", error=e)
         with stats_lock:
@@ -1432,7 +1495,7 @@ def worker(
         return {"ok": False, "index": index, "stopped": True, "error": str(e)}
     except Exception as e:
         cost = time.time() - start
-        reason = classify_register_failure(e)
+        reason = str(getattr(e, "failure_reason", "") or "") or classify_register_failure(e)
         if not proxy_reported:
             register_proxy_pool.report(selection, ok=False, reason=reason, error=e)
         with stats_lock:
@@ -1440,7 +1503,7 @@ def worker(
             stats["fail"] += 1
         _set_worker_state(index, status="failed", elapsed_seconds=round(cost, 1), last_error=str(e), failure_reason=reason)
         log(f"任务{index} 注册失败，耗时 {cost:.1f}s，原因={reason}，错误：{e}", "red")
-        return {"ok": False, "index": index, "error": str(e), "reason": reason}
+        return {"ok": False, "index": index, "error": str(e), "reason": reason, "refresh_failed": bool(getattr(e, "refresh_failed", False))}
     finally:
         worker_run_context.run_id = previous_run_id
         if registrar is not None:

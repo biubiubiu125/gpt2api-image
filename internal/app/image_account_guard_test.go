@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newImageAccountGuardTestServer(t *testing.T) *Server {
@@ -226,6 +227,198 @@ func TestRegisterRemovalDeletesUnknownQuotaAccounts(t *testing.T) {
 	}
 }
 
+func TestCountAccountsForTokensUsesFinalPersistedAccounts(t *testing.T) {
+	accounts := []Account{{AccessToken: "kept"}, {AccessToken: "other"}}
+	got := countAccountsForTokens(accounts, []string{"kept", "removed"})
+	if got != 1 {
+		t.Fatalf("countAccountsForTokens = %d, want 1", got)
+	}
+}
+
+func TestCountValidatedAccountsForTokensRequiresUsableAccounts(t *testing.T) {
+	accounts := []Account{
+		{AccessToken: "usable", Status: accountStatusNormal, Quota: 10},
+		{AccessToken: "unknown", Status: accountStatusNormal, Quota: 10, ImageQuotaUnknown: true},
+		{AccessToken: "zero", Status: accountStatusNormal, Quota: 0},
+		{AccessToken: "pending", Status: accountStatusNormal, Quota: 10, PendingDelete: true},
+		{AccessToken: "disabled", Status: accountStatusDisabled, Quota: 10},
+	}
+	got := countValidatedAccountsForTokens(accounts, []string{"usable", "unknown", "zero", "pending", "disabled"})
+	if got != 1 {
+		t.Fatalf("countValidatedAccountsForTokens = %d, want 1", got)
+	}
+}
+
+func TestImportedAccountIsPendingRefreshValidation(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	records := map[string]map[string]any{
+		"tok": {"access_token": "tok", "status": accountStatusNormal, "quota": 100},
+	}
+	added, skipped, err := s.upsertAccountRecordsForRefresh(records, "web")
+	if err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	if added != 1 || skipped != 0 {
+		t.Fatalf("added=%d skipped=%d, want 1/0", added, skipped)
+	}
+	got := s.store.LoadAccounts()
+	if len(got) != 1 {
+		t.Fatalf("accounts = %#v, want one pending account", got)
+	}
+	if !got[0].ImageQuotaUnknown || !got[0].RefreshValidationPending || got[0].Quota != 0 {
+		t.Fatalf("imported account should wait for refresh validation, got %#v", got[0])
+	}
+}
+
+func TestPendingRefreshValidationSurvivesGlobalImageCleanup(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	if _, _, err := s.upsertAccountRecordsForRefresh(map[string]map[string]any{
+		"tok": {"access_token": "tok", "status": accountStatusNormal, "quota": 100},
+	}, "web"); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	if removed := s.cleanupUnusableImageAccounts(); removed != 0 {
+		t.Fatalf("pending refresh validation account should not be globally cleaned, removed=%d", removed)
+	}
+	got := s.store.LoadAccounts()
+	if len(got) != 1 || !got[0].RefreshValidationPending || !got[0].ImageQuotaUnknown || got[0].Quota != 0 {
+		t.Fatalf("pending refresh validation account should survive global cleanup, got %#v", got)
+	}
+
+	if removed := s.removeRegisterUnusableAccounts([]string{"tok"}, []map[string]any{{"token": "tok", "error": "refresh failed"}}); removed != 1 {
+		t.Fatalf("refresh cleanup should still remove pending invalid account, removed=%d", removed)
+	}
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("pending account should be removed after refresh failure, got %#v", got)
+	}
+}
+
+func TestStalePendingRefreshValidationIsGloballyCleaned(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	createdAt := time.Now().UTC().Add(-accountRefreshValidationGracePeriod - time.Minute).Format(time.RFC3339Nano)
+	if err := s.store.SaveAccounts([]Account{{
+		AccessToken:              "tok",
+		Status:                   accountStatusNormal,
+		ImageQuotaUnknown:        true,
+		RefreshValidationPending: true,
+		Quota:                    0,
+		CreatedAt:                &createdAt,
+	}}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+
+	if removed := s.cleanupUnusableImageAccounts(); removed != 1 {
+		t.Fatalf("stale pending refresh validation account should be cleaned, removed=%d", removed)
+	}
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("stale pending account should be removed, got %#v", got)
+	}
+}
+
+func TestExistingValidatedAccountKeepsRuntimeStateWhenReimported(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	limitedAt := "2026-01-01T00:00:00Z"
+	resetAt := "2026-01-01T01:00:00Z"
+	if err := s.store.SaveAccounts([]Account{{
+		AccessToken:       "tok",
+		Status:            accountStatusNormal,
+		Quota:             25,
+		InitialQuota:      50,
+		ImageQuotaUnknown: false,
+		LimitsProgress:    []map[string]any{{"feature_name": "images", "remaining": 25}},
+		RateLimitedAt:     &limitedAt,
+		RateLimitResetAt:  &resetAt,
+	}}); err != nil {
+		t.Fatalf("save existing account: %v", err)
+	}
+
+	added, skipped, err := s.upsertAccountRecordsForRefresh(map[string]map[string]any{
+		"tok": {"access_token": "tok", "status": accountStatusNormal, "quota": 100, "email": "updated@example.com"},
+	}, "web")
+	if err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	if added != 0 || skipped != 1 {
+		t.Fatalf("added=%d skipped=%d, want 0/1", added, skipped)
+	}
+	got := s.store.LoadAccounts()
+	if len(got) != 1 {
+		t.Fatalf("accounts = %#v, want one existing account", got)
+	}
+	if got[0].ImageQuotaUnknown || got[0].RefreshValidationPending || got[0].Quota != 25 || len(got[0].LimitsProgress) != 1 {
+		t.Fatalf("existing validated runtime state should be preserved before refresh, got %#v", got[0])
+	}
+	if got[0].Email == nil || *got[0].Email != "updated@example.com" {
+		t.Fatalf("account metadata should still be updated, got %#v", got[0].Email)
+	}
+
+	removed := s.removeRegisterUnusableAccounts([]string{"tok"}, []map[string]any{{"token": "tok", "error": "temporary refresh failed"}})
+	if removed != 0 {
+		t.Fatalf("existing validated account should not be removed on refresh error, removed=%d", removed)
+	}
+	if got := s.store.LoadAccounts(); len(got) != 1 || got[0].Quota != 25 || got[0].ImageQuotaUnknown || got[0].RefreshValidationPending {
+		t.Fatalf("existing validated account should survive refresh failure, got %#v", got)
+	}
+}
+
+func TestRefreshFailureRemovesImportedAccountWithStaleQuota(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	if _, _, err := s.upsertAccountRecordsForRefresh(map[string]map[string]any{
+		"tok": {"access_token": "tok", "status": accountStatusNormal, "quota": 100},
+	}, "web"); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	if got := s.store.LoadAccounts(); len(got) != 1 || !got[0].ImageQuotaUnknown || !got[0].RefreshValidationPending || got[0].Quota != 0 {
+		t.Fatalf("account should be pending validation before refresh, got %#v", got)
+	}
+
+	s.removeRegisterUnusableAccounts([]string{"tok"}, []map[string]any{{"token": "tok", "error": "refresh failed"}})
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("stale imported account should be removed after refresh failure, got %#v", got)
+	}
+}
+
+func TestRemoveRegisterUnusableAccountsReturnsActualRemovalCount(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	if err := s.store.SaveAccounts([]Account{{AccessToken: "tok", Status: accountStatusNormal, ImageQuotaUnknown: true, Quota: 0}}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+
+	removed := s.removeRegisterUnusableAccounts([]string{"tok"}, nil)
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("unusable account should be removed, got %#v", got)
+	}
+}
+
+func TestRefreshRemovalCountsSeparateTargetAndGlobalCleanup(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	if err := s.store.SaveAccounts([]Account{
+		{AccessToken: "target", Status: accountStatusNormal, Quota: 10},
+		{AccessToken: "stale", Status: accountStatusNormal, ImageQuotaUnknown: true, Quota: 0},
+	}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+
+	removed, cleanupRemoved := s.cleanupRefreshedAccountState([]string{"target"}, nil, false)
+	if removed != 0 {
+		t.Fatalf("target removed = %d, want 0", removed)
+	}
+	if cleanupRemoved != 1 {
+		t.Fatalf("cleanup removed = %d, want 1", cleanupRemoved)
+	}
+	got := s.store.LoadAccounts()
+	if len(got) != 1 {
+		t.Fatalf("accounts = %#v, want target account after stale cleanup", got)
+	}
+	if countAccountsForTokens(got, []string{"target"}) != 1 {
+		t.Fatalf("target account should survive global cleanup, got %#v", got)
+	}
+}
+
 func TestCodexAccountImportRequiresRefreshToken(t *testing.T) {
 	records := map[string]map[string]any{
 		"tok": {"access_token": "tok"},
@@ -290,7 +483,7 @@ func TestInternalRegisterAccountRecordsUseSharedCodexValidation(t *testing.T) {
 }
 
 func TestMergeRefreshedAccountInfoOverridesStaleKnownQuota(t *testing.T) {
-	account := Account{AccessToken: "tok", SourceType: "codex", Status: accountStatusNormal, Quota: 100, ImageQuotaUnknown: false}
+	account := Account{AccessToken: "tok", SourceType: "codex", Status: accountStatusNormal, Quota: 100, ImageQuotaUnknown: false, RefreshValidationPending: true}
 	mergeRefreshedAccountInfo(&account, Account{
 		AccessToken:       "new-token-ignored",
 		SourceType:        "web",
@@ -304,7 +497,7 @@ func TestMergeRefreshedAccountInfoOverridesStaleKnownQuota(t *testing.T) {
 	if account.SourceType != "codex" {
 		t.Fatalf("refresh merge should keep codex source type, got %q", account.SourceType)
 	}
-	if !account.ImageQuotaUnknown || account.Quota != 0 {
+	if !account.ImageQuotaUnknown || account.RefreshValidationPending || account.Quota != 0 {
 		t.Fatalf("refresh merge should overwrite stale quota with unknown state: %#v", account)
 	}
 

@@ -379,6 +379,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/image-tasks/generations", s.handleImageTaskGeneration)
 	s.mux.HandleFunc("/api/image-tasks/edits", s.handleImageTaskEdit)
 	s.mux.HandleFunc("/api/image-tasks/cancel", s.handleImageTaskCancel)
+	s.mux.HandleFunc("/api/chat/stream", s.handleChatStream)
 	s.mux.HandleFunc("/api/register", s.handleRegister)
 	s.mux.HandleFunc("/api/register/start", s.handleRegisterStart)
 	s.mux.HandleFunc("/api/register/stop", s.handleRegisterStop)

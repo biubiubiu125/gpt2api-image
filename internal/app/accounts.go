@@ -53,34 +53,24 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, msg)
 			return
 		}
-		added, skipped := 0, 0
-		if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
-			existing := map[string]int{}
-			for i, a := range accounts {
-				existing[a.AccessToken] = i
-			}
-			for token, rec := range tokset {
-				a := accountFromRecord(token, accountRecordSource(source, rec), rec)
-				if idx, ok := existing[token]; ok {
-					cur := accounts[idx]
-					mergeAccount(&cur, a)
-					accounts[idx] = cur
-					skipped++
-				} else {
-					accounts = append(accounts, a)
-					added++
-				}
-			}
-			return accounts
-		}); err != nil {
+		added, skipped, err := s.upsertAccountRecordsForRefresh(tokset, source)
+		if err != nil {
 			writeErr(w, 500, "failed to save accounts: "+err.Error())
 			return
 		}
 		tokens := keysOf(tokset)
-		refreshed, errs := s.refreshAccountInfos(r.Context(), tokens)
+		refreshed, errs, removedUnusable, cleanupRemoved := s.refreshAccountInfos(r.Context(), tokens, false)
 		accounts := s.store.LoadAccounts()
-		s.logSvc.add("account", "新增账号", map[string]any{"added": added, "skipped": skipped, "refreshed": refreshed, "emails": accountEmailsForTokens(accounts, tokens)})
-		writeJSON(w, 200, map[string]any{"added": added, "skipped": skipped, "refreshed": refreshed, "errors": errs, "items": accounts})
+		writeAttempted := added + skipped
+		saved := countAccountsForTokens(accounts, tokens)
+		validatedSaved := countValidatedAccountsForTokens(accounts, tokens)
+		refreshFailed := len(errs)
+		status := "ok"
+		if refreshFailed > 0 || validatedSaved < writeAttempted {
+			status = "partial"
+		}
+		s.logSvc.add("account", "新增账号", map[string]any{"added": added, "skipped": skipped, "write_attempted": writeAttempted, "saved": saved, "validated_saved": validatedSaved, "refreshed": refreshed, "refresh_failed": refreshFailed, "removed_unusable": removedUnusable, "cleanup_removed": cleanupRemoved, "emails": accountEmailsForTokens(accounts, tokens)})
+		writeJSON(w, 200, map[string]any{"status": status, "added": added, "skipped": skipped, "write_attempted": writeAttempted, "saved": saved, "validated_saved": validatedSaved, "refreshed": refreshed, "refresh_failed": refreshFailed, "removed_unusable": removedUnusable, "cleanup_removed": cleanupRemoved, "errors": errs, "items": accounts})
 	case http.MethodDelete:
 		var body struct {
 			Tokens          []string `json:"tokens"`
@@ -161,7 +151,7 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 		status = accountStatusNormal
 	}
 	now := nowISO()
-	a := Account{AccessToken: token, Type: typ, SourceType: source, Status: status, Quota: intAny(rec["quota"], 0), Success: intAny(rec["success"], 0), Fail: intAny(rec["fail"], 0), CreatedAt: &now, ImageQuotaUnknown: boolAny(rec["image_quota_unknown"], false)}
+	a := Account{AccessToken: token, Type: typ, SourceType: source, Status: status, Quota: intAny(rec["quota"], 0), Success: intAny(rec["success"], 0), Fail: intAny(rec["fail"], 0), CreatedAt: &now, ImageQuotaUnknown: boolAny(rec["image_quota_unknown"], false), RefreshValidationPending: boolAny(rec["refresh_validation_pending"], false)}
 	a.PendingDelete = boolAny(rec["pending_delete"], false)
 	if v := strings.TrimSpace(strAny(rec["delete_reason"], "")); v != "" {
 		a.DeleteReason = &v
@@ -274,6 +264,104 @@ func accountEmailsForTokenSet(accounts []Account, targets map[string]bool) []str
 	return out
 }
 
+func countAccountsForTokens(accounts []Account, tokens []string) int {
+	targets := map[string]bool{}
+	for _, token := range tokens {
+		if token = strings.TrimSpace(token); token != "" {
+			targets[token] = true
+		}
+	}
+	if len(targets) == 0 {
+		return 0
+	}
+	count := 0
+	for _, account := range accounts {
+		if targets[account.AccessToken] {
+			count++
+		}
+	}
+	return count
+}
+
+func countValidatedAccountsForTokens(accounts []Account, tokens []string) int {
+	targets := map[string]bool{}
+	for _, token := range tokens {
+		if token = strings.TrimSpace(token); token != "" {
+			targets[token] = true
+		}
+	}
+	if len(targets) == 0 {
+		return 0
+	}
+	count := 0
+	for _, account := range accounts {
+		if !targets[account.AccessToken] {
+			continue
+		}
+		if !isAccountStatus(account.Status, accountStatusNormal) || account.PendingDelete || account.ImageQuotaUnknown || account.Quota <= 0 {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func markAccountPendingRefreshValidation(account *Account) {
+	account.ImageQuotaUnknown = true
+	account.RefreshValidationPending = true
+	account.Quota = 0
+	account.LimitsProgress = nil
+	if account.CreatedAt == nil || strings.TrimSpace(*account.CreatedAt) == "" {
+		now := nowISO()
+		account.CreatedAt = &now
+	}
+}
+
+func preserveValidatedAccountRuntimeState(dst *Account, previous Account) {
+	if previous.ImageQuotaUnknown || previous.Quota <= 0 {
+		return
+	}
+	dst.Status = previous.Status
+	dst.Quota = previous.Quota
+	dst.InitialQuota = previous.InitialQuota
+	dst.ImageQuotaUnknown = previous.ImageQuotaUnknown
+	dst.RefreshValidationPending = previous.RefreshValidationPending
+	dst.LimitsProgress = previous.LimitsProgress
+	dst.RestoreAt = previous.RestoreAt
+	dst.RateLimitedAt = previous.RateLimitedAt
+	dst.RateLimitResetAt = previous.RateLimitResetAt
+	dst.PendingDelete = previous.PendingDelete
+	dst.DeleteReason = previous.DeleteReason
+	dst.DeleteMarkedAt = previous.DeleteMarkedAt
+}
+
+func (s *Server) upsertAccountRecordsForRefresh(tokset map[string]map[string]any, defaultSource string) (int, int, error) {
+	added, skipped := 0, 0
+	err := s.store.UpdateAccounts(func(accounts []Account) []Account {
+		existing := map[string]int{}
+		for i, a := range accounts {
+			existing[a.AccessToken] = i
+		}
+		for token, rec := range tokset {
+			a := accountFromRecord(token, accountRecordSource(defaultSource, rec), rec)
+			markAccountPendingRefreshValidation(&a)
+			if idx, ok := existing[token]; ok {
+				cur := accounts[idx]
+				previous := cur
+				mergeAccount(&cur, a)
+				preserveValidatedAccountRuntimeState(&cur, previous)
+				accounts[idx] = cur
+				skipped++
+			} else {
+				accounts = append(accounts, a)
+				added++
+			}
+		}
+		return accounts
+	})
+	return added, skipped, err
+}
+
 func mergeAccount(dst *Account, src Account) {
 	if src.Type != "" {
 		dst.Type = src.Type
@@ -286,6 +374,9 @@ func mergeAccount(dst *Account, src Account) {
 	}
 	if src.PendingDelete {
 		dst.PendingDelete = true
+	}
+	if src.RefreshValidationPending {
+		dst.RefreshValidationPending = true
 	}
 	if src.DeleteReason != nil {
 		dst.DeleteReason = src.DeleteReason
@@ -360,6 +451,7 @@ func mergeRefreshedAccountInfo(dst *Account, src Account) {
 		dst.SourceType = sourceType
 	}
 	dst.ImageQuotaUnknown = src.ImageQuotaUnknown
+	dst.RefreshValidationPending = false
 	dst.Quota = src.Quota
 	dst.LimitsProgress = src.LimitsProgress
 	if dst.InitialQuota < dst.Quota {
@@ -367,7 +459,7 @@ func mergeRefreshedAccountInfo(dst *Account, src Account) {
 	}
 }
 
-func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (int, []map[string]any) {
+func (s *Server) refreshAccountInfos(parent context.Context, tokens []string, deferInvalidRemoval ...bool) (int, []map[string]any, int, int) {
 	want := map[string]bool{}
 	for _, t := range tokens {
 		if strings.TrimSpace(t) != "" {
@@ -419,8 +511,18 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string) (i
 			refreshed = len(updates)
 		}
 	}
-	s.cleanupUnusableImageAccounts()
-	return refreshed, errs
+	deferRemoval := len(deferInvalidRemoval) > 0 && deferInvalidRemoval[0]
+	removed, cleanupRemoved := s.cleanupRefreshedAccountState(tokens, errs, deferRemoval)
+	return refreshed, errs, removed, cleanupRemoved
+}
+
+func (s *Server) cleanupRefreshedAccountState(tokens []string, errs []map[string]any, deferRemoval bool) (int, int) {
+	if deferRemoval {
+		return 0, 0
+	}
+	removed := s.removeRegisterUnusableAccounts(tokens, errs)
+	cleanupRemoved := s.cleanupUnusableImageAccounts()
+	return removed, cleanupRemoved
 }
 
 func (s *Server) handleAccountsRefresh(w http.ResponseWriter, r *http.Request) {
@@ -450,12 +552,12 @@ func (s *Server) handleAccountsRefresh(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	before := s.store.LoadAccounts()
-	refreshed, errs := s.refreshAccountInfos(r.Context(), tokens)
+	refreshed, errs, removedUnusable, cleanupRemoved := s.refreshAccountInfos(r.Context(), tokens)
 	accounts := s.store.LoadAccounts()
 	if s.logSvc != nil {
-		s.logSvc.add("account", "刷新账号", map[string]any{"refreshed": refreshed, "errors": len(errs), "emails": accountEmailsForRefreshLog(before, accounts, tokens)})
+		s.logSvc.add("account", "刷新账号", map[string]any{"refreshed": refreshed, "errors": len(errs), "removed_unusable": removedUnusable, "cleanup_removed": cleanupRemoved, "emails": accountEmailsForRefreshLog(before, accounts, tokens)})
 	}
-	writeJSON(w, 200, map[string]any{"refreshed": refreshed, "errors": errs, "items": accounts})
+	writeJSON(w, 200, map[string]any{"refreshed": refreshed, "errors": errs, "removed_unusable": removedUnusable, "cleanup_removed": cleanupRemoved, "items": accounts})
 }
 
 func accountEmailsForRefreshLog(before, after []Account, tokens []string) []string {

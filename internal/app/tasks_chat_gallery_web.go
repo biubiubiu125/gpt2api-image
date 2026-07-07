@@ -1280,14 +1280,15 @@ func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, i
 		writeErr(w, 403, err.Error())
 		return
 	}
-	if s.taskStore != nil {
+	clientTaskID := strings.TrimSpace(strAny(b["client_task_id"], strAny(b["task_id"], "")))
+	if s.taskStore != nil && clientTaskID != "" {
 		refs := extractChatImages(b)
 		mode := "generate"
 		if len(refs) > 0 {
 			mode = "edit"
 		}
 		task, _, err := s.createDBImageTask(r.Context(), id, imageTaskCreateRequest{
-			ClientTaskID:   strAny(b["client_task_id"], strAny(b["task_id"], "")),
+			ClientTaskID:   clientTaskID,
 			Mode:           mode,
 			Prompt:         prompt,
 			Model:          model,
@@ -1312,7 +1313,7 @@ func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, i
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.imageRequestTimeout())
 	defer cancel()
-	items, err := s.generateImageWithPool(ctx, prompt, model, strAny(b["size"], ""), strAny(b["resolution"], ""), extractChatImages(b))
+	items, err := s.generateImagesWithPool(ctx, prompt, model, strAny(b["size"], ""), strAny(b["resolution"], ""), extractChatImages(b), 1)
 	w.Header().Set("Content-Type", "text/event-stream")
 	cid := "conv_" + randID(8)
 	if err != nil {

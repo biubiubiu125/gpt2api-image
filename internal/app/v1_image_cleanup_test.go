@@ -180,6 +180,54 @@ func TestImageStorageLimitDeletesOldestManagedImages(t *testing.T) {
 	}
 }
 
+func TestImageStorageLimitProtectsUserOwnedImagesWhenConfigured(t *testing.T) {
+	s, _ := newV1ImageCleanupTestServer(t)
+	s.cfg.ImageMaxStorageMB = 1
+	s.cfg.CleanupProtectUserImages = true
+	userRel := "2026/07/01/user-old.png"
+	adminRel := "2026/07/01/admin-new.png"
+	base := time.Now().Add(-2 * time.Hour)
+	for i, rel := range []string{userRel, adminRel} {
+		path, err := s.imagePath(rel)
+		if err != nil {
+			t.Fatalf("image path: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("mkdir image dir: %v", err)
+		}
+		if err := os.WriteFile(path, make([]byte, 700*1024), 0644); err != nil {
+			t.Fatalf("write image: %v", err)
+		}
+		createdAt := base.Add(time.Duration(i) * time.Hour)
+		if err := os.Chtimes(path, createdAt, createdAt); err != nil {
+			t.Fatalf("chtimes image: %v", err)
+		}
+	}
+	if err := s.store.UpdateOwners(func(owners map[string]string) map[string]string {
+		owners[userRel] = "user-key"
+		owners[adminRel] = "admin"
+		return owners
+	}); err != nil {
+		t.Fatalf("update owners: %v", err)
+	}
+
+	removed := s.cleanupImageStorageLimit()
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	userPath, _ := s.imagePath(userRel)
+	if _, err := os.Stat(userPath); err != nil {
+		t.Fatalf("user image should be protected: %v", err)
+	}
+	adminPath, _ := s.imagePath(adminRel)
+	if _, err := os.Stat(adminPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("admin image should be removed, stat err=%v", err)
+	}
+	if _, ok := s.store.LoadOwners()[adminRel]; ok {
+		t.Fatalf("admin owner metadata still exists")
+	}
+}
+
 func TestImageStorageLimitProtectsCurrentSavedImages(t *testing.T) {
 	s, _ := newV1ImageCleanupTestServer(t)
 	s.cfg.ImageMaxStorageMB = 1

@@ -177,6 +177,7 @@ def _default_config() -> dict:
             "done": 0,
             "saved": 0,
             "refresh_failed": 0,
+            "token_acquired_refresh_failed": 0,
             "running": 0,
             "threads": openai_register.config["threads"],
             "elapsed_seconds": 0,
@@ -485,6 +486,7 @@ class RegisterService:
                 "done": 0,
                 "saved": 0,
                 "refresh_failed": 0,
+                "token_acquired_refresh_failed": 0,
                 "running": 1,
                 "threads": 1,
                 "failure_reasons": {},
@@ -570,6 +572,7 @@ class RegisterService:
                 "done": 0,
                 "saved": 0,
                 "refresh_failed": 0,
+                "token_acquired_refresh_failed": 0,
                 "running": 0,
                 "threads": run_config["threads"],
                 "failure_reasons": {},
@@ -584,7 +587,7 @@ class RegisterService:
             }
             self._sync_openai_register_config(run_config)
             with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "start_time": time.time()})
+                openai_register.stats.update({"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "token_acquired_refresh_failed": 0, "start_time": time.time()})
             self._save()
             openai_register.set_active_run_id(job_id)
             self._runner = threading.Thread(target=self._run, args=(run_config, trigger, self._stop_event, job_id), daemon=True, name="openai-register")
@@ -633,9 +636,9 @@ class RegisterService:
         with self._lock:
             self._require_idle_locked("resetting stats")
             self._logs = []
-            self._config["stats"] = {"success": 0, "usable_success": 0, "fail": 0, "done": 0, "saved": 0, "refresh_failed": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "failure_reasons": {}, **self._pool_metrics(), "updated_at": _now()}
+            self._config["stats"] = {"success": 0, "usable_success": 0, "fail": 0, "done": 0, "saved": 0, "refresh_failed": 0, "token_acquired_refresh_failed": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "failure_reasons": {}, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "start_time": 0.0})
+                openai_register.stats.update({"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "token_acquired_refresh_failed": 0, "start_time": 0.0})
             self._save()
             return self.get()
 
@@ -862,7 +865,7 @@ class RegisterService:
         base_config = dict(run_config or self.get(redact=False))
         threads = int(base_config["threads"])
         submitted, done, success, usable_success, fail = 0, 0, 0, 0, 0
-        saved, refresh_failed = 0, 0
+        saved, refresh_failed, token_acquired_refresh_failed = 0, 0, 0
         failure_reasons: dict[str, int] = {}
         stall_logged = False
         shutdown_requested = False
@@ -872,9 +875,11 @@ class RegisterService:
         shutdown_wait = True
 
         def record_worker_result(result: dict) -> None:
-            nonlocal success, usable_success, fail, saved, refresh_failed
+            nonlocal success, usable_success, fail, saved, refresh_failed, token_acquired_refresh_failed
             if result.get("refresh_failed"):
                 refresh_failed += 1
+            if result.get("token_acquired") and result.get("refresh_failed"):
+                token_acquired_refresh_failed += 1
             if result.get("ok"):
                 success += 1
                 if result.get("usable"):
@@ -911,7 +916,7 @@ class RegisterService:
                             f"注册任务已停止，已取消未开始任务 {cancelled_count} 个，等待运行中任务完成清理",
                             "yellow",
                         )
-                        self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons))
+                        self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons))
                     if not futures:
                         break
                 stalled_workers = [] if shutdown_requested else self._stalling_worker_states(int(cfg.get("task_stall_timeout_seconds") or 0))
@@ -939,7 +944,7 @@ class RegisterService:
                             "red",
                         )
                         stall_logged = True
-                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons))
+                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons))
                     if not futures:
                         break
                 while (
@@ -951,7 +956,7 @@ class RegisterService:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted, stop_event, None, cfg.get("task_timeout_seconds"), run_id))
                     self._set_active_futures(futures)
-                self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons))
+                self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons))
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break
                 if not futures:
@@ -962,7 +967,7 @@ class RegisterService:
                     continue
                 finished, futures = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
                 if not finished:
-                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons))
+                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons))
                     continue
                 for future in finished:
                     done += 1
@@ -976,7 +981,7 @@ class RegisterService:
             self._set_active_futures(set())
             executor.shutdown(wait=shutdown_wait, cancel_futures=True)
             openai_register.clear_active_run_id(run_id)
-        self._bump(running=0, done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, failure_reasons=dict(failure_reasons), finished_at=_now())
+        self._bump(running=0, done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons), finished_at=_now())
         with self._lock:
             self._config["enabled"] = False
             if self._stop_event is stop_event:

@@ -35,6 +35,8 @@ def classify_register_failure(error: object) -> str:
         or "account_delete_failed" in text
     ):
         return "account_delete_failed"
+    if "token_acquired_refresh_failed" in text:
+        return "token_acquired_refresh_failed"
     if "registered_account_refresh_failed" in text or "account_refresh_failed" in text or "/backend-api/me" in text:
         return "account_refresh_failed"
     if "registered_account_unusable" in text or "unusable_after_refresh" in text:

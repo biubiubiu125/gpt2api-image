@@ -7,7 +7,7 @@ set -euo pipefail
 #   - Detect current OS/ARCH.
 #   - Download latest GitHub Release archive.
 #   - Install to ./gpt2api-image-install unless --dir is specified.
-#   - Preserve existing config.json and data/ when updating.
+#   - Preserve existing data/config.json, legacy config.json, and data/ when updating.
 #   - If Release asset is unavailable, use --from-source to build from source.
 #
 # Examples:
@@ -46,7 +46,7 @@ Environment:
   GPT2API_IMAGE_INSTALL_PORT   Same as --port.
 
 Notes:
-  - Existing config.json and data/ are preserved during update.
+  - Existing data/config.json, legacy config.json, and data/ are preserved during update.
   - Release mode expects assets named like gpt2api-image-linux-amd64.tar.gz.
   - Source mode requires git, go, and optionally npm/node for --web.
 EOF
@@ -117,16 +117,19 @@ backup_existing_state() {
 
 restore_existing_state() {
   local backup_dir="$1"
-  if [[ -f "$backup_dir/config.json" ]]; then
-    cp "$backup_dir/config.json" "$INSTALL_DIR/config.json"
-  elif [[ ! -f "$INSTALL_DIR/config.json" && -f "$INSTALL_DIR/config.example.json" ]]; then
-    cp "$INSTALL_DIR/config.example.json" "$INSTALL_DIR/config.json"
-  fi
   if [[ -d "$backup_dir/data" ]]; then
     rm -rf "$INSTALL_DIR/data"
     cp -a "$backup_dir/data" "$INSTALL_DIR/data"
   else
     mkdir -p "$INSTALL_DIR/data"
+  fi
+  if [[ -f "$backup_dir/config.json" ]]; then
+    cp "$backup_dir/config.json" "$INSTALL_DIR/config.json"
+    if [[ ! -f "$INSTALL_DIR/data/config.json" ]]; then
+      cp "$backup_dir/config.json" "$INSTALL_DIR/data/config.json"
+    fi
+  elif [[ ! -f "$INSTALL_DIR/data/config.json" && -f "$INSTALL_DIR/config.example.json" ]]; then
+    cp "$INSTALL_DIR/config.example.json" "$INSTALL_DIR/data/config.json"
   fi
 }
 
@@ -242,10 +245,10 @@ main() {
   fi
 
   log "Install/update complete"
-  if [[ -f "$INSTALL_DIR/config.json" ]]; then
-    log "Config: $INSTALL_DIR/config.json"
+  if [[ -f "$INSTALL_DIR/data/config.json" ]]; then
+    log "Config: $INSTALL_DIR/data/config.json"
   else
-    warn "config.json was not created; please create it before starting"
+    warn "data/config.json was not created; please create it before starting"
   fi
   log "Data dir: $INSTALL_DIR/data"
   log "Run: cd '$INSTALL_DIR' && ./start.sh --port '$PORT'"

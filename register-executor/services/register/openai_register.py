@@ -27,6 +27,10 @@ class RegisteredAccountValidationError(RuntimeError):
     pass
 
 
+class RegisteredTokenAcquiredRefreshError(RegisteredAccountValidationError):
+    pass
+
+
 def _int_or_default(value: object, default: int) -> int:
     try:
         return int(value)
@@ -65,15 +69,31 @@ def _refresh_failed_validation_error(access_token: str, refresh_error: object) -
     try:
         _delete_saved_account_or_raise(access_token)
     except Exception as cleanup_exc:
-        err = RegisteredAccountValidationError(
+        err = RegisteredTokenAcquiredRefreshError(
             f"registered_account_refresh_failed: {refresh_error}; registered_account_delete_failed: {cleanup_exc}"
         )
         err.refresh_failed = True
+        err.token_acquired = True
         err.failure_reason = "account_delete_failed"
         return err, False
-    err = RegisteredAccountValidationError(f"registered_account_refresh_failed: {refresh_error}")
+    err = RegisteredTokenAcquiredRefreshError(f"registered_account_refresh_failed: {refresh_error}")
     err.refresh_failed = True
+    err.token_acquired = True
+    err.failure_reason = "token_acquired_refresh_failed"
     return err, True
+
+
+def _require_register_tokens(tokens: dict | None) -> dict:
+    if not isinstance(tokens, dict):
+        raise RuntimeError("token_exchange_failed: token response is empty")
+    missing = [
+        key
+        for key in ("access_token", "refresh_token", "id_token")
+        if not str(tokens.get(key) or "").strip()
+    ]
+    if missing:
+        raise RuntimeError(f"token_exchange_failed: missing {', '.join(missing)}")
+    return tokens
 
 
 base_dir = Path(__file__).resolve().parent
@@ -115,7 +135,7 @@ sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0
 default_timeout = 30
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
-stats = {"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "start_time": 0.0}
+stats = {"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "token_acquired_refresh_failed": 0, "start_time": 0.0}
 register_log_sink = None
 worker_state_lock = threading.Lock()
 worker_states: dict[str, dict[str, Any]] = {}
@@ -1408,6 +1428,7 @@ def worker(
         _check_run_active(run_id)
         registrar = PlatformRegistrar(selection.proxy, stop_event=stop_event, deadline=deadline)
         result = registrar.register(index)
+        result = _require_register_tokens(result)
         _check_task_control(stop_event, deadline)
         _check_run_active(run_id)
         if selection.bind_to_account and selection.proxy:
@@ -1503,7 +1524,7 @@ def worker(
             stats["fail"] += 1
         _set_worker_state(index, status="failed", elapsed_seconds=round(cost, 1), last_error=str(e), failure_reason=reason)
         log(f"任务{index} 注册失败，耗时 {cost:.1f}s，原因={reason}，错误：{e}", "red")
-        return {"ok": False, "index": index, "error": str(e), "reason": reason, "refresh_failed": bool(getattr(e, "refresh_failed", False))}
+        return {"ok": False, "index": index, "error": str(e), "reason": reason, "refresh_failed": bool(getattr(e, "refresh_failed", False)), "token_acquired": bool(getattr(e, "token_acquired", False))}
     finally:
         worker_run_context.run_id = previous_run_id
         if registrar is not None:

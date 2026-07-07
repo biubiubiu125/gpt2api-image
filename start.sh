@@ -105,6 +105,18 @@ if $BUILD_FRONTEND; then
 fi
 
 # ---------- 环境变量 ----------
+mkdir -p "$SCRIPT_DIR/data"
+if [ -z "${GPT2API_IMAGE_CONFIG_FILE:-}" ]; then
+    export GPT2API_IMAGE_CONFIG_FILE="$SCRIPT_DIR/data/config.json"
+fi
+if [ ! -f "$GPT2API_IMAGE_CONFIG_FILE" ]; then
+    mkdir -p "$(dirname "$GPT2API_IMAGE_CONFIG_FILE")"
+    if [ -f "$SCRIPT_DIR/config.json" ]; then
+        cp "$SCRIPT_DIR/config.json" "$GPT2API_IMAGE_CONFIG_FILE"
+    elif [ -f "$SCRIPT_DIR/config.example.json" ]; then
+        cp "$SCRIPT_DIR/config.example.json" "$GPT2API_IMAGE_CONFIG_FILE"
+    fi
+fi
 export GPT2API_IMAGE_ADDR=":$PORT"
 export GPT2API_IMAGE_UPSTREAM_TRANSPORT="$TRANSPORT"
 export GPT2API_IMAGE_MODE="$MODE"
@@ -130,6 +142,7 @@ echo ">>> 管理面板: http://127.0.0.1:$PORT"
 echo ">>> API 地址: http://127.0.0.1:$PORT/v1"
 echo ">>> 运行模式: $MODE"
 echo ">>> 停止方式: Ctrl+C"
+echo ">>> Config file: $GPT2API_IMAGE_CONFIG_FILE"
 echo ""
 
 exec "$BIN" "$MODE"

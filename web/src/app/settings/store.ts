@@ -74,6 +74,7 @@ function normalizeRegister(config: RegisterConfig): RegisterConfig {
       done: Number(config.stats?.done || 0),
       saved: Number(config.stats?.saved || 0),
       refresh_failed: Number(config.stats?.refresh_failed || 0),
+      token_acquired_refresh_failed: Number(config.stats?.token_acquired_refresh_failed || 0),
       running: Number(config.stats?.running || 0),
       threads: Number(config.stats?.threads || config.threads || 1),
       failure_reasons: config.stats?.failure_reasons || {},

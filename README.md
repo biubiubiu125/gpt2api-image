@@ -62,8 +62,9 @@ data/logs.jsonl              JSONL 日志
 
 ## 服务器部署
 
-推荐使用 Docker Compose。生产形态会启动 4 个服务：
+推荐使用 Docker Compose。生产形态会启动 4 个常驻服务，并在启动前运行 1 个一次性迁移服务：
 
+- `config-migrate`：一次性初始化或迁移 `data/config.json`
 - `postgres`：PostgreSQL 任务队列
 - `api`：Go HTTP API 和管理后台
 - `worker`：后台图片任务 Worker
@@ -74,11 +75,12 @@ data/logs.jsonl              JSONL 日志
 ```bash
 cd /opt/gpt2api-image
 cp .env.example .env
-cp config.example.json config.json
+mkdir -p data
+cp config.example.json data/config.json
 
 openssl rand -hex 32
 nano .env
-nano config.json
+nano data/config.json
 ```
 
 `.env` 至少设置：
@@ -95,6 +97,7 @@ GPT2API_IMAGE_BASE_URL=https://your-api.example.com
 - `GPT2API_IMAGE_AUTH_KEY` 是管理后台和根 API 密钥，不能留空，也不能使用默认占位值。
 - `GPT2API_IMAGE_BASE_URL` 用于 Worker 返回图片 URL，生产环境要填外部可访问域名。
 - `GPT2API_IMAGE_REGISTER_INTERNAL_KEY` 是 API 和注册执行器内部通信密钥，启用注册执行器时必填，且不要复用 `GPT2API_IMAGE_AUTH_KEY`。
+- `data/config.json` 是后台设置页保存的配置文件。旧部署根目录下的 `config.json` 只作为迁移来源，不再作为 Compose 的运行挂载。
 - 反向代理只需要转发到 API 暴露端口，注册执行器不要直接暴露到公网。
 
 ### 2. 启动
@@ -124,7 +127,7 @@ docker compose logs -f api worker register-executor
 `data/` 和 PostgreSQL volume 会被保留。更新前建议备份：
 
 ```bash
-tar -czf backup-data-$(date +%F-%H%M%S).tar.gz data config.json .env
+tar -czf backup-data-$(date +%F-%H%M%S).tar.gz data .env
 docker compose exec postgres pg_dump -U gpt2api_image gpt2api_image > backup-db-$(date +%F-%H%M%S).sql
 ```
 
@@ -153,7 +156,8 @@ docker compose up -d
 ### Go API
 
 ```bash
-cp config.example.json config.json
+mkdir -p data
+cp config.example.json data/config.json
 export GPT2API_IMAGE_AUTH_KEY="$(openssl rand -hex 32)"
 export GPT2API_IMAGE_ADDR=":3000"
 go run ./cmd/server serve
@@ -209,8 +213,16 @@ python app.py
 配置优先级：
 
 1. 环境变量
-2. `config.json`
-3. 代码默认值
+2. `GPT2API_IMAGE_CONFIG_FILE` 指向的 JSON 文件
+3. `data/config.json`
+4. 兼容旧路径 `config.json`
+5. 代码默认值
+
+默认配置文件是 `data/config.json`。如果设置了 `GPT2API_IMAGE_CONFIG_FILE`，服务会从该路径读取并把后台设置保存回该路径；相对路径按项目根目录解析。
+
+Compose 默认将 `GPT2API_IMAGE_CONFIG_FILE` 设置为 `/app/data/config.json`，并通过 `config-migrate` 在 `data/config.json` 不存在时从旧 `config.json` 或 `config.example.json` 初始化。
+
+直接运行 `start.sh` 时也会自动初始化 `data/config.json`；如果自定义了 `GPT2API_IMAGE_CONFIG_FILE`，脚本会先创建目标目录再复制配置模板。
 
 常用环境变量：
 
@@ -219,6 +231,7 @@ python app.py
 | `GPT2API_IMAGE_AUTH_KEY` | 管理后台和根 API 密钥 |
 | `GPT2API_IMAGE_ADDR` | HTTP 监听地址，默认 `:3000`，Compose 内为 `:80` |
 | `GPT2API_IMAGE_MODE` | 运行模式：`serve`、`worker`、`all` |
+| `GPT2API_IMAGE_CONFIG_FILE` | 配置 JSON 文件路径，默认 `data/config.json` |
 | `GPT2API_IMAGE_DATABASE_URL` | PostgreSQL 连接串，启用 DB 任务队列 |
 | `GPT2API_IMAGE_BASE_URL` | 返回图片 URL 的外部基准地址 |
 | `GPT2API_IMAGE_REGISTER_EXECUTOR_URL` | API 调用注册执行器的地址 |
@@ -234,7 +247,7 @@ python app.py
 | `POSTGRES_PASSWORD` | Compose 内 PostgreSQL 密码 |
 | `TZ` | 容器时区，默认 `Asia/Shanghai` |
 
-`config.json` 常用字段：
+`data/config.json` 常用字段：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -257,6 +270,8 @@ python app.py
 | `global_system_prompt` | 全局提示词 |
 | `cors_allowed_origins` | CORS 白名单 |
 | `log_request_text` | 是否记录请求 prompt |
+
+兼容旧部署：如果服务器根目录仍有旧版 `config.json`，Docker 启动时会由 `config-migrate` 服务在 `data/config.json` 不存在时自动迁移；没有旧配置时会用 `config.example.json` 初始化。后台设置之后只写 `data/config.json`。
 
 ## API
 
@@ -283,7 +298,8 @@ x-api-key: <key>
 | `POST /api/accounts/refresh` | 刷新账号信息 |
 | `GET/POST /api/settings` | 读取和保存设置 |
 | `GET /api/images` | 图片管理列表 |
-| `DELETE /api/images/delete` | 删除图片 |
+| `POST /api/images/delete` | 删除图片 |
+| `POST /api/images/download` | 打包下载图片 |
 | `GET /api/image-tasks` | 图片任务列表 |
 | `POST /api/image-tasks/generations` | 创建异步文生图任务 |
 | `POST /api/image-tasks/edits` | 创建异步编辑任务 |
@@ -315,7 +331,7 @@ x-api-key: <key>
 2. 写入 `data/accounts.json`
 3. 立即刷新导入账号
 4. 刷新失败、额度未知、额度为 0、状态不可用或被标记删除时，按无效账号清理逻辑处理
-5. 响应返回 `status`、`added`、`skipped`、`saved`、`refreshed`、`refresh_failed`、`errors`、`items`
+5. 响应返回 `status`、`added`、`skipped`、`write_attempted`、`saved`、`validated_saved`、`refreshed`、`refresh_failed`、`removed_unusable`、`cleanup_removed`、`errors`、`items`
 
 示例：
 
@@ -351,11 +367,12 @@ curl -sS http://127.0.0.1:3000/api/accounts \
 
 当前注册闭环规则：
 
-- 注册成功后先写入账号，再立即调用 API 刷新账号信息。
+- 注册流程必须拿到 `access_token`、`refresh_token`、`id_token` 三件套；缺任意 token 会按 `token_exchange_failed` 失败，不写入账号。
+- 注册成功拿到 token 后先写入账号，再立即调用 API 刷新账号信息。
 - 只有刷新成功、读回状态正常、额度已知且额度大于 0 的账号才计入 `usable_success`。
 - 刷新失败、刷新返回错误、读回不可用、额度未知、额度为 0 或状态异常时，会删除刚写入账号并计失败。
 - 不保留不可用注册结果；注册机账号成本低，运营口径以“可用账号数”和“可用额度”为准。
-- `refresh_failed` 统计刷新失败次数，`failure_reasons` 统计失败原因。
+- `refresh_failed` 统计刷新失败次数，`token_acquired_refresh_failed` 统计已拿到 token 但保存后刷新失败的次数，`failure_reasons` 统计失败原因。
 - `/api/register/events` 提供 SSE 实时状态，前端注册页面会持续显示运行状态和日志。
 
 注册机常用操作：
@@ -494,7 +511,7 @@ curl -sS http://127.0.0.1:3000/api/system/status \
 
 常见问题：
 
-- 启动时报 `auth-key 未设置`：设置 `GPT2API_IMAGE_AUTH_KEY` 或修改 `config.json` 的 `auth-key`。
+- 启动时报 `auth-key 未设置`：设置 `GPT2API_IMAGE_AUTH_KEY` 或修改 `data/config.json` 的 `auth-key`。
 - 注册执行器代理返回 `register_internal_key is required`：设置 `GPT2API_IMAGE_REGISTER_INTERNAL_KEY`，并保证 API 与注册执行器使用同一个内部密钥。
 - Worker 启动失败：确认 `GPT2API_IMAGE_DATABASE_URL` 和 `GPT2API_IMAGE_BASE_URL` 已设置。
 - 返回图片 URL 不对：检查 `GPT2API_IMAGE_BASE_URL` 是否是外部访问域名。
@@ -506,7 +523,7 @@ curl -sS http://127.0.0.1:3000/api/system/status \
 
 ## 安全
 
-- 不要提交 `.env`、`config.json`、`data/`、日志、导出账号、密钥或令牌。
+- 不要提交 `.env`、`data/config.json`、`data/`、日志、导出账号、密钥或令牌。
 - `GPT2API_IMAGE_AUTH_KEY`、注册机内部密钥、邮箱服务密钥和账号 token 必须保存在服务器配置中。
 - 注册执行器不要直接暴露公网，只允许 API 容器或内网访问。
 - 默认关闭 `GPT2API_IMAGE_LOG_REQUEST_TEXT`，只有排障时再临时开启。

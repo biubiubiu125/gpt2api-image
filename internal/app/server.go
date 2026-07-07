@@ -20,6 +20,7 @@ const (
 
 type Server struct {
 	root             string
+	configFile       string
 	dataDir          string
 	imagesDir        string
 	webDist          string
@@ -50,7 +51,8 @@ func NewServer(root string) (*Server, error) {
 
 func newServer(root string, startWatcher bool) (*Server, error) {
 	root, _ = filepath.Abs(root)
-	cfg, err := loadConfig(filepath.Join(root, "config.json"))
+	configFile := resolveConfigPath(root)
+	cfg, err := loadConfig(configFile)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +87,7 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 		return nil, errors.New("auth-key 未设置")
 	}
 	if isUnsafeDefaultAuthKey(cfg.AuthKey) {
-		return nil, errors.New("auth-key 不能使用默认占位值，请设置 GPT2API_IMAGE_AUTH_KEY 或修改 config.json")
+		return nil, errors.New("auth-key 不能使用默认占位值，请设置 GPT2API_IMAGE_AUTH_KEY 或修改 data/config.json")
 	}
 	if cfg.RefreshAccountIntervalMinute <= 0 {
 		cfg.RefreshAccountIntervalMinute = 60
@@ -122,7 +124,7 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 	}
 	cfg.UpstreamTransport = normalizeUpstreamTransport(cfg.UpstreamTransport)
 	cfg.ImageRouteStrategy = normalizeImageRouteStrategy(cfg.ImageRouteStrategy)
-	s := &Server{root: root, dataDir: filepath.Join(root, "data"), imagesDir: filepath.Join(root, "data", "images"), webDist: filepath.Join(root, "web_dist"), cfg: cfg, callStarts: map[string]time.Time{}, callDetails: map[string]map[string]any{}, taskCancels: map[string]context.CancelFunc{}, accountPool: newAccountPool(&cfg)}
+	s := &Server{root: root, configFile: configFile, dataDir: filepath.Join(root, "data"), imagesDir: filepath.Join(root, "data", "images"), webDist: filepath.Join(root, "web_dist"), cfg: cfg, callStarts: map[string]time.Time{}, callDetails: map[string]map[string]any{}, taskCancels: map[string]context.CancelFunc{}, accountPool: newAccountPool(&cfg)}
 	if err := os.MkdirAll(s.imagesDir, 0755); err != nil {
 		return nil, err
 	}
@@ -143,6 +145,24 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 		s.startLimitedAccountWatcher()
 	}
 	return s, nil
+}
+
+func resolveConfigPath(root string) string {
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_CONFIG_FILE")); env != "" {
+		if filepath.IsAbs(env) {
+			return env
+		}
+		return filepath.Join(root, env)
+	}
+	dataConfig := filepath.Join(root, "data", "config.json")
+	if _, err := os.Stat(dataConfig); err == nil {
+		return dataConfig
+	}
+	legacyConfig := filepath.Join(root, "config.json")
+	if _, err := os.Stat(legacyConfig); err == nil {
+		return legacyConfig
+	}
+	return dataConfig
 }
 
 func isUnsafeDefaultAuthKey(value string) bool {
@@ -193,7 +213,11 @@ func (s *Server) saveConfig() error {
 
 func (s *Server) saveConfigValue(cfg Config) error {
 	m := configMapFrom(cfg, true)
-	return writeJSONFile(filepath.Join(s.root, "config.json"), m)
+	configFile := s.configFile
+	if strings.TrimSpace(configFile) == "" {
+		configFile = resolveConfigPath(s.root)
+	}
+	return writeJSONFile(configFile, m)
 }
 
 func (s *Server) configMap(includeAuth bool) map[string]any {

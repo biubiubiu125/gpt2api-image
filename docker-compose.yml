@@ -1,4 +1,24 @@
 services:
+  config-migrate:
+    image: alpine:3.20
+    container_name: gpt2api-image-config-migrate
+    restart: "no"
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    command: >
+      sh -c 'set -eu;
+      mkdir -p data;
+      if [ ! -f data/config.json ]; then
+        if [ -f config.json ] && [ ! -d config.json ]; then
+          cp config.json data/config.json;
+        elif [ -f config.example.json ]; then
+          cp config.example.json data/config.json;
+        else
+          printf "{}\n" > data/config.json;
+        fi;
+      fi'
+
   postgres:
     image: postgres:16-alpine
     container_name: gpt2api-image-postgres
@@ -22,16 +42,18 @@ services:
     container_name: gpt2api-image-api
     restart: unless-stopped
     depends_on:
+      config-migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     ports:
       - "3000:80"
     volumes:
       - ./data:/app/data
-      - ./config.json:/app/config.json
     environment:
       - GPT2API_IMAGE_MODE=serve
       - GPT2API_IMAGE_ADDR=:80
+      - GPT2API_IMAGE_CONFIG_FILE=/app/data/config.json
       - GPT2API_IMAGE_AUTH_KEY=${GPT2API_IMAGE_AUTH_KEY:?set GPT2API_IMAGE_AUTH_KEY}
       - GPT2API_IMAGE_REGISTER_INTERNAL_KEY=${GPT2API_IMAGE_REGISTER_INTERNAL_KEY:?set GPT2API_IMAGE_REGISTER_INTERNAL_KEY}
       - GPT2API_IMAGE_REGISTER_EXECUTOR_URL=http://register-executor:8091
@@ -74,9 +96,9 @@ services:
         condition: service_healthy
     volumes:
       - ./data:/app/data
-      - ./config.json:/app/config.json
     environment:
       - GPT2API_IMAGE_MODE=worker
+      - GPT2API_IMAGE_CONFIG_FILE=/app/data/config.json
       - GPT2API_IMAGE_AUTH_KEY=${GPT2API_IMAGE_AUTH_KEY:?set GPT2API_IMAGE_AUTH_KEY}
       - GPT2API_IMAGE_REGISTER_INTERNAL_KEY=${GPT2API_IMAGE_REGISTER_INTERNAL_KEY:?set GPT2API_IMAGE_REGISTER_INTERNAL_KEY}
       - GPT2API_IMAGE_DATABASE_URL=postgresql://gpt2api_image:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/gpt2api_image

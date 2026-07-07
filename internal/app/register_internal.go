@@ -67,6 +67,9 @@ func (s *Server) addAccountRecords(records []map[string]any) (int, int, string, 
 	for _, rec := range records {
 		t := strings.TrimSpace(strAny(rec["access_token"], strAny(rec["accessToken"], "")))
 		if t != "" {
+			if _, ok := rec["refresh_validation_pending"]; !ok {
+				rec["refresh_validation_pending"] = true
+			}
 			tokset[t] = rec
 		}
 	}

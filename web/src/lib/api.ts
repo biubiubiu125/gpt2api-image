@@ -301,6 +301,7 @@ export type RegisterConfig = {
     done: number;
     saved?: number;
     refresh_failed?: number;
+    token_acquired_refresh_failed?: number;
     running: number;
     threads: number;
     elapsed_seconds?: number;

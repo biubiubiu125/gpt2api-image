@@ -20,12 +20,14 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -buildvcs=fals
 
 FROM alpine:3.20 AS app
 WORKDIR /app
-RUN adduser -D -H app && mkdir -p /app/data /app/web_dist && chown -R app:app /app
+RUN apk add --no-cache su-exec && adduser -D -H app && mkdir -p /app/data /app/web_dist && chown -R app:app /app
 COPY --from=go-build /out/gpt2api-image /app/gpt2api-image
 COPY --from=web-build /app/web/out /app/web_dist
 COPY config.example.json /app/config.example.json
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 COPY VERSION /app/VERSION
-USER app
+RUN chmod +x /app/docker-entrypoint.sh
 EXPOSE 80
 ENV GPT2API_IMAGE_ADDR=:80
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["/app/gpt2api-image"]

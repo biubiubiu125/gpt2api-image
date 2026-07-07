@@ -146,6 +146,7 @@ export function RegisterCard() {
     { label: "失败", value: stats.fail, tone: stats.fail > 0 ? "error" : "muted" },
     { label: "保存", value: stats.saved || 0, tone: "ok" },
     { label: "刷新失败", value: stats.refresh_failed || 0, tone: (stats.refresh_failed || 0) > 0 ? "warn" : "muted" },
+    { label: "已取Token刷新失败", value: stats.token_acquired_refresh_failed || 0, tone: (stats.token_acquired_refresh_failed || 0) > 0 ? "warn" : "muted" },
     { label: "完成", value: stats.done },
     { label: "线程", value: `${stats.running}/${stats.threads}` },
     { label: "平均", value: `${stats.avg_seconds || 0}s` },

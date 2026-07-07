@@ -22,6 +22,7 @@ const (
 )
 
 var errImageAccountBusy = errors.New("image account concurrency limit reached")
+var errImageUploadQuotaReserved = errors.New("no available image upload quota")
 var errAdminClientTaskOwnerRequired = errors.New("owner_id is required when admin uses client_task_id")
 
 type PGTaskStore struct {
@@ -126,10 +127,12 @@ CREATE TABLE IF NOT EXISTS account_leases_v1 (
   lease_id TEXT PRIMARY KEY,
   token_hash TEXT NOT NULL,
   holder TEXT NOT NULL,
+  upload_weight INTEGER NOT NULL DEFAULT 0,
   expires_ts DOUBLE PRECISION NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+ALTER TABLE account_leases_v1 ADD COLUMN IF NOT EXISTS upload_weight INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS ix_account_leases_v1_token ON account_leases_v1(token_hash, expires_ts);
 `)
 	return err
@@ -548,6 +551,10 @@ RETURNING t.id, t.client_task_id, t.owner_id, t.owner_role, t.status, t.mode, t.
 }
 
 func (s *PGTaskStore) AcquireAccountLease(ctx context.Context, token string, maxLeases int, holder string, ttl time.Duration) (string, bool, error) {
+	return s.AcquireAccountLeaseWithUploadQuota(ctx, token, maxLeases, -1, 0, holder, ttl)
+}
+
+func (s *PGTaskStore) AcquireAccountLeaseWithUploadQuota(ctx context.Context, token string, maxLeases, maxUploadReservations, uploadWeight int, holder string, ttl time.Duration) (string, bool, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
 		return "", false, errors.New("account token is required")
@@ -557,6 +564,9 @@ func (s *PGTaskStore) AcquireAccountLease(ctx context.Context, token string, max
 	}
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
+	}
+	if uploadWeight < 0 {
+		uploadWeight = 0
 	}
 	now := time.Now()
 	nowTS := float64(now.UnixNano()) / 1e9
@@ -575,17 +585,20 @@ func (s *PGTaskStore) AcquireAccountLease(ctx context.Context, token string, max
 	if _, err := tx.ExecContext(ctx, `DELETE FROM account_leases_v1 WHERE expires_ts <= $1`, nowTS); err != nil {
 		return "", false, err
 	}
-	var active int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_leases_v1 WHERE token_hash=$1 AND expires_ts > $2`, tokenHash, nowTS).Scan(&active); err != nil {
+	var active, activeUploadWeight int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(upload_weight),0) FROM account_leases_v1 WHERE token_hash=$1 AND expires_ts > $2`, tokenHash, nowTS).Scan(&active, &activeUploadWeight); err != nil {
 		return "", false, err
 	}
 	if active >= maxLeases {
 		return "", false, nil
 	}
+	if uploadWeight > 0 && maxUploadReservations >= 0 && activeUploadWeight+uploadWeight > maxUploadReservations {
+		return "", false, errImageUploadQuotaReserved
+	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO account_leases_v1 (lease_id, token_hash, holder, expires_ts, created_at, updated_at)
-VALUES ($1,$2,$3,$4,$5,$5)
-`, leaseID, tokenHash, holder, expiresTS, nowISO()); err != nil {
+INSERT INTO account_leases_v1 (lease_id, token_hash, holder, upload_weight, expires_ts, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$6)
+`, leaseID, tokenHash, holder, uploadWeight, expiresTS, nowISO()); err != nil {
 		return "", false, err
 	}
 	if err := tx.Commit(); err != nil {

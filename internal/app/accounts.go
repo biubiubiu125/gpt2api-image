@@ -151,7 +151,7 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 		status = accountStatusNormal
 	}
 	now := nowISO()
-	a := Account{AccessToken: token, Type: typ, SourceType: source, Status: status, Quota: intAny(rec["quota"], 0), Success: intAny(rec["success"], 0), Fail: intAny(rec["fail"], 0), CreatedAt: &now, ImageQuotaUnknown: boolAny(rec["image_quota_unknown"], false), RefreshValidationPending: boolAny(rec["refresh_validation_pending"], false)}
+	a := Account{AccessToken: token, Type: typ, SourceType: source, Status: status, Quota: intAny(rec["quota"], 0), Success: intAny(rec["success"], 0), Fail: intAny(rec["fail"], 0), CreatedAt: &now, ImageQuotaUnknown: boolAny(rec["image_quota_unknown"], false), UploadQuotaUnknown: true, RefreshValidationPending: boolAny(rec["refresh_validation_pending"], false)}
 	a.PendingDelete = boolAny(rec["pending_delete"], false)
 	if v := strings.TrimSpace(strAny(rec["delete_reason"], "")); v != "" {
 		a.DeleteReason = &v
@@ -183,6 +183,9 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 	if v := strings.TrimSpace(strAny(rec["default_model_slug"], "")); v != "" {
 		a.DefaultModelSlug = &v
 	}
+	if v := strings.TrimSpace(strAny(rec["image_limit_reset_at"], "")); v != "" {
+		a.ImageLimitResetAt = &v
+	}
 	if v := strings.TrimSpace(strAny(rec["restore_at"], "")); v != "" {
 		a.RestoreAt = &v
 	}
@@ -192,6 +195,19 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 	if v := strings.TrimSpace(strAny(rec["rate_limit_reset_at"], "")); v != "" {
 		a.RateLimitResetAt = &v
 	}
+	if _, ok := rec["upload_quota"]; ok {
+		a.UploadQuota = intAny(rec["upload_quota"], 0)
+		a.UploadQuotaUnknown = false
+	}
+	if _, ok := rec["upload_quota_unknown"]; ok {
+		a.UploadQuotaUnknown = boolAny(rec["upload_quota_unknown"], a.UploadQuotaUnknown)
+	}
+	if v := strings.TrimSpace(strAny(rec["upload_limit_reset_at"], "")); v != "" {
+		a.UploadLimitResetAt = &v
+	}
+	if v := strings.TrimSpace(strAny(rec["upload_limit_feature_name"], "")); v != "" {
+		a.UploadLimitFeatureName = &v
+	}
 	if arr, ok := rec["limits_progress"].([]any); ok {
 		for _, item := range arr {
 			if m, ok := item.(map[string]any); ok {
@@ -199,6 +215,11 @@ func accountFromRecord(token, source string, rec map[string]any) Account {
 			}
 		}
 	}
+	if a.UploadQuotaUnknown && len(a.LimitsProgress) > 0 {
+		applyUploadQuotaInfo(&a, uploadQuotaFromLimits(a.LimitsProgress))
+	}
+	normalizeAccountLimitState(&a)
+	normalizeAccountUploadQuotaState(&a)
 	a.FP = accountFPFromRecord(rec)
 	if a.InitialQuota < a.Quota {
 		a.InitialQuota = a.Quota
@@ -308,8 +329,12 @@ func countValidatedAccountsForTokens(accounts []Account, tokens []string) int {
 
 func markAccountPendingRefreshValidation(account *Account) {
 	account.ImageQuotaUnknown = true
+	account.UploadQuotaUnknown = true
 	account.RefreshValidationPending = true
 	account.Quota = 0
+	account.UploadQuota = 0
+	account.UploadLimitResetAt = nil
+	account.UploadLimitFeatureName = nil
 	account.LimitsProgress = nil
 	if account.CreatedAt == nil || strings.TrimSpace(*account.CreatedAt) == "" {
 		now := nowISO()
@@ -318,6 +343,7 @@ func markAccountPendingRefreshValidation(account *Account) {
 }
 
 func preserveValidatedAccountRuntimeState(dst *Account, previous Account) {
+	preserveAccountUploadQuotaRuntimeState(dst, previous)
 	if previous.ImageQuotaUnknown || previous.Quota <= 0 {
 		return
 	}
@@ -327,12 +353,35 @@ func preserveValidatedAccountRuntimeState(dst *Account, previous Account) {
 	dst.ImageQuotaUnknown = previous.ImageQuotaUnknown
 	dst.RefreshValidationPending = previous.RefreshValidationPending
 	dst.LimitsProgress = previous.LimitsProgress
+	dst.ImageLimitResetAt = previous.ImageLimitResetAt
 	dst.RestoreAt = previous.RestoreAt
 	dst.RateLimitedAt = previous.RateLimitedAt
 	dst.RateLimitResetAt = previous.RateLimitResetAt
 	dst.PendingDelete = previous.PendingDelete
 	dst.DeleteReason = previous.DeleteReason
 	dst.DeleteMarkedAt = previous.DeleteMarkedAt
+}
+
+func preserveAccountUploadQuotaRuntimeState(dst *Account, previous Account) {
+	if !hasUploadQuotaRuntimeState(previous) {
+		return
+	}
+	dst.UploadQuota = previous.UploadQuota
+	dst.UploadQuotaUnknown = previous.UploadQuotaUnknown
+	dst.UploadLimitResetAt = previous.UploadLimitResetAt
+	dst.UploadLimitFeatureName = previous.UploadLimitFeatureName
+}
+
+func hasUploadQuotaRuntimeState(account Account) bool {
+	if !account.UploadQuotaUnknown || account.UploadQuota > 0 || account.UploadLimitResetAt != nil || account.UploadLimitFeatureName != nil {
+		return true
+	}
+	for _, item := range account.LimitsProgress {
+		if isUploadLimitFeatureName(strAny(item["feature_name"], "")) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) upsertAccountRecordsForRefresh(tokset map[string]map[string]any, defaultSource string) (int, int, error) {
@@ -408,6 +457,9 @@ func mergeAccount(dst *Account, src Account) {
 	if src.DefaultModelSlug != nil {
 		dst.DefaultModelSlug = src.DefaultModelSlug
 	}
+	if src.ImageLimitResetAt != nil {
+		dst.ImageLimitResetAt = src.ImageLimitResetAt
+	}
 	if src.RestoreAt != nil {
 		dst.RestoreAt = src.RestoreAt
 	}
@@ -421,7 +473,13 @@ func mergeAccount(dst *Account, src Account) {
 		dst.LimitsProgress = src.LimitsProgress
 		dst.ImageQuotaUnknown = src.ImageQuotaUnknown
 	}
-	if src.Quota > 0 || src.RestoreAt != nil || src.DefaultModelSlug != nil {
+	if !src.UploadQuotaUnknown || src.UploadQuota > 0 || src.UploadLimitResetAt != nil || src.UploadLimitFeatureName != nil {
+		dst.UploadQuota = src.UploadQuota
+		dst.UploadQuotaUnknown = src.UploadQuotaUnknown
+		dst.UploadLimitResetAt = src.UploadLimitResetAt
+		dst.UploadLimitFeatureName = src.UploadLimitFeatureName
+	}
+	if src.Quota > 0 || src.ImageLimitResetAt != nil || src.RestoreAt != nil || src.DefaultModelSlug != nil {
 		dst.ImageQuotaUnknown = src.ImageQuotaUnknown
 	}
 	if len(src.FP) > 0 {
@@ -445,18 +503,81 @@ func mergeAccount(dst *Account, src Account) {
 func mergeRefreshedAccountInfo(dst *Account, src Account) {
 	accessToken := dst.AccessToken
 	sourceType := dst.SourceType
+	status := dst.Status
+	quota := dst.Quota
+	initialQuota := dst.InitialQuota
+	imageQuotaUnknown := dst.ImageQuotaUnknown
+	limitsProgress := dst.LimitsProgress
+	imageLimitResetAt := dst.ImageLimitResetAt
+	restoreAt := dst.RestoreAt
+	rateLimitedAt := dst.RateLimitedAt
+	rateLimitResetAt := dst.RateLimitResetAt
+	uploadQuota := dst.UploadQuota
+	uploadQuotaUnknown := dst.UploadQuotaUnknown
+	uploadLimitResetAt := dst.UploadLimitResetAt
+	uploadLimitFeatureName := dst.UploadLimitFeatureName
 	mergeAccount(dst, src)
 	dst.AccessToken = accessToken
 	if strings.TrimSpace(sourceType) != "" {
 		dst.SourceType = sourceType
 	}
-	dst.ImageQuotaUnknown = src.ImageQuotaUnknown
+	dst.Status = status
+	dst.Quota = quota
+	dst.InitialQuota = initialQuota
+	dst.ImageQuotaUnknown = imageQuotaUnknown
+	dst.LimitsProgress = limitsProgress
+	dst.ImageLimitResetAt = imageLimitResetAt
+	dst.RestoreAt = restoreAt
+	dst.RateLimitedAt = rateLimitedAt
+	dst.RateLimitResetAt = rateLimitResetAt
+	dst.UploadQuota = uploadQuota
+	dst.UploadQuotaUnknown = uploadQuotaUnknown
+	dst.UploadLimitResetAt = uploadLimitResetAt
+	dst.UploadLimitFeatureName = uploadLimitFeatureName
 	dst.RefreshValidationPending = false
-	dst.Quota = src.Quota
-	dst.LimitsProgress = src.LimitsProgress
-	if dst.InitialQuota < dst.Quota {
-		dst.InitialQuota = dst.Quota
+	if refreshedHasImageQuotaSignal(src) {
+		dst.Status = src.Status
+		dst.ImageQuotaUnknown = src.ImageQuotaUnknown
+		dst.Quota = src.Quota
+		dst.LimitsProgress = src.LimitsProgress
+		dst.ImageLimitResetAt = src.ImageLimitResetAt
+		dst.RestoreAt = src.RestoreAt
+		dst.RateLimitedAt = src.RateLimitedAt
+		dst.RateLimitResetAt = src.RateLimitResetAt
+		if dst.InitialQuota < dst.Quota {
+			dst.InitialQuota = dst.Quota
+		}
 	}
+	if refreshedHasUploadQuotaSignal(src) {
+		dst.UploadQuota = src.UploadQuota
+		dst.UploadQuotaUnknown = src.UploadQuotaUnknown
+		dst.UploadLimitResetAt = src.UploadLimitResetAt
+		dst.UploadLimitFeatureName = src.UploadLimitFeatureName
+	}
+}
+
+func refreshedHasImageQuotaSignal(account Account) bool {
+	if account.Quota > 0 || account.ImageLimitResetAt != nil || account.RestoreAt != nil || account.RateLimitResetAt != nil {
+		return true
+	}
+	for _, item := range account.LimitsProgress {
+		if strings.TrimSpace(strAny(item["feature_name"], "")) == "image_gen" {
+			return true
+		}
+	}
+	return false
+}
+
+func refreshedHasUploadQuotaSignal(account Account) bool {
+	if account.UploadQuota > 0 || account.UploadLimitResetAt != nil || account.UploadLimitFeatureName != nil {
+		return true
+	}
+	for _, item := range account.LimitsProgress {
+		if isUploadLimitFeatureName(strAny(item["feature_name"], "")) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) refreshAccountInfos(parent context.Context, tokens []string, deferInvalidRemoval ...bool) (int, []map[string]any, int, int) {
@@ -509,6 +630,9 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string, de
 			errs = append(errs, map[string]any{"error": "failed to save refreshed accounts: " + err.Error()})
 		} else {
 			refreshed = len(updates)
+			if s.logSvc != nil {
+				s.logSvc.add("account", "刷新上传额度", map[string]any{"items": uploadQuotaRefreshLogItems(updates)})
+			}
 		}
 	}
 	deferRemoval := len(deferInvalidRemoval) > 0 && deferInvalidRemoval[0]
@@ -566,6 +690,27 @@ func accountEmailsForRefreshLog(before, after []Account, tokens []string) []stri
 		return emails
 	}
 	return accountEmailsForTokens(before, tokens)
+}
+
+func uploadQuotaRefreshLogItems(updates map[string]Account) []map[string]any {
+	tokens := make([]string, 0, len(updates))
+	for token := range updates {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	out := make([]map[string]any, 0, len(tokens))
+	for _, token := range tokens {
+		account := updates[token]
+		item := map[string]any{
+			"email":                ptrString(account.Email),
+			"upload_quota":         account.UploadQuota,
+			"upload_quota_unknown": account.UploadQuotaUnknown,
+			"feature_name":         ptrString(account.UploadLimitFeatureName),
+			"reset_at":             ptrString(account.UploadLimitResetAt),
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func (s *Server) handleAccountsUpdate(w http.ResponseWriter, r *http.Request) {

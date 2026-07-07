@@ -15,6 +15,10 @@ export type Account = {
   quota: number;
   initial_quota?: number;
   image_quota_unknown?: boolean;
+  upload_quota?: number;
+  upload_quota_unknown?: boolean;
+  upload_limit_reset_at?: string | null;
+  upload_limit_feature_name?: string | null;
   refresh_validation_pending?: boolean;
   email?: string | null;
   user_id?: string | null;
@@ -25,7 +29,9 @@ export type Account = {
     reset_after?: string;
   }>;
   default_model_slug?: string | null;
+  image_limit_reset_at?: string | null;
   restore_at?: string | null;
+  rate_limit_reset_at?: string | null;
   pending_delete?: boolean;
   success: number;
   fail: number;

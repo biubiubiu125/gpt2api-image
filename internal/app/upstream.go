@@ -48,6 +48,7 @@ type UpstreamClient struct {
 	secCHUAPlatform string
 	scriptSources   []string
 	dataBuild       string
+	onUploadSuccess func()
 }
 
 type chatRequirements struct{ Token, ProofToken, TurnstileToken, SOToken string }
@@ -58,10 +59,11 @@ type upstreamImageResult struct {
 }
 
 type imageGenerationOptions struct {
-	Timeout         time.Duration
-	PollInterval    time.Duration
-	PollInitialWait time.Duration
-	UploadTimeout   time.Duration
+	Timeout           time.Duration
+	PollInterval      time.Duration
+	PollInitialWait   time.Duration
+	UploadTimeout     time.Duration
+	OnReferenceUpload func()
 }
 
 func normalizeImageGenerationOptions(opts imageGenerationOptions) imageGenerationOptions {
@@ -541,6 +543,9 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 		up, err := c.uploadImage(ctx, b, fmt.Sprintf("image_%d.png", i+1), opts.UploadTimeout)
 		if err != nil {
 			return nil, err
+		}
+		if opts.OnReferenceUpload != nil {
+			opts.OnReferenceUpload()
 		}
 		uploads = append(uploads, up)
 	}
@@ -1080,7 +1085,8 @@ func (c *UpstreamClient) GetUserInfo(ctx context.Context) (Account, error) {
 	if !quotaUnknown && quota <= 0 {
 		status = "限流"
 	}
-	acc := Account{AccessToken: c.token, Type: planType, Status: status, SourceType: "web", Quota: quota, ImageQuotaUnknown: quotaUnknown, LimitsProgress: limits}
+	acc := Account{AccessToken: c.token, Type: planType, Status: status, SourceType: "web", Quota: quota, ImageQuotaUnknown: quotaUnknown, UploadQuotaUnknown: true, LimitsProgress: limits}
+	applyUploadQuotaInfo(&acc, uploadQuotaFromLimits(limits))
 	if e := strAny(me["email"], ""); e != "" {
 		acc.Email = &e
 	}
@@ -1091,8 +1097,7 @@ func (c *UpstreamClient) GetUserInfo(ctx context.Context) (Account, error) {
 		acc.DefaultModelSlug = &defaultModel
 	}
 	if restoreAt != "" {
-		acc.RestoreAt = &restoreAt
-		acc.RateLimitResetAt = &restoreAt
+		acc.ImageLimitResetAt = &restoreAt
 	}
 	if acc.InitialQuota < acc.Quota {
 		acc.InitialQuota = acc.Quota
@@ -2210,6 +2215,9 @@ func (c *UpstreamClient) conversationContent(ctx context.Context, raw any) (map[
 		uploaded, err := c.uploadImage(ctx, imageBytes, fmt.Sprintf("chat_image_%d.png", i+1), 120*time.Second)
 		if err != nil {
 			return nil, nil, err
+		}
+		if c.onUploadSuccess != nil {
+			c.onUploadSuccess()
 		}
 		fileID := strAny(uploaded["file_id"], "")
 		parts = append(parts, map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + fileID, "width": uploaded["width"], "height": uploaded["height"], "size_bytes": uploaded["file_size"]})

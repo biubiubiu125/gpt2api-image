@@ -103,6 +103,17 @@ func TestCollectImageBatchResultsAllowsPartialForRetryableFailures(t *testing.T)
 	}
 }
 
+func TestCollectImageBatchResultsDoesNotSwallowUploadLimit(t *testing.T) {
+	success := upstreamImageResult{Bytes: []byte("ok")}
+	items, err := collectImageBatchResults(context.Background(), [][]upstreamImageResult{{success}, nil}, []error{nil, errors.New("POST /backend-api/files failed: status=429 body=file upload limit reached")})
+	if err == nil || !strings.Contains(err.Error(), "file upload limit") {
+		t.Fatalf("upload limit err = %v, want propagated upload limit", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("upload limit items = %#v, want none", items)
+	}
+}
+
 func TestPickTokenPrefersHighQuotaLowUsageLowConcurrency(t *testing.T) {
 	cfg := Config{ImageAccountConcurrency: 3}
 	pool := newAccountPool(&cfg)
@@ -552,7 +563,7 @@ func TestInternalRegisterAccountRecordsUseSharedCodexValidation(t *testing.T) {
 	}
 }
 
-func TestMergeRefreshedAccountInfoOverridesStaleKnownQuota(t *testing.T) {
+func TestMergeRefreshedAccountInfoPreservesQuotaWithoutImageSignal(t *testing.T) {
 	account := Account{AccessToken: "tok", SourceType: "codex", Status: accountStatusNormal, Quota: 100, ImageQuotaUnknown: false, RefreshValidationPending: true}
 	mergeRefreshedAccountInfo(&account, Account{
 		AccessToken:       "new-token-ignored",
@@ -567,8 +578,59 @@ func TestMergeRefreshedAccountInfoOverridesStaleKnownQuota(t *testing.T) {
 	if account.SourceType != "codex" {
 		t.Fatalf("refresh merge should keep codex source type, got %q", account.SourceType)
 	}
-	if !account.ImageQuotaUnknown || account.RefreshValidationPending || account.Quota != 0 {
-		t.Fatalf("refresh merge should overwrite stale quota with unknown state: %#v", account)
+	if account.ImageQuotaUnknown || account.RefreshValidationPending || account.Quota != 100 {
+		t.Fatalf("refresh merge should preserve image quota without image quota signal: %#v", account)
+	}
+
+	s := newImageAccountGuardTestServer(t)
+	if err := s.store.SaveAccounts([]Account{account}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+	s.cleanupUnusableImageAccounts()
+	if got := s.store.LoadAccounts(); len(got) != 1 {
+		t.Fatalf("refreshed account without image quota signal should remain, got %#v", got)
+	}
+}
+
+func TestMergeRefreshedAccountInfoPreservesImageQuotaOnEmptyRefreshAccount(t *testing.T) {
+	account := Account{
+		AccessToken:              "tok",
+		SourceType:               "codex",
+		Status:                   accountStatusNormal,
+		Quota:                    25,
+		InitialQuota:             25,
+		ImageQuotaUnknown:        false,
+		LimitsProgress:           []map[string]any{{"feature_name": "image_gen", "remaining": 25}},
+		RefreshValidationPending: true,
+	}
+	mergeRefreshedAccountInfo(&account, Account{AccessToken: "tok"})
+
+	if account.Quota != 25 || account.InitialQuota != 25 || account.ImageQuotaUnknown || len(account.LimitsProgress) != 1 {
+		t.Fatalf("empty refresh account should not overwrite image quota: %#v", account)
+	}
+	if account.RefreshValidationPending {
+		t.Fatalf("refresh validation should be cleared: %#v", account)
+	}
+}
+
+func TestMergeRefreshedAccountInfoOverridesExplicitEmptyImageQuota(t *testing.T) {
+	account := Account{AccessToken: "tok", SourceType: "codex", Status: accountStatusNormal, Quota: 100, ImageQuotaUnknown: false, RefreshValidationPending: true}
+	mergeRefreshedAccountInfo(&account, Account{
+		AccessToken:       "new-token-ignored",
+		SourceType:        "web",
+		Status:            accountStatusLimited,
+		Quota:             0,
+		ImageQuotaUnknown: false,
+		LimitsProgress:    []map[string]any{{"feature_name": "image_gen", "remaining": 0}},
+	})
+	if account.AccessToken != "tok" {
+		t.Fatalf("refresh merge should keep stored token, got %q", account.AccessToken)
+	}
+	if account.SourceType != "codex" {
+		t.Fatalf("refresh merge should keep codex source type, got %q", account.SourceType)
+	}
+	if account.ImageQuotaUnknown || account.RefreshValidationPending || account.Quota != 0 {
+		t.Fatalf("refresh merge should overwrite stale quota with explicit empty image quota: %#v", account)
 	}
 
 	s := newImageAccountGuardTestServer(t)
@@ -577,6 +639,6 @@ func TestMergeRefreshedAccountInfoOverridesStaleKnownQuota(t *testing.T) {
 	}
 	s.cleanupUnusableImageAccounts()
 	if got := s.store.LoadAccounts(); len(got) != 0 {
-		t.Fatalf("refreshed unknown quota account should be removed, got %#v", got)
+		t.Fatalf("refreshed empty quota account should be removed, got %#v", got)
 	}
 }

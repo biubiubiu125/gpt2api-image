@@ -72,7 +72,7 @@ func shouldTryNextImageRoute(err error, ctxErr error) bool {
 		return false
 	}
 	text := strings.ToLower(err.Error())
-	if strings.Contains(text, "no available image quota") || strings.Contains(text, "no available codex") {
+	if strings.Contains(text, "no available image quota") || strings.Contains(text, "no available image upload quota") || strings.Contains(text, "no available codex") {
 		return true
 	}
 	return shouldRetryImageAccount(err)

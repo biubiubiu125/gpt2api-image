@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+const (
+	defaultRateLimitRestoreDelay    = 5 * time.Minute
+	freeUploadLimitFallbackDelay    = 24 * time.Hour
+	paidUploadLimitFallbackDelay    = 3 * time.Hour
+	unknownUploadLimitFallbackDelay = freeUploadLimitFallbackDelay
+	defaultUploadLimitFeature       = "upload"
+)
+
 func isRateLimitErrorText(err error) bool {
 	if err == nil {
 		return false
@@ -88,8 +96,15 @@ func isTemporaryUpstreamErrorText(err error) bool {
 }
 
 func rateLimitRestoreDelay(err error) time.Duration {
+	if delay, ok := parseRateLimitRestoreDelay(err); ok {
+		return delay
+	}
+	return defaultRateLimitRestoreDelay
+}
+
+func parseRateLimitRestoreDelay(err error) (time.Duration, bool) {
 	if err == nil {
-		return 5 * time.Minute
+		return 0, false
 	}
 	text := strings.ToLower(err.Error())
 	hours := 0
@@ -101,9 +116,42 @@ func rateLimitRestoreDelay(err error) time.Duration {
 		minutes, _ = strconv.Atoi(m[1])
 	}
 	if hours > 0 || minutes > 0 {
-		return time.Duration(hours)*time.Hour + time.Duration(minutes)*time.Minute
+		return time.Duration(hours)*time.Hour + time.Duration(minutes)*time.Minute, true
 	}
-	return 5 * time.Minute
+	return 0, false
+}
+
+func uploadLimitRestoreDelay(err error, accountType string) time.Duration {
+	if delay, ok := parseRateLimitRestoreDelay(err); ok {
+		return delay
+	}
+	return uploadLimitFallbackDelay(accountType)
+}
+
+func uploadLimitFallbackDelay(accountType string) time.Duration {
+	switch strings.ToLower(strings.TrimSpace(normalizeAccountType(accountType))) {
+	case "plus", "pro", "team", "enterprise", "prolite", "premium":
+		return paidUploadLimitFallbackDelay
+	case "free":
+		return freeUploadLimitFallbackDelay
+	default:
+		return unknownUploadLimitFallbackDelay
+	}
+}
+
+func defaultUploadLimitResetAt(account Account, err error) string {
+	return time.Now().UTC().Add(uploadLimitRestoreDelay(err, account.Type)).Format(time.RFC3339)
+}
+
+func setDefaultUploadLimitMetadata(account *Account, err error) {
+	if account.UploadLimitResetAt == nil {
+		reset := defaultUploadLimitResetAt(*account, err)
+		account.UploadLimitResetAt = &reset
+	}
+	if account.UploadLimitFeatureName == nil {
+		featureName := defaultUploadLimitFeature
+		account.UploadLimitFeatureName = &featureName
+	}
 }
 
 func (s *Server) markAccountSuccess(token string, image bool) {
@@ -122,11 +170,17 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 			if image && !accounts[i].ImageQuotaUnknown && accounts[i].Quota > 0 {
 				accounts[i].Quota--
 				if accounts[i].Quota <= 0 {
+					accounts[i].Quota = 0
+					accounts[i].Status = accountStatusLimited
+					if accountHasUploadQuotaRuntimeValue(accounts[i]) {
+						return accounts
+					}
 					removeReason = "image_quota_empty"
 				}
 			}
 			if isAccountStatus(accounts[i].Status, accountStatusLimited) && !accounts[i].ImageQuotaUnknown && accounts[i].Quota > 0 {
 				accounts[i].Status = accountStatusNormal
+				accounts[i].ImageLimitResetAt = nil
 				accounts[i].RestoreAt = nil
 				accounts[i].RateLimitedAt = nil
 				accounts[i].RateLimitResetAt = nil
@@ -142,6 +196,32 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 		if _, err := s.removeOrMarkImageAccount(token, removeReason); err != nil {
 			log.Printf("[account-state] failed to remove exhausted image account: %v", err)
 		}
+	}
+}
+
+func (s *Server) markAccountUploadSuccess(token string, n int) {
+	if token == "" || n <= 0 {
+		return
+	}
+	now := nowISO()
+	if err := s.store.UpdateAccounts(func(accounts []Account) []Account {
+		for i := range accounts {
+			if accounts[i].AccessToken != token {
+				continue
+			}
+			accounts[i].LastUsedAt = &now
+			if !accounts[i].UploadQuotaUnknown && accounts[i].UploadQuota > 0 {
+				accounts[i].UploadQuota = maxInt(0, accounts[i].UploadQuota-n)
+				if accounts[i].UploadQuota == 0 {
+					accounts[i].UploadQuotaUnknown = false
+					setDefaultUploadLimitMetadata(&accounts[i], nil)
+				}
+			}
+			return accounts
+		}
+		return accounts
+	}); err != nil {
+		log.Printf("[account-state] failed to save account upload quota state: %v", err)
 	}
 }
 
@@ -168,9 +248,19 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 				accounts[i].Quota = 0
 				return accounts
 			}
+			if isUploadLimitErrorText(err) {
+				accounts[i].UploadQuota = 0
+				accounts[i].UploadQuotaUnknown = false
+				reset := defaultUploadLimitResetAt(accounts[i], err)
+				accounts[i].UploadLimitResetAt = &reset
+				featureName := defaultUploadLimitFeature
+				accounts[i].UploadLimitFeatureName = &featureName
+				return accounts
+			}
 			if isRateLimitErrorText(err) {
 				accounts[i].Status = accountStatusLimited
 				reset := time.Now().UTC().Add(rateLimitRestoreDelay(err)).Format(time.RFC3339)
+				accounts[i].ImageLimitResetAt = nil
 				accounts[i].RestoreAt = &reset
 				accounts[i].RateLimitResetAt = &reset
 				accounts[i].RateLimitedAt = &now

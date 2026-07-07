@@ -54,12 +54,33 @@ func imageAccountRemovalReason(a Account, includePendingRefreshValidation bool) 
 		return "", false
 	}
 	if a.ImageQuotaUnknown {
+		if accountHasUploadQuotaRuntimeValue(a) {
+			return "", false
+		}
 		return "image_quota_unknown", true
 	}
 	if a.Quota <= 0 {
+		if accountHasUploadQuotaRuntimeValue(a) {
+			return "", false
+		}
 		return "image_quota_empty", true
 	}
 	return "", false
+}
+
+func accountHasUploadQuotaRuntimeValue(a Account) bool {
+	if a.UploadQuota > 0 {
+		return true
+	}
+	if !a.UploadQuotaUnknown && (a.UploadLimitResetAt != nil || a.UploadLimitFeatureName != nil) {
+		return true
+	}
+	for _, item := range a.LimitsProgress {
+		if isUploadLimitFeatureName(strAny(item["feature_name"], "")) {
+			return true
+		}
+	}
+	return false
 }
 
 func accountRefreshValidationRecentlyStarted(a Account) bool {

@@ -132,7 +132,11 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 		}
 		excluded := scope.excludedSnapshot()
 		traceLogf(ctx, "├─ image account attempt %d/%d model=%s resolution=%s excluded=%d", scope.usedCount()+1, maxImageAccountFallbackAttempts, model, resolution, len(excluded))
-		account, err := s.pickAccountExcluding(model, resolution, excluded)
+		requiredUploads := 0
+		if !isCodexImageRequest(model, resolution) {
+			requiredUploads = len(refs)
+		}
+		account, err := s.pickAccountExcludingForUploads(model, resolution, excluded, requiredUploads)
 		if err != nil {
 			if lastErr != nil {
 				return nil, lastErr
@@ -142,6 +146,9 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 		poolToken := account.AccessToken
 		if !scope.reserve(poolToken) {
 			s.accountPool.releaseToken(poolToken)
+			if requiredUploads > 0 {
+				s.accountPool.releaseUploadReservation(poolToken, requiredUploads)
+			}
 			if scope.exhausted() {
 				break
 			}
@@ -151,11 +158,17 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				s.accountPool.releaseToken(poolToken)
+				if requiredUploads > 0 {
+					s.accountPool.releaseUploadReservation(poolToken, requiredUploads)
+				}
 				s.cleanupPendingDeletedAccounts()
 				return nil, ctxErr
 			}
 			if errors.Is(err, context.Canceled) {
 				s.accountPool.releaseToken(poolToken)
+				if requiredUploads > 0 {
+					s.accountPool.releaseUploadReservation(poolToken, requiredUploads)
+				}
 				s.cleanupPendingDeletedAccounts()
 				return nil, err
 			}
@@ -163,6 +176,9 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 				s.markAccountFailure(poolToken, err, true)
 			}
 			s.accountPool.releaseToken(poolToken)
+			if requiredUploads > 0 {
+				s.accountPool.releaseUploadReservation(poolToken, requiredUploads)
+			}
 			s.cleanupPendingDeletedAccounts()
 			if errors.Is(err, errImageAccountBusy) {
 				lastErr = err
@@ -183,11 +199,14 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 		}
 		releaseSelectedToken := func() {
 			s.accountPool.releaseToken(poolToken)
+			if requiredUploads > 0 {
+				s.accountPool.releaseUploadReservation(poolToken, requiredUploads)
+			}
 			if hasTokenAlias {
 				s.accountPool.releaseToken(token)
 			}
 		}
-		leaseID, leased, err := s.acquireImageAccountLease(ctx, token)
+		leaseID, leased, err := s.acquireImageAccountLease(ctx, token, actualAccount, requiredUploads)
 		if err != nil {
 			releaseSelectedToken()
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -202,7 +221,13 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 			continue
 		}
 		traceLogf(ctx, "│  ├─ selected image account %s", accountLabel(actualAccount))
-		items, err := client.GenerateImage(ctx, prompt, model, size, resolution, refs, s.imageGenerationOptions())
+		opts := s.imageGenerationOptions()
+		if requiredUploads > 0 {
+			opts.OnReferenceUpload = func() {
+				s.markAccountUploadSuccess(token, 1)
+			}
+		}
+		items, err := client.GenerateImage(ctx, prompt, model, size, resolution, refs, opts)
 		if err == nil {
 			traceLogf(ctx, "└─ image account attempt success images=%d", len(items))
 			s.markAccountSuccess(token, true)
@@ -240,7 +265,11 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 	return nil, lastErr
 }
 
-func (s *Server) acquireImageAccountLease(ctx context.Context, token string) (string, bool, error) {
+func (s *Server) acquireImageAccountLease(ctx context.Context, token string, account Account, requiredUploads int) (string, bool, error) {
+	return s.acquireUploadAccountLease(ctx, token, account, requiredUploads, "image-"+randID(8), s.imageRequestTimeout()+2*time.Minute)
+}
+
+func (s *Server) acquireUploadAccountLease(ctx context.Context, token string, account Account, requiredUploads int, holder string, ttl time.Duration) (string, bool, error) {
 	if s.taskStore == nil {
 		return "", true, nil
 	}
@@ -248,8 +277,27 @@ func (s *Server) acquireImageAccountLease(ctx context.Context, token string) (st
 	if maxConc < 1 {
 		maxConc = 1
 	}
-	ttl := s.imageRequestTimeout() + 2*time.Minute
-	return s.taskStore.AcquireAccountLease(ctx, token, maxConc, "image-"+randID(8), ttl)
+	maxUploadReservations := -1
+	if requiredUploads > 0 {
+		if account.UploadQuotaUnknown {
+			return "", false, errImageUploadQuotaReserved
+		} else {
+			maxUploadReservations = account.UploadQuota
+		}
+	}
+	if strings.TrimSpace(holder) == "" {
+		holder = "upload-" + randID(8)
+	}
+	return s.taskStore.AcquireAccountLeaseWithUploadQuota(ctx, token, maxConc, maxUploadReservations, requiredUploads, holder, ttl)
+}
+
+func (s *Server) releaseTextUploadSelection(ctx context.Context, token, leaseID string, requiredUploads int) {
+	if requiredUploads <= 0 {
+		return
+	}
+	s.accountPool.releaseToken(token)
+	s.accountPool.releaseUploadReservation(token, requiredUploads)
+	s.releaseImageAccountLease(ctx, leaseID)
 }
 
 func (s *Server) acquireOAuthRefreshLease(ctx context.Context, account Account) (string, bool, error) {
@@ -359,7 +407,7 @@ func isNonSwallowableImageBatchError(err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return true
 	}
-	return isImagePolicyMessage(err.Error())
+	return isImagePolicyMessage(err.Error()) || isUploadLimitErrorText(err)
 }
 
 func (s *Server) generateTaskImages(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
@@ -370,5 +418,5 @@ func shouldRetryImageAccount(err error) bool {
 	if err == nil {
 		return false
 	}
-	return isRateLimitErrorText(err) || isInvalidTokenErrorText(err) || isUpstreamBlockErrorText(err) || isTurnstileRequirementErrorText(err) || isRetryableBootstrapError(err) || isTemporaryUpstreamErrorText(err)
+	return isUploadLimitErrorText(err) || isRateLimitErrorText(err) || isInvalidTokenErrorText(err) || isUpstreamBlockErrorText(err) || isTurnstileRequirementErrorText(err) || isRetryableBootstrapError(err) || isTemporaryUpstreamErrorText(err)
 }

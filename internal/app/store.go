@@ -178,26 +178,36 @@ func (s *Store) LoadAccounts() []Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	items := readJSONFile(s.path("accounts.json"), []Account{})
+	return normalizeAccountsForStore(items)
+}
+
+func normalizeAccountsForStore(items []Account) []Account {
 	out := make([]Account, 0, len(items))
 	for _, a := range items {
 		if a.AccessToken == "" {
 			continue
 		}
-		if a.Type == "" {
-			a.Type = "free"
-		}
-		if a.Status == "" {
-			a.Status = accountStatusNormal
-		}
-		if a.SourceType == "" {
-			a.SourceType = "web"
-		}
-		if a.InitialQuota < a.Quota {
-			a.InitialQuota = a.Quota
-		}
-		out = append(out, a)
+		out = append(out, normalizeAccountForStore(a))
 	}
 	return out
+}
+
+func normalizeAccountForStore(a Account) Account {
+	if a.Type == "" {
+		a.Type = "free"
+	}
+	if a.Status == "" {
+		a.Status = accountStatusNormal
+	}
+	if a.SourceType == "" {
+		a.SourceType = "web"
+	}
+	if a.InitialQuota < a.Quota {
+		a.InitialQuota = a.Quota
+	}
+	normalizeAccountLimitState(&a)
+	normalizeAccountUploadQuotaState(&a)
+	return a
 }
 
 func (s *Store) SaveAccounts(items []Account) error {
@@ -212,7 +222,7 @@ func (s *Store) UpdateAccounts(fn func([]Account) []Account) error {
 	path := s.path("accounts.json")
 	return updateJSONFile(path, func() error {
 		items := readJSONFile(path, []Account{})
-		return writeJSONFileUnlocked(path, fn(items))
+		return writeJSONFileUnlocked(path, fn(normalizeAccountsForStore(items)))
 	})
 }
 

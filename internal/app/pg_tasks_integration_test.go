@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -320,6 +321,90 @@ func TestPGTaskStoreIntegrationAsyncLifecycle(t *testing.T) {
 	}
 	if _, err := store.CancelTasksByClientTaskID(ctx, cancelClientTaskID, admin); !errors.Is(err, errAdminClientTaskOwnerRequired) {
 		t.Fatalf("admin direct client_task_id cancel err = %v, want owner-required", err)
+	}
+}
+
+func TestPGTaskStoreIntegrationUploadLeaseQuotaConcurrency(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set GPT2API_IMAGE_TEST_DATABASE_URL to run PostgreSQL task-store integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	store, err := NewPGTaskStore(databaseURL)
+	if err != nil {
+		t.Fatalf("open pg task store: %v", err)
+	}
+	defer store.db.Close()
+
+	token := "upload_lease_token_" + randID(10)
+	holderPrefix := "upload_lease_holder_" + randID(10)
+	defer func() {
+		_, _ = store.db.ExecContext(context.Background(), `DELETE FROM account_leases_v1 WHERE holder LIKE $1`, holderPrefix+"%")
+	}()
+
+	const attempts = 8
+	const maxUploadReservations = 3
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	acquired := []string{}
+	quotaBlocked := 0
+	unexpected := []error{}
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			leaseID, leased, err := store.AcquireAccountLeaseWithUploadQuota(ctx, token, attempts, maxUploadReservations, 1, holderPrefix+randID(6), time.Minute)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if errors.Is(err, errImageUploadQuotaReserved) {
+					quotaBlocked++
+					return
+				}
+				unexpected = append(unexpected, err)
+				return
+			}
+			if leased {
+				acquired = append(acquired, leaseID)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(unexpected) > 0 {
+		t.Fatalf("unexpected acquire errors: %#v", unexpected)
+	}
+	if len(acquired) != maxUploadReservations {
+		t.Fatalf("acquired leases = %d, want %d; quotaBlocked=%d", len(acquired), maxUploadReservations, quotaBlocked)
+	}
+	if quotaBlocked != attempts-maxUploadReservations {
+		t.Fatalf("quota blocked = %d, want %d", quotaBlocked, attempts-maxUploadReservations)
+	}
+	active, err := store.CountAccountLeases(ctx, token)
+	if err != nil {
+		t.Fatalf("count leases: %v", err)
+	}
+	if active != maxUploadReservations {
+		t.Fatalf("active leases = %d, want %d", active, maxUploadReservations)
+	}
+	if err := store.ReleaseAccountLease(ctx, acquired[0]); err != nil {
+		t.Fatalf("release lease: %v", err)
+	}
+	replacement, leased, err := store.AcquireAccountLeaseWithUploadQuota(ctx, token, attempts, maxUploadReservations, 1, holderPrefix+randID(6), time.Minute)
+	if err != nil {
+		t.Fatalf("replacement acquire: %v", err)
+	}
+	if !leased {
+		t.Fatal("replacement lease was not acquired after release")
+	}
+	acquired[0] = replacement
+	for _, leaseID := range acquired {
+		if err := store.ReleaseAccountLease(ctx, leaseID); err != nil {
+			t.Fatalf("cleanup release %s: %v", leaseID, err)
+		}
 	}
 }
 

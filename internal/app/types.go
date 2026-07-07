@@ -41,11 +41,16 @@ type Account struct {
 	Quota                    int               `json:"quota"`
 	InitialQuota             int               `json:"initial_quota,omitempty"`
 	ImageQuotaUnknown        bool              `json:"image_quota_unknown,omitempty"`
+	UploadQuota              int               `json:"upload_quota"`
+	UploadQuotaUnknown       bool              `json:"upload_quota_unknown,omitempty"`
+	UploadLimitResetAt       *string           `json:"upload_limit_reset_at,omitempty"`
+	UploadLimitFeatureName   *string           `json:"upload_limit_feature_name,omitempty"`
 	RefreshValidationPending bool              `json:"refresh_validation_pending,omitempty"`
 	Email                    *string           `json:"email,omitempty"`
 	UserID                   *string           `json:"user_id,omitempty"`
 	LimitsProgress           []map[string]any  `json:"limits_progress,omitempty"`
 	DefaultModelSlug         *string           `json:"default_model_slug,omitempty"`
+	ImageLimitResetAt        *string           `json:"image_limit_reset_at,omitempty"`
 	RestoreAt                *string           `json:"restore_at,omitempty"`
 	RateLimitedAt            *string           `json:"rate_limited_at,omitempty"`
 	RateLimitResetAt         *string           `json:"rate_limit_reset_at,omitempty"`

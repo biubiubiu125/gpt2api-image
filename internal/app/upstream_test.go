@@ -109,6 +109,48 @@ func tinyPNGBytes(t *testing.T) []byte {
 	return data
 }
 
+func TestGetUserInfoKeepsImageResetSeparateFromGenericRateLimit(t *testing.T) {
+	resetAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	client := &UpstreamClient{
+		token:     "tok",
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.URL.Path == "/backend-api/me":
+				return upstreamTestResponse(200, `{"email":"user@example.com","id":"user_1"}`), nil
+			case req.URL.Path == "/backend-api/conversation/init":
+				body := map[string]any{
+					"limits_progress": []map[string]any{
+						{"feature_name": "image_gen", "remaining": 0, "reset_after": resetAt},
+						{"feature_name": "file_uploads", "remaining": 2},
+					},
+				}
+				b, _ := json.Marshal(body)
+				return upstreamTestResponse(200, string(b)), nil
+			case strings.Contains(req.URL.Path, "/backend-api/accounts/check/"):
+				return upstreamTestResponse(200, `{"accounts":{"default":{"account":{"plan_type":"free"}}}}`), nil
+			default:
+				t.Fatalf("unexpected upstream request path: %s", req.URL.Path)
+				return nil, nil
+			}
+		}),
+	}
+
+	account, err := client.GetUserInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetUserInfo: %v", err)
+	}
+	if account.ImageLimitResetAt == nil || *account.ImageLimitResetAt != resetAt {
+		t.Fatalf("image reset = %#v, want %s", account.ImageLimitResetAt, resetAt)
+	}
+	if account.RestoreAt != nil || account.RateLimitResetAt != nil {
+		t.Fatalf("image reset should not populate generic rate limit fields: %#v", account)
+	}
+	if account.UploadQuota != 2 || account.UploadQuotaUnknown {
+		t.Fatalf("upload quota = %#v, want known 2", account)
+	}
+}
+
 func TestDownloadRejectsOversizedContentLength(t *testing.T) {
 	client := &UpstreamClient{
 		userAgent: "test-agent",

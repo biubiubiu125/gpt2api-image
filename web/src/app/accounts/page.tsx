@@ -18,6 +18,7 @@ import {
   Rows3,
   Search,
   Trash2,
+  UploadCloud,
   UserRound,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -83,7 +84,8 @@ const metricCards = [
   { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
-  { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
+  { key: "quota", label: "图片额度", color: "text-blue-500", icon: RefreshCw },
+  { key: "uploadQuota", label: "上传额度", color: "text-cyan-600", icon: UploadCloud },
 ] as const;
 
 function isUnlimitedImageQuotaAccount(account: Account) {
@@ -118,6 +120,39 @@ function formatQuota(account: Account) {
     return "未知";
   }
   return String(Math.max(0, account.quota));
+}
+
+function uploadQuotaUnknown(account: Account) {
+  return Boolean(account.upload_quota_unknown) || typeof account.upload_quota !== "number";
+}
+
+function hasActiveLimitWindow(account: Account) {
+  if (account.status !== "限流") {
+    return false;
+  }
+  const resetAt = account.rate_limit_reset_at || account.restore_at;
+  if (!resetAt) {
+    return false;
+  }
+  const date = new Date(resetAt);
+  return Number.isNaN(date.getTime()) || Date.now() < date.getTime();
+}
+
+function isUploadUsableAccount(account: Account) {
+  return (
+    account.status !== "异常" &&
+    account.status !== "禁用" &&
+    !account.pending_delete &&
+    !hasActiveLimitWindow(account) &&
+    !uploadQuotaUnknown(account)
+  );
+}
+
+function formatUploadQuota(account: Account) {
+  if (uploadQuotaUnknown(account)) {
+    return "未知";
+  }
+  return String(Math.max(0, Math.floor(account.upload_quota ?? 0)));
 }
 
 function formatRestoreAt(value?: string | null) {
@@ -158,6 +193,14 @@ function formatQuotaSummary(accounts: Account[]) {
     return "∞";
   }
   return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+}
+
+function formatUploadQuotaSummary(accounts: Account[]) {
+  return formatCompact(
+    accounts
+      .filter(isUploadUsableAccount)
+      .reduce((sum, account) => sum + Math.max(0, Math.floor(account.upload_quota ?? 0)), 0),
+  );
 }
 
 function maskToken(token?: string) {
@@ -299,13 +342,14 @@ function AccountCard({
   const typeAvatar = (typeName[0] || "?").toUpperCase();
   const isUnlimited = isUnlimitedImageQuotaAccount(account);
   const isUnknown = imageQuotaUnknown(account);
+  const isUploadUnknown = uploadQuotaUnknown(account);
   const maxQuota = quotaUpperBound(account);
   const remainingPct = isUnlimited
     ? 100
     : isUnknown
       ? 0
       : Math.max(0, Math.min(100, Math.round((account.quota / maxQuota) * 100)));
-  const restore = formatRestoreAt(account.restore_at);
+  const restore = formatRestoreAt(account.rate_limit_reset_at || account.restore_at || account.image_limit_reset_at);
 
   return (
     <div
@@ -384,7 +428,7 @@ function AccountCard({
       <div className="mt-3 space-y-1.5">
         <div className="flex items-baseline justify-between">
           <span className="font-data text-[10px] font-semibold tracking-[0.18em] uppercase text-muted-foreground">
-            剩余额度
+            图片额度
           </span>
           <span className="font-data tabular-nums text-xs">
             {isUnlimited ? (
@@ -402,6 +446,26 @@ function AccountCard({
           </span>
         </div>
         <PillProgress percent={remainingPct} />
+      </div>
+
+      <div className="mt-3 space-y-1.5">
+        <div className="flex items-baseline justify-between">
+          <span className="font-data text-[10px] font-semibold tracking-[0.18em] uppercase text-muted-foreground">
+            上传额度
+          </span>
+          <span className="font-data tabular-nums text-xs">
+            {isUploadUnknown ? (
+              <span className="text-muted-foreground">未知</span>
+            ) : (
+              <span className="font-semibold text-foreground">{formatUploadQuota(account)}</span>
+            )}
+          </span>
+        </div>
+        {account.upload_limit_reset_at ? (
+          <div className="text-[11px] leading-4 text-muted-foreground">
+            恢复 <span className="font-data text-foreground/80">{formatRestoreAt(account.upload_limit_reset_at).absolute}</span>
+          </div>
+        ) : null}
       </div>
 
       <div className="mt-4 flex items-center gap-0.5 border-t border-border/60 pt-2.5 text-muted-foreground">
@@ -552,8 +616,9 @@ function AccountsPageContent() {
     const abnormal = accounts.filter((item) => item.status === "异常").length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
     const quota = formatQuotaSummary(accounts);
+    const uploadQuota = formatUploadQuotaSummary(accounts);
 
-    return { total, active, limited, abnormal, disabled, quota };
+    return { total, active, limited, abnormal, disabled, quota, uploadQuota };
   }, [accounts]);
 
   const accountTypeOptions = useMemo(
@@ -791,7 +856,7 @@ function AccountsPageContent() {
       </Dialog>
 
       <section className="mt-3 space-y-3 lg:mt-2">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-7">
           {metricCards.map((item) => {
             const Icon = item.icon;
             const value = summary[item.key];
@@ -974,7 +1039,7 @@ function AccountsPageContent() {
 
             {viewMode === "list" ? (
               <div className="overflow-x-auto">
-              <table className="w-full min-w-[920px] text-left">
+              <table className="w-full min-w-[1020px] text-left">
                 <thead className="border-b border-border bg-secondary/40 text-[12px] font-medium text-muted-foreground">
                   <tr>
                     <th className="w-12 px-4 py-2.5">
@@ -987,7 +1052,8 @@ function AccountsPageContent() {
                     <th className="w-36 px-4 py-2.5 font-medium">类型</th>
                     <th className="w-24 px-4 py-2.5 font-medium">状态</th>
                     <th className="w-56 px-4 py-2.5 font-medium">账号信息</th>
-                    <th className="w-24 px-4 py-2.5 font-medium">额度</th>
+                    <th className="w-24 px-4 py-2.5 font-medium">图片额度</th>
+                    <th className="w-24 px-4 py-2.5 font-medium">上传额度</th>
                     <th className="w-40 px-4 py-2.5 font-medium">恢复时间</th>
                     <th className="w-36 px-4 py-2.5 font-medium">注册时间</th>
                     <th className="w-18 px-4 py-2.5 font-medium">成功</th>
@@ -1066,9 +1132,19 @@ function AccountsPageContent() {
                             {formatQuota(account)}
                           </span>
                         </td>
+                        <td className="px-4 py-3">
+                          <span
+                            className={cn(
+                              "font-data tabular-nums text-sm font-semibold",
+                              uploadQuotaUnknown(account) ? "text-muted-foreground" : "text-foreground",
+                            )}
+                          >
+                            {formatUploadQuota(account)}
+                          </span>
+                        </td>
                         <td className="px-4 py-3 text-xs leading-5 text-muted-foreground">
                           {(() => {
-                            const restore = formatRestoreAt(account.restore_at);
+                            const restore = formatRestoreAt(account.rate_limit_reset_at || account.restore_at || account.image_limit_reset_at);
                             return (
                               <div className="space-y-0.5">
                                 {restore.relative ? <div className="font-medium text-foreground">{restore.relative}</div> : null}

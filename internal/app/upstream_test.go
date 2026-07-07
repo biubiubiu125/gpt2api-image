@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +35,47 @@ func (r upstreamErrorReadCloser) Close() error {
 	return nil
 }
 
+type upstreamCancelingReadCloser struct {
+	cancel     context.CancelFunc
+	cancelOnce sync.Once
+	closeOnce  sync.Once
+	closed     chan struct{}
+}
+
+func (r *upstreamCancelingReadCloser) Read(_ []byte) (int, error) {
+	r.cancelOnce.Do(func() {
+		if r.cancel != nil {
+			r.cancel()
+		}
+	})
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *upstreamCancelingReadCloser) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.closed)
+	})
+	return nil
+}
+
+type upstreamBlockingReadCloser struct {
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func (r *upstreamBlockingReadCloser) Read(_ []byte) (int, error) {
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *upstreamBlockingReadCloser) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.closed)
+	})
+	return nil
+}
+
 func upstreamTestResponse(status int, body string) *http.Response {
 	return upstreamTestResponseWithHeader(status, body, http.Header{})
 }
@@ -46,6 +89,15 @@ func upstreamTestResponseWithHeader(status int, body string, header http.Header)
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Header:     header,
 	}
+}
+
+func upstreamRequestModel(t *testing.T, req *http.Request) string {
+	t.Helper()
+	var body map[string]any
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		t.Fatalf("decode upstream request body: %v", err)
+	}
+	return strAny(body["model"], "")
 }
 
 func tinyPNGBytes(t *testing.T) []byte {
@@ -632,6 +684,447 @@ func TestNormalizeTextModelOptions(t *testing.T) {
 		if got.Model != tc.wantModel || got.ReasoningLevel != tc.wantReasoning {
 			t.Fatalf("normalizeTextModelOptions(%q) = %#v, want model=%q reasoning=%q", tc.model, got, tc.wantModel, tc.wantReasoning)
 		}
+	}
+}
+
+func TestImageModelSlug(t *testing.T) {
+	cases := []struct {
+		model string
+		want  []string
+	}{
+		{"", []string{"auto"}},
+		{"auto", []string{"auto"}},
+		{"gpt-image-2", []string{"gpt-5-5-thinking", "gpt-5-5", "gpt-5-3"}},
+		{"GPT-IMAGE-2", []string{"gpt-5-5-thinking", "gpt-5-5", "gpt-5-3"}},
+		{"codex-gpt-image-2", []string{"codex-gpt-image-2"}},
+		{"unknown", []string{"auto"}},
+	}
+	for _, tc := range cases {
+		got := imageModelSlugs(tc.model)
+		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Fatalf("imageModelSlugs(%q) = %#v, want %#v", tc.model, got, tc.want)
+		}
+		if got := imageModelSlug(tc.model); got != tc.want[0] {
+			t.Fatalf("imageModelSlug(%q) = %q, want first slug %q", tc.model, got, tc.want[0])
+		}
+	}
+}
+
+func TestShouldTryNextImageModelSlug(t *testing.T) {
+	for _, err := range []error{
+		errors.New("POST /backend-api/f/conversation/prepare failed: status=400 body=model_not_found"),
+		errors.New("POST /backend-api/f/conversation failed: status=400 body=gpt-5-5-thinking is not available for this account"),
+		errors.New(`POST /backend-api/f/conversation/prepare failed: status=429 body={"error":"usage_limit_reached"}`),
+		errors.New("POST /backend-api/f/conversation/prepare failed: status=429 body=Usage limit reached for gpt-5-5-thinking"),
+		errors.New("POST /backend-api/f/conversation/prepare failed: status=429 body=You've hit the free plan limit for gpt-5-5-thinking. Try again when the limit resets."),
+		errors.New("I can't generate images right now."),
+		errors.New("I can't generate this image right now."),
+		errors.New("I can\u2019t generate this image right now."),
+		errors.New("I cannot create that image."),
+		errors.New("Sorry, I was unable to generate the requested image."),
+		errors.New("image poll timed out after 1m0s"),
+		errors.New("upstream returned no image"),
+		errors.New("image generation SSE timed out (120s)"),
+		errors.New("GET /backend-api/conversation/abc failed: status=503 body=busy"),
+	} {
+		if !shouldTryNextImageModelSlug(err, nil) {
+			t.Fatalf("expected retry for %v", err)
+		}
+	}
+	if shouldTryNextImageModelSlug(errors.New("content policy blocked"), nil) {
+		t.Fatal("content policy errors should not try lower image model slug")
+	}
+	if shouldTryNextImageModelSlug(errors.New("I can't generate this image because it violates our content policy."), nil) {
+		t.Fatal("content policy image refusal should not try lower image model slug")
+	}
+	if shouldTryNextImageModelSlug(errors.New("I can\u2019t generate this image because it violates our content policy."), nil) {
+		t.Fatal("content policy image refusal with smart apostrophe should not try lower image model slug")
+	}
+	if isImagePolicyMessage("I can't generate images right now.") {
+		t.Fatal("generic image generation failure should not be treated as content policy")
+	}
+	if shouldTryNextImageModelSlug(errors.New("POST /backend-api/f/conversation failed: status=429 body=You've hit the free plan limit for image generation. Try again when your limit resets."), nil) {
+		t.Fatal("global image quota errors should not try lower image model slug")
+	}
+	if shouldTryNextImageModelSlug(errors.New("invalid prompt"), nil) {
+		t.Fatal("non-model validation errors should not try lower image model slug")
+	}
+	if shouldTryNextImageModelSlug(errors.New("upstream returned no image"), context.Canceled) {
+		t.Fatal("context cancellation should not try lower image model slug")
+	}
+	if shouldTryNextImageModelSlug(errors.Join(errors.New("image generation SSE timed out"), context.Canceled), nil) {
+		t.Fatal("wrapped context cancellation should not try lower image model slug")
+	}
+}
+
+func TestGenerateImageTriesImageModelSlugsInOrder(t *testing.T) {
+	imageBytes := tinyPNGBytes(t)
+	prepareModels := []string{}
+	startModels := []string{}
+	client := &UpstreamClient{
+		token:     "access-token",
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/":
+				return upstreamTestResponse(200, "<html></html>"), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/sentinel/chat-requirements":
+				return upstreamTestResponse(200, `{"token":"requirements-token"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
+				model := upstreamRequestModel(t, req)
+				prepareModels = append(prepareModels, model)
+				switch model {
+				case "gpt-5-5-thinking":
+					return upstreamTestResponse(429, `You've hit the free plan limit for gpt-5-5-thinking. Try again when the limit resets.`), nil
+				case "gpt-5-5":
+					return upstreamTestResponse(200, `{"conduit_token":"conduit-gpt-5-5"}`), nil
+				case "gpt-5-3":
+					return upstreamTestResponse(200, `{"conduit_token":"conduit-gpt-5-3"}`), nil
+				default:
+					t.Fatalf("unexpected prepare model %q", model)
+				}
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
+				model := upstreamRequestModel(t, req)
+				startModels = append(startModels, model)
+				if model == "gpt-5-5" {
+					return upstreamTestResponse(400, `gpt-5-5 is not available for this account`), nil
+				}
+				if model != "gpt-5-3" {
+					t.Fatalf("unexpected start model %q", model)
+				}
+				sseBody := strings.Join([]string{
+					`data: {"type":"server_ste_metadata","metadata":{"tool_invoked":true,"turn_use_case":"image gen"}}`,
+					"",
+					`data: {"conversation_id":"conv_test","o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":{"asset_pointer":"file-service://file_success","content_type":"image_asset_pointer"}}]}`,
+					"",
+					"data: [DONE]",
+					"",
+				}, "\n")
+				return upstreamTestResponseWithHeader(200, sseBody, http.Header{"Content-Type": []string{"text/event-stream"}}), nil
+			case req.Method == http.MethodGet && req.URL.Path == "/backend-api/files/file_success/download":
+				return upstreamTestResponse(200, `{"download_url":"https://example.test/generated.png"}`), nil
+			case req.Method == http.MethodGet && req.URL.Host == "example.test":
+				return upstreamTestResponseWithHeader(200, string(imageBytes), http.Header{"Content-Type": []string{"image/png"}}), nil
+			default:
+				t.Fatalf("unexpected upstream request %s %s", req.Method, req.URL.String())
+			}
+			return nil, nil
+		}),
+	}
+
+	items, err := client.GenerateImage(context.Background(), "draw a cat", "gpt-image-2", "1:1", "1k", nil, imageGenerationOptions{Timeout: time.Second, PollInterval: time.Millisecond})
+	if err != nil {
+		t.Fatalf("GenerateImage err = %v", err)
+	}
+	if len(items) != 1 || !bytes.Equal(items[0].Bytes, imageBytes) {
+		t.Fatalf("GenerateImage items = %#v, want one generated image", items)
+	}
+	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking,gpt-5-5,gpt-5-3"; got != want {
+		t.Fatalf("prepare models = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(startModels, ","), "gpt-5-5,gpt-5-3"; got != want {
+		t.Fatalf("start models = %q, want %q", got, want)
+	}
+}
+
+func TestGenerateImageReturnsPolicyMessageWithoutFallback(t *testing.T) {
+	prepareModels := []string{}
+	startModels := []string{}
+	client := &UpstreamClient{
+		token:     "access-token",
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/":
+				return upstreamTestResponse(200, "<html></html>"), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/sentinel/chat-requirements":
+				return upstreamTestResponse(200, `{"token":"requirements-token"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
+				model := upstreamRequestModel(t, req)
+				prepareModels = append(prepareModels, model)
+				if model != "gpt-5-5-thinking" {
+					t.Fatalf("policy response should not try prepare model %q", model)
+				}
+				return upstreamTestResponse(200, `{"conduit_token":"conduit-policy"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
+				model := upstreamRequestModel(t, req)
+				startModels = append(startModels, model)
+				if model != "gpt-5-5-thinking" {
+					t.Fatalf("policy response should not try start model %q", model)
+				}
+				sseBody := strings.Join([]string{
+					`data: {"conversation_id":"conv_policy","message":{"author":{"role":"assistant"},"content":{"parts":["I can't help create that image because it violates our content policy."]}}}`,
+					"",
+					"data: [DONE]",
+					"",
+				}, "\n")
+				return upstreamTestResponseWithHeader(200, sseBody, http.Header{"Content-Type": []string{"text/event-stream"}}), nil
+			case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/backend-api/conversation/"):
+				t.Fatalf("policy response should not poll conversation %s", req.URL.Path)
+			default:
+				t.Fatalf("unexpected upstream request %s %s", req.Method, req.URL.String())
+			}
+			return nil, nil
+		}),
+	}
+
+	items, err := client.GenerateImage(context.Background(), "draw a blocked subject", "gpt-image-2", "1:1", "1k", nil, imageGenerationOptions{Timeout: time.Second, PollInterval: time.Millisecond})
+	if err == nil || !strings.Contains(err.Error(), "content policy") {
+		t.Fatalf("GenerateImage err = %v, want content policy message", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("GenerateImage items = %#v, want none", items)
+	}
+	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking"; got != want {
+		t.Fatalf("prepare models = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking"; got != want {
+		t.Fatalf("start models = %q, want %q", got, want)
+	}
+}
+
+func TestGenerateImageReturnsModerationBlockWithoutFallback(t *testing.T) {
+	prepareModels := []string{}
+	startModels := []string{}
+	client := &UpstreamClient{
+		token:     "access-token",
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/":
+				return upstreamTestResponse(200, "<html></html>"), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/sentinel/chat-requirements":
+				return upstreamTestResponse(200, `{"token":"requirements-token"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
+				model := upstreamRequestModel(t, req)
+				prepareModels = append(prepareModels, model)
+				if model != "gpt-5-5-thinking" {
+					t.Fatalf("moderation block should not try prepare model %q", model)
+				}
+				return upstreamTestResponse(200, `{"conduit_token":"conduit-blocked"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
+				model := upstreamRequestModel(t, req)
+				startModels = append(startModels, model)
+				if model != "gpt-5-5-thinking" {
+					t.Fatalf("moderation block should not try start model %q", model)
+				}
+				sseBody := strings.Join([]string{
+					`data: {"type":"moderation","moderation_response":{"blocked":true}}`,
+					"",
+					"data: [DONE]",
+					"",
+				}, "\n")
+				return upstreamTestResponseWithHeader(200, sseBody, http.Header{"Content-Type": []string{"text/event-stream"}}), nil
+			case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/backend-api/conversation/"):
+				t.Fatalf("moderation block should not poll conversation %s", req.URL.Path)
+			default:
+				t.Fatalf("unexpected upstream request %s %s", req.Method, req.URL.String())
+			}
+			return nil, nil
+		}),
+	}
+
+	items, err := client.GenerateImage(context.Background(), "draw a blocked subject", "gpt-image-2", "1:1", "1k", nil, imageGenerationOptions{Timeout: time.Second, PollInterval: time.Millisecond})
+	if err == nil || !strings.Contains(err.Error(), "content policy blocked") {
+		t.Fatalf("GenerateImage err = %v, want moderation block", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("GenerateImage items = %#v, want none", items)
+	}
+	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking"; got != want {
+		t.Fatalf("prepare models = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking"; got != want {
+		t.Fatalf("start models = %q, want %q", got, want)
+	}
+}
+
+func TestGenerateImageReturnsContextCanceledDuringSSEWithoutFallback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	prepareModels := []string{}
+	startModels := []string{}
+	client := &UpstreamClient{
+		token:     "access-token",
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/":
+				return upstreamTestResponse(200, "<html></html>"), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/sentinel/chat-requirements":
+				return upstreamTestResponse(200, `{"token":"requirements-token"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
+				model := upstreamRequestModel(t, req)
+				prepareModels = append(prepareModels, model)
+				if model != "gpt-5-5-thinking" {
+					t.Fatalf("canceled request should not try prepare model %q", model)
+				}
+				return upstreamTestResponse(200, `{"conduit_token":"conduit-canceled"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
+				model := upstreamRequestModel(t, req)
+				startModels = append(startModels, model)
+				if model != "gpt-5-5-thinking" {
+					t.Fatalf("canceled request should not try start model %q", model)
+				}
+				return &http.Response{
+					StatusCode: 200,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       &upstreamCancelingReadCloser{cancel: cancel, closed: make(chan struct{})},
+				}, nil
+			default:
+				t.Fatalf("unexpected upstream request %s %s", req.Method, req.URL.String())
+			}
+			return nil, nil
+		}),
+	}
+
+	items, err := client.GenerateImage(ctx, "draw a cat", "gpt-image-2", "1:1", "1k", nil, imageGenerationOptions{Timeout: time.Second, PollInterval: time.Millisecond})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("GenerateImage err = %v, want context.Canceled", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("GenerateImage items = %#v, want none", items)
+	}
+	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking"; got != want {
+		t.Fatalf("prepare models = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking"; got != want {
+		t.Fatalf("start models = %q, want %q", got, want)
+	}
+}
+
+func TestGenerateImageFallbacksOnSSETimeout(t *testing.T) {
+	imageBytes := tinyPNGBytes(t)
+	prepareModels := []string{}
+	startModels := []string{}
+	client := &UpstreamClient{
+		token:     "access-token",
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/":
+				return upstreamTestResponse(200, "<html></html>"), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/sentinel/chat-requirements":
+				return upstreamTestResponse(200, `{"token":"requirements-token"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
+				model := upstreamRequestModel(t, req)
+				prepareModels = append(prepareModels, model)
+				return upstreamTestResponse(200, `{"conduit_token":"conduit-`+model+`"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
+				model := upstreamRequestModel(t, req)
+				startModels = append(startModels, model)
+				if model == "gpt-5-5-thinking" {
+					return &http.Response{
+						StatusCode: 200,
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body:       &upstreamBlockingReadCloser{closed: make(chan struct{})},
+					}, nil
+				}
+				if model != "gpt-5-5" {
+					t.Fatalf("unexpected fallback start model %q", model)
+				}
+				sseBody := strings.Join([]string{
+					`data: {"type":"server_ste_metadata","metadata":{"tool_invoked":true,"turn_use_case":"image gen"}}`,
+					"",
+					`data: {"conversation_id":"conv_timeout_success","o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":{"asset_pointer":"file-service://file_timeout_success","content_type":"image_asset_pointer"}}]}`,
+					"",
+					"data: [DONE]",
+					"",
+				}, "\n")
+				return upstreamTestResponseWithHeader(200, sseBody, http.Header{"Content-Type": []string{"text/event-stream"}}), nil
+			case req.Method == http.MethodGet && req.URL.Path == "/backend-api/files/file_timeout_success/download":
+				return upstreamTestResponse(200, `{"download_url":"https://example.test/generated-timeout.png"}`), nil
+			case req.Method == http.MethodGet && req.URL.Host == "example.test":
+				return upstreamTestResponseWithHeader(200, string(imageBytes), http.Header{"Content-Type": []string{"image/png"}}), nil
+			default:
+				t.Fatalf("unexpected upstream request %s %s", req.Method, req.URL.String())
+			}
+			return nil, nil
+		}),
+	}
+
+	items, err := client.GenerateImage(context.Background(), "draw a cat", "gpt-image-2", "1:1", "1k", nil, imageGenerationOptions{Timeout: 15 * time.Millisecond, PollInterval: time.Millisecond})
+	if err != nil {
+		t.Fatalf("GenerateImage err = %v", err)
+	}
+	if len(items) != 1 || !bytes.Equal(items[0].Bytes, imageBytes) {
+		t.Fatalf("GenerateImage items = %#v, want one generated image", items)
+	}
+	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking,gpt-5-5"; got != want {
+		t.Fatalf("prepare models = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking,gpt-5-5"; got != want {
+		t.Fatalf("start models = %q, want %q", got, want)
+	}
+}
+
+func TestGenerateImageFallbacksOnGenericGenerationRefusal(t *testing.T) {
+	imageBytes := tinyPNGBytes(t)
+	prepareModels := []string{}
+	startModels := []string{}
+	client := &UpstreamClient{
+		token:     "access-token",
+		userAgent: "test-agent",
+		client: upstreamDoerFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/":
+				return upstreamTestResponse(200, "<html></html>"), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/sentinel/chat-requirements":
+				return upstreamTestResponse(200, `{"token":"requirements-token"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
+				model := upstreamRequestModel(t, req)
+				prepareModels = append(prepareModels, model)
+				return upstreamTestResponse(200, `{"conduit_token":"conduit-`+model+`"}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
+				model := upstreamRequestModel(t, req)
+				startModels = append(startModels, model)
+				if model == "gpt-5-5-thinking" {
+					sseBody := strings.Join([]string{
+						`data: {"type":"server_ste_metadata","metadata":{"tool_invoked":false,"turn_use_case":"text"}}`,
+						"",
+						`data: {"conversation_id":"conv_generic","message":{"author":{"role":"assistant"},"content":{"parts":["I can\u2019t generate this image right now."]}}}`,
+						"",
+						"data: [DONE]",
+						"",
+					}, "\n")
+					return upstreamTestResponseWithHeader(200, sseBody, http.Header{"Content-Type": []string{"text/event-stream"}}), nil
+				}
+				if model != "gpt-5-5" {
+					t.Fatalf("unexpected fallback start model %q", model)
+				}
+				sseBody := strings.Join([]string{
+					`data: {"type":"server_ste_metadata","metadata":{"tool_invoked":true,"turn_use_case":"image gen"}}`,
+					"",
+					`data: {"conversation_id":"conv_success","o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":{"asset_pointer":"file-service://file_success","content_type":"image_asset_pointer"}}]}`,
+					"",
+					"data: [DONE]",
+					"",
+				}, "\n")
+				return upstreamTestResponseWithHeader(200, sseBody, http.Header{"Content-Type": []string{"text/event-stream"}}), nil
+			case req.Method == http.MethodGet && req.URL.Path == "/backend-api/conversation/conv_generic":
+				t.Fatalf("generic no-image text with text metadata should fall back without polling %s", req.URL.Path)
+			case req.Method == http.MethodGet && req.URL.Path == "/backend-api/files/file_success/download":
+				return upstreamTestResponse(200, `{"download_url":"https://example.test/generated-generic.png"}`), nil
+			case req.Method == http.MethodGet && req.URL.Host == "example.test":
+				return upstreamTestResponseWithHeader(200, string(imageBytes), http.Header{"Content-Type": []string{"image/png"}}), nil
+			default:
+				t.Fatalf("unexpected upstream request %s %s", req.Method, req.URL.String())
+			}
+			return nil, nil
+		}),
+	}
+
+	items, err := client.GenerateImage(context.Background(), "draw a cat", "gpt-image-2", "1:1", "1k", nil, imageGenerationOptions{Timeout: 20 * time.Millisecond, PollInterval: time.Millisecond})
+	if err != nil {
+		t.Fatalf("GenerateImage err = %v", err)
+	}
+	if len(items) != 1 || !bytes.Equal(items[0].Bytes, imageBytes) {
+		t.Fatalf("GenerateImage items = %#v, want one generated image", items)
+	}
+	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking,gpt-5-5"; got != want {
+		t.Fatalf("prepare models = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking,gpt-5-5"; got != want {
+		t.Fatalf("start models = %q, want %q", got, want)
 	}
 }
 

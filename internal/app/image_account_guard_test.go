@@ -33,6 +33,76 @@ func TestImageAccountAttemptScopeCapsAtFive(t *testing.T) {
 	}
 }
 
+func TestGenerateImageWithPoolCanceledContextDoesNotMarkAccountFailure(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	if err := s.store.SaveAccounts([]Account{
+		{AccessToken: "tok-a", SourceType: "web", Status: accountStatusNormal, Quota: 5},
+		{AccessToken: "tok-b", SourceType: "web", Status: accountStatusNormal, Quota: 5},
+	}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	items, err := s.generateImageWithPool(ctx, "prompt", "gpt-image-2", "1:1", "", nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("generateImageWithPool err = %v, want context.Canceled", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("items = %#v, want none", items)
+	}
+	for _, account := range s.store.LoadAccounts() {
+		if account.Fail != 0 {
+			t.Fatalf("account %s fail = %d, want 0", account.AccessToken, account.Fail)
+		}
+		if got := s.accountPool.activeCount(account.AccessToken); got != 0 {
+			t.Fatalf("account %s active count = %d, want 0", account.AccessToken, got)
+		}
+	}
+}
+
+func TestCollectImageBatchResultsDoesNotSwallowCanceledOrPolicy(t *testing.T) {
+	success := upstreamImageResult{Bytes: []byte("ok")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	items, err := collectImageBatchResults(ctx, [][]upstreamImageResult{{success}}, []error{nil})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled context err = %v, want context.Canceled", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("canceled context items = %#v, want none", items)
+	}
+
+	items, err = collectImageBatchResults(context.Background(), [][]upstreamImageResult{{success}, nil}, []error{nil, context.Canceled})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled worker err = %v, want context.Canceled", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("canceled worker items = %#v, want none", items)
+	}
+
+	policyErr := errors.New("I can\u2019t generate this image because it violates our content policy.")
+	items, err = collectImageBatchResults(context.Background(), [][]upstreamImageResult{{success}, nil}, []error{nil, policyErr})
+	if err == nil || !strings.Contains(err.Error(), "content policy") {
+		t.Fatalf("policy err = %v, want content policy", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("policy items = %#v, want none", items)
+	}
+}
+
+func TestCollectImageBatchResultsAllowsPartialForRetryableFailures(t *testing.T) {
+	success := upstreamImageResult{Bytes: []byte("ok")}
+	items, err := collectImageBatchResults(context.Background(), [][]upstreamImageResult{{success}, nil}, []error{nil, errors.New("image generation SSE timed out (120s)")})
+	if err != nil {
+		t.Fatalf("collect err = %v, want partial success", err)
+	}
+	if len(items) != 1 || string(items[0].Bytes) != "ok" {
+		t.Fatalf("items = %#v, want one successful image", items)
+	}
+}
+
 func TestPickTokenPrefersHighQuotaLowUsageLowConcurrency(t *testing.T) {
 	cfg := Config{ImageAccountConcurrency: 3}
 	pool := newAccountPool(&cfg)

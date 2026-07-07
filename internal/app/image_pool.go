@@ -127,6 +127,9 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 	s.cleanupUnusableImageAccounts()
 	var lastErr error
 	for !scope.exhausted() {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		excluded := scope.excludedSnapshot()
 		traceLogf(ctx, "├─ image account attempt %d/%d model=%s resolution=%s excluded=%d", scope.usedCount()+1, maxImageAccountFallbackAttempts, model, resolution, len(excluded))
 		account, err := s.pickAccountExcluding(model, resolution, excluded)
@@ -146,6 +149,16 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 		}
 		client, actualAccount, err := s.upstreamClientForImageAccount(model, resolution, account)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				s.accountPool.releaseToken(poolToken)
+				s.cleanupPendingDeletedAccounts()
+				return nil, ctxErr
+			}
+			if errors.Is(err, context.Canceled) {
+				s.accountPool.releaseToken(poolToken)
+				s.cleanupPendingDeletedAccounts()
+				return nil, err
+			}
 			if !errors.Is(err, errImageAccountBusy) {
 				s.markAccountFailure(poolToken, err, true)
 			}
@@ -177,6 +190,9 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 		leaseID, leased, err := s.acquireImageAccountLease(ctx, token)
 		if err != nil {
 			releaseSelectedToken()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			lastErr = err
 			continue
 		}
@@ -196,6 +212,18 @@ func (s *Server) generateImageWithPoolScopedRoute(ctx context.Context, prompt, m
 			return items, nil
 		}
 		traceLogf(ctx, "│  └─ image account attempt failed error=%v", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			releaseSelectedToken()
+			s.releaseImageAccountLease(ctx, leaseID)
+			s.cleanupPendingDeletedAccounts()
+			return nil, ctxErr
+		}
+		if errors.Is(err, context.Canceled) {
+			releaseSelectedToken()
+			s.releaseImageAccountLease(ctx, leaseID)
+			s.cleanupPendingDeletedAccounts()
+			return nil, err
+		}
 		s.markAccountFailure(token, err, true)
 		releaseSelectedToken()
 		s.releaseImageAccountLease(ctx, leaseID)
@@ -291,15 +319,29 @@ func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size
 		}()
 	}
 	wg.Wait()
+	return collectImageBatchResults(ctx, results, errs)
+}
+
+func collectImageBatchResults(ctx context.Context, results [][]upstreamImageResult, errs []error) ([]upstreamImageResult, error) {
 	out := []upstreamImageResult{}
 	var lastErr error
-	for i := 0; i < n; i++ {
-		if len(results[i]) > 0 {
+	var blockingErr error
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		blockingErr = ctxErr
+	}
+	for i := 0; i < len(results) || i < len(errs); i++ {
+		if i < len(results) && len(results[i]) > 0 {
 			out = append(out, results[i][0])
 		}
-		if errs[i] != nil {
+		if i < len(errs) && errs[i] != nil {
 			lastErr = errs[i]
+			if blockingErr == nil && isNonSwallowableImageBatchError(errs[i]) {
+				blockingErr = errs[i]
+			}
 		}
+	}
+	if blockingErr != nil {
+		return nil, blockingErr
 	}
 	if len(out) > 0 {
 		return out, nil
@@ -308,6 +350,16 @@ func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size
 		return nil, lastErr
 	}
 	return nil, errors.New("upstream returned no image")
+}
+
+func isNonSwallowableImageBatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return isImagePolicyMessage(err.Error())
 }
 
 func (s *Server) generateTaskImages(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {

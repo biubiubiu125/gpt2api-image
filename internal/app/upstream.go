@@ -544,58 +544,79 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 		}
 		uploads = append(uploads, up)
 	}
-	traceLogf(ctx, "│  ├─ step prepare image conversation")
-	conduit, err := c.prepareImage(ctx, finalPrompt, model, cr)
+	slugs := imageModelSlugs(model)
+	var lastErr error
+	for idx, slug := range slugs {
+		traceLogf(ctx, "│  ├─ image backend model attempt %d/%d slug=%s", idx+1, len(slugs), slug)
+		items, err := c.generateImageWithModelSlug(ctx, finalPrompt, slug, cr, uploads, opts)
+		if err == nil {
+			return items, nil
+		}
+		lastErr = err
+		traceLogf(ctx, "│  └─ image backend model slug=%s failed error=%v", slug, err)
+		if idx == len(slugs)-1 || !shouldTryNextImageModelSlug(err, ctx.Err()) {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("upstream returned no image")
+	}
+	return nil, lastErr
+}
+
+func (c *UpstreamClient) generateImageWithModelSlug(ctx context.Context, prompt, modelSlug string, cr chatRequirements, uploads []map[string]any, opts imageGenerationOptions) ([]upstreamImageResult, error) {
+	traceLogf(ctx, "│  ├─ step prepare image conversation model_slug=%s", modelSlug)
+	conduit, err := c.prepareImage(ctx, prompt, modelSlug, cr)
 	if err != nil {
 		return nil, err
 	}
-	traceLogf(ctx, "│  ├─ step start image SSE conversation uploads=%d", len(uploads))
-	resp, err := c.startImage(ctx, finalPrompt, model, cr, conduit, uploads)
+	traceLogf(ctx, "│  ├─ step start image SSE conversation model_slug=%s uploads=%d", modelSlug, len(uploads))
+	resp, err := c.startImage(ctx, prompt, modelSlug, cr, conduit, uploads)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	cid := ""
-	fileIDs := []string{}
-	sedimentIDs := []string{}
-	message := ""
-	state := newUpstreamConversationState("", nil)
-	generated := false
 	// 限制 SSE 读取时长，防止上游无限挂起。
 	sseCtx, sseCancel := context.WithTimeout(ctx, opts.Timeout)
 	defer sseCancel()
-	// 从 resp.Body 读取 SSE，受 sseCtx 控制
-	done := make(chan struct{}, 1)
+	sseResults := make(chan imageSSEParseResult, 1)
 	go func() {
-		defer func() { done <- struct{}{} }()
-		for ev := range parseSSE(resp.Body) {
-			if ev == "[DONE]" {
-				generated = true
-				return
-			}
-			updateImageState(ev, &cid, &message)
-			if meta, ok := state.Apply(ev); ok {
-				if meta.ConversationID != "" {
-					cid = meta.ConversationID
-				}
-				fileIDs = unique(append(fileIDs, meta.FileIDs...))
-				sedimentIDs = unique(append(sedimentIDs, meta.SedimentIDs...))
-				if meta.Delta != "" || state.Text != "" {
-					message = state.Text
-				}
-			}
-		}
-		generated = true
+		sseResults <- parseImageSSE(resp.Body)
 	}()
+	var parsed imageSSEParseResult
 	select {
-	case <-done:
+	case parsed = <-sseResults:
 	case <-sseCtx.Done():
-		if !generated {
+		select {
+		case parsed = <-sseResults:
+		default:
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			return nil, fmt.Errorf("image generation SSE timed out (%ds)", int(opts.Timeout/time.Second))
 		}
 	}
-	if message != "" && len(fileIDs) == 0 && len(sedimentIDs) == 0 && (state.Blocked || state.ToolInvoked == false || state.TurnUseCase == "text") {
-		return nil, errors.New(cleanImageMessage(message))
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	cid := parsed.cid
+	fileIDs := parsed.fileIDs
+	sedimentIDs := parsed.sedimentIDs
+	message := parsed.message
+	state := parsed.state
+	if state == nil {
+		state = newUpstreamConversationState("", nil)
+	}
+	if len(fileIDs) == 0 && len(sedimentIDs) == 0 {
+		if state.Blocked {
+			if message != "" {
+				return nil, errors.New(cleanImageMessage(message))
+			}
+			return nil, errors.New("content policy blocked")
+		}
+		if message != "" && (state.ToolInvoked == false || state.TurnUseCase == "text" || isImagePolicyMessage(message)) {
+			return nil, errors.New(cleanImageMessage(message))
+		}
 	}
 	if cid != "" && len(fileIDs) == 0 && len(sedimentIDs) == 0 && !isImageQuotaMessage(message) {
 		traceLogf(ctx, "│  ├─ step poll final image tool records conversation=%s timeout=%s interval=%s", maskedValue(cid), opts.Timeout, opts.PollInterval)
@@ -636,9 +657,43 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 	traceLogf(ctx, "└─ image generation done images=%d", len(results))
 	return results, nil
 }
-func (c *UpstreamClient) prepareImage(ctx context.Context, prompt, model string, cr chatRequirements) (string, error) {
+
+type imageSSEParseResult struct {
+	cid         string
+	fileIDs     []string
+	sedimentIDs []string
+	message     string
+	state       *upstreamConversationState
+}
+
+func parseImageSSE(r io.Reader) imageSSEParseResult {
+	res := imageSSEParseResult{
+		fileIDs:     []string{},
+		sedimentIDs: []string{},
+		state:       newUpstreamConversationState("", nil),
+	}
+	for ev := range parseSSE(r) {
+		if ev == "[DONE]" {
+			return res
+		}
+		updateImageState(ev, &res.cid, &res.message)
+		if meta, ok := res.state.Apply(ev); ok {
+			if meta.ConversationID != "" {
+				res.cid = meta.ConversationID
+			}
+			res.fileIDs = unique(append(res.fileIDs, meta.FileIDs...))
+			res.sedimentIDs = unique(append(res.sedimentIDs, meta.SedimentIDs...))
+			if meta.Delta != "" || res.state.Text != "" {
+				res.message = res.state.Text
+			}
+		}
+	}
+	return res
+}
+
+func (c *UpstreamClient) prepareImage(ctx context.Context, prompt, modelSlug string, cr chatRequirements) (string, error) {
 	path := "/backend-api/f/conversation/prepare"
-	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": uuid4(), "model": imageModelSlug(model), "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": uuid4(), "author": map[string]any{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{prompt}}}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]any{"app_name": "chatgpt.com"}}
+	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": uuid4(), "model": modelSlug, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": uuid4(), "author": map[string]any{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{prompt}}}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]any{"app_name": "chatgpt.com"}}
 	resp, err := c.do(ctx, http.MethodPost, path, c.imageHeaders(path, cr, "", "*/*"), payload, false)
 	if err != nil {
 		return "", err
@@ -652,7 +707,7 @@ func (c *UpstreamClient) prepareImage(ctx context.Context, prompt, model string,
 	}
 	return token, nil
 }
-func (c *UpstreamClient) startImage(ctx context.Context, prompt, model string, cr chatRequirements, conduit string, refs []map[string]any) (*http.Response, error) {
+func (c *UpstreamClient) startImage(ctx context.Context, prompt, modelSlug string, cr chatRequirements, conduit string, refs []map[string]any) (*http.Response, error) {
 	path := "/backend-api/f/conversation"
 	parts := []any{}
 	attachments := []map[string]any{}
@@ -669,7 +724,7 @@ func (c *UpstreamClient) startImage(ctx context.Context, prompt, model string, c
 	if len(attachments) > 0 {
 		metadata["attachments"] = attachments
 	}
-	payload := map[string]any{"action": "next", "messages": []any{map[string]any{"id": uuid4(), "author": map[string]any{"role": "user"}, "create_time": float64(time.Now().UnixNano()) / 1e9, "content": content, "metadata": metadata}}, "parent_message_id": uuid4(), "model": imageModelSlug(model), "client_prepare_state": "sent", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "enable_message_followups": true, "system_hints": []string{"picture_v2"}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": clientContext(), "paragen_cot_summary_display_override": "allow", "force_parallel_switch": "auto"}
+	payload := map[string]any{"action": "next", "messages": []any{map[string]any{"id": uuid4(), "author": map[string]any{"role": "user"}, "create_time": float64(time.Now().UnixNano()) / 1e9, "content": content, "metadata": metadata}}, "parent_message_id": uuid4(), "model": modelSlug, "client_prepare_state": "sent", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "enable_message_followups": true, "system_hints": []string{"picture_v2"}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": clientContext(), "paragen_cot_summary_display_override": "allow", "force_parallel_switch": "auto"}
 	return c.do(ctx, http.MethodPost, path, c.imageHeaders(path, cr, conduit, "text/event-stream"), payload, true)
 }
 func (c *UpstreamClient) uploadImage(ctx context.Context, data []byte, name string, timeout time.Duration) (map[string]any, error) {
@@ -1633,13 +1688,142 @@ func applyTextPatch(event map[string]any, current string) (string, bool) {
 	return current, false
 }
 
+var imageClassifyTextReplacer = strings.NewReplacer(
+	"\u2018", "'",
+	"\u2019", "'",
+	"\u02bc", "'",
+	"\uff07", "'",
+)
+
+func normalizeImageClassifyText(s string) string {
+	return strings.ToLower(imageClassifyTextReplacer.Replace(strings.TrimSpace(s)))
+}
+
 func isImageQuotaMessage(s string) bool {
-	text := strings.ToLower(s)
+	text := normalizeImageClassifyText(s)
 	return strings.Contains(text, "free plan limit") ||
 		strings.Contains(text, "limit for image generation") ||
+		strings.Contains(text, "image generation limit") ||
 		strings.Contains(text, "image generations requests") ||
+		strings.Contains(text, "image generation requests") ||
 		strings.Contains(text, "when the limit resets") ||
-		strings.Contains(text, "usage limit")
+		strings.Contains(text, "when your limit resets")
+}
+
+func isImagePolicyMessage(s string) bool {
+	text := normalizeImageClassifyText(s)
+	if text == "" {
+		return false
+	}
+	if strings.Contains(text, "content policy") ||
+		strings.Contains(text, "safety policy") ||
+		strings.Contains(text, "policy violation") ||
+		strings.Contains(text, "violates our policy") ||
+		strings.Contains(text, "violates our safety") {
+		return true
+	}
+	hasRefusal := strings.Contains(text, "can't help create") ||
+		strings.Contains(text, "cannot help create") ||
+		strings.Contains(text, "can't generate") ||
+		strings.Contains(text, "cannot generate") ||
+		strings.Contains(text, "not able to generate") ||
+		strings.Contains(text, "i can't assist") ||
+		strings.Contains(text, "i cannot assist")
+	if !hasRefusal {
+		return false
+	}
+	return strings.Contains(text, "policy") ||
+		strings.Contains(text, "safety") ||
+		strings.Contains(text, "violate") ||
+		strings.Contains(text, "disallowed")
+}
+
+func isImageModelLimitMessage(s string) bool {
+	text := normalizeImageClassifyText(s)
+	if text == "" || !(strings.Contains(text, "limit") || strings.Contains(text, "rate")) {
+		return false
+	}
+	return hasImageBackendModelMarker(text) ||
+		strings.Contains(text, "model limit") ||
+		strings.Contains(text, "model usage")
+}
+
+func isImageModelUnavailableMessage(s string) bool {
+	text := normalizeImageClassifyText(s)
+	if text == "" || !hasImageBackendModelMarker(text) {
+		return false
+	}
+	return strings.Contains(text, "unavailable") ||
+		strings.Contains(text, "not available") ||
+		strings.Contains(text, "not found") ||
+		strings.Contains(text, "not_found") ||
+		strings.Contains(text, "model-not-found") ||
+		strings.Contains(text, "model_not_found") ||
+		strings.Contains(text, "unsupported") ||
+		strings.Contains(text, "unknown") ||
+		strings.Contains(text, "invalid") ||
+		strings.Contains(text, "disabled")
+}
+
+func hasImageBackendModelMarker(text string) bool {
+	return strings.Contains(text, "gpt-5-5") ||
+		strings.Contains(text, "gpt-5.5") ||
+		strings.Contains(text, "gpt-5-3") ||
+		strings.Contains(text, "gpt-5.3") ||
+		strings.Contains(text, "thinking") ||
+		strings.Contains(text, "instant") ||
+		strings.Contains(text, "model")
+}
+
+func isImageNoResultMessage(s string) bool {
+	text := normalizeImageClassifyText(s)
+	if text == "" || isImagePolicyMessage(text) || isImageQuotaMessage(text) {
+		return false
+	}
+	return strings.Contains(text, "can't generate images") ||
+		strings.Contains(text, "cannot generate images") ||
+		strings.Contains(text, "can't create images") ||
+		strings.Contains(text, "cannot create images") ||
+		strings.Contains(text, "unable to generate images") ||
+		strings.Contains(text, "unable to create images") ||
+		strings.Contains(text, "not able to generate images") ||
+		strings.Contains(text, "not able to create images") ||
+		isImageGenerationFailurePhrase(text) ||
+		strings.Contains(text, "couldn't generate") ||
+		strings.Contains(text, "could not generate") ||
+		strings.Contains(text, "failed to generate") ||
+		strings.Contains(text, "image generation failed") ||
+		strings.Contains(text, "no image was generated") ||
+		strings.Contains(text, "no images were generated")
+}
+
+func isImageGenerationFailurePhrase(text string) bool {
+	if !strings.Contains(text, "image") {
+		return false
+	}
+	for _, phrase := range []string{
+		"can't generate",
+		"cannot generate",
+		"can not generate",
+		"unable to generate",
+		"not able to generate",
+		"couldn't generate",
+		"could not generate",
+		"failed to generate",
+		"can't create",
+		"cannot create",
+		"can not create",
+		"unable to create",
+		"not able to create",
+		"couldn't create",
+		"could not create",
+		"failed to create",
+	} {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func cleanImageMessage(s string) string {
@@ -1924,14 +2108,54 @@ func normalizeTextModelOptions(model string) textModelOptions {
 }
 
 func imageModelSlug(model string) string {
-	switch strings.TrimSpace(strings.ToLower(model)) {
-	case "gpt-image-2":
-		return "gpt-5-3"
-	case "codex-gpt-image-2":
-		return "codex-gpt-image-2"
-	default:
+	slugs := imageModelSlugs(model)
+	if len(slugs) == 0 {
 		return "auto"
 	}
+	return slugs[0]
+}
+
+func imageModelSlugs(model string) []string {
+	switch strings.TrimSpace(strings.ToLower(model)) {
+	case "gpt-image-2":
+		return []string{"gpt-5-5-thinking", "gpt-5-5", "gpt-5-3"}
+	case "codex-gpt-image-2":
+		return []string{"codex-gpt-image-2"}
+	default:
+		return []string{"auto"}
+	}
+}
+
+func shouldTryNextImageModelSlug(err error, ctxErr error) bool {
+	if err == nil || ctxErr != nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	text := normalizeImageClassifyText(err.Error())
+	if strings.Contains(text, "upstream returned no image") ||
+		strings.Contains(text, "image poll timed out") ||
+		strings.Contains(text, "image generation sse timed out") ||
+		strings.Contains(text, "missing conduit_token") {
+		return true
+	}
+	if isImageModelUnavailableMessage(text) {
+		return true
+	}
+	if isImageModelLimitMessage(text) {
+		return true
+	}
+	if isImageQuotaMessage(text) {
+		return false
+	}
+	if isImageNoResultMessage(text) {
+		return true
+	}
+	if isRateLimitErrorText(err) {
+		return true
+	}
+	return isTemporaryUpstreamErrorText(err)
 }
 func clientContext() map[string]any {
 	return map[string]any{"is_dark_mode": false, "time_since_loaded": 120, "page_height": 900, "page_width": 1400, "pixel_ratio": 2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com"}

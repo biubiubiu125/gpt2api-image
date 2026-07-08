@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ---------- 默认值 ----------
-PORT="${GPT2API_IMAGE_ADDR:-3000}"
+PORT="${GPT2API_IMAGE_ADDR:-2008}"
 PORT="${PORT#:}"
 TRANSPORT="${GPT2API_IMAGE_UPSTREAM_TRANSPORT:-tls-client}"
 MODE="${GPT2API_IMAGE_MODE:-serve}"
@@ -120,6 +120,7 @@ fi
 export GPT2API_IMAGE_ADDR=":$PORT"
 export GPT2API_IMAGE_UPSTREAM_TRANSPORT="$TRANSPORT"
 export GPT2API_IMAGE_MODE="$MODE"
+export TZ="${TZ:-Asia/Shanghai}"
 
 # curl-impersonate 自动下载
 if [ "$TRANSPORT" = "curl-impersonate" ]; then

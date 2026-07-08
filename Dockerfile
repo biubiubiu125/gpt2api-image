@@ -28,6 +28,7 @@ COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 COPY VERSION /app/VERSION
 RUN chmod +x /app/docker-entrypoint.sh
 EXPOSE 80
-ENV GPT2API_IMAGE_ADDR=:80
+ENV GPT2API_IMAGE_ADDR=:80 \
+    TZ=Asia/Shanghai
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["/app/gpt2api-image"]

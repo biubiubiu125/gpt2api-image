@@ -15,6 +15,12 @@ import (
 )
 
 func main() {
+	if strings.TrimSpace(os.Getenv("TZ")) == "" {
+		_ = os.Setenv("TZ", "Asia/Shanghai")
+		if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+			time.Local = loc
+		}
+	}
 	mode := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_MODE"))
 	if len(os.Args) > 1 && strings.TrimSpace(os.Args[1]) != "" {
 		mode = strings.TrimSpace(os.Args[1])
@@ -49,7 +55,7 @@ func main() {
 	}
 	addr := os.Getenv("GPT2API_IMAGE_ADDR")
 	if addr == "" {
-		addr = ":3000"
+		addr = ":2008"
 	}
 	httpServer := &http.Server{
 		Addr:              addr,

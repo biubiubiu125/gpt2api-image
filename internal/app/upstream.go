@@ -125,9 +125,13 @@ func normalizeUpstreamTransport(value string) string {
 }
 
 func newUpstreamHTTPClient(transport, proxyURL string, binGetter func() (string, error)) (upstreamHTTPDoer, error) {
+	proxy, err := normalizeProxyURL(proxyURL)
+	if err != nil {
+		return nil, err
+	}
 	switch normalizeUpstreamTransport(transport) {
 	case "curl-impersonate":
-		return newCurlImpersonateClient(proxyURL, binGetter)
+		return newCurlImpersonateClient(proxy, binGetter)
 	default:
 		options := []tlsclient.HttpClientOption{
 			tlsclient.WithClientProfile(upstreamTLSProfile()),
@@ -135,8 +139,8 @@ func newUpstreamHTTPClient(transport, proxyURL string, binGetter func() (string,
 			tlsclient.WithNotFollowRedirects(),
 			tlsclient.WithTimeoutSeconds(0),
 		}
-		if strings.TrimSpace(proxyURL) != "" {
-			options = append(options, tlsclient.WithProxyUrl(strings.TrimSpace(proxyURL)))
+		if proxy != "" {
+			options = append(options, tlsclient.WithProxyUrl(proxy))
 		}
 		return tlsclient.NewHttpClient(nil, options...)
 	}
@@ -2254,7 +2258,7 @@ func buildPowConfig(ua string, scripts []string, dataBuild string) []any {
 	if len(scripts) > 0 {
 		script = scripts[rand.Intn(len(scripts))]
 	}
-	return []any{[]int{3000, 4000, 5000}[rand.Intn(3)], time.Now().In(time.FixedZone("EST", -5*3600)).Format("Mon Jan 02 2006 15:04:05") + " GMT-0500 (Eastern Standard Time)", 4294705152, 0, ua, script, dataBuild, "en-US", "en-US,es-US,en,es", 0, nav[rand.Intn(len(nav))], "location", win[rand.Intn(len(win))], float64(time.Now().UnixNano()) / 1e6, randID(16), "", []int{8, 16, 24, 32}[rand.Intn(4)], float64(time.Now().UnixNano())/1e6 - 1000}
+	return []any{[]int{3000, 4000, 5000}[rand.Intn(3)], time.Now().In(time.FixedZone("CST", 8*3600)).Format("Mon Jan 02 2006 15:04:05") + " GMT+0800 (China Standard Time)", 4294705152, 0, ua, script, dataBuild, "en-US", "en-US,es-US,en,es", 0, nav[rand.Intn(len(nav))], "location", win[rand.Intn(len(win))], float64(time.Now().UnixNano()) / 1e6, randID(16), "", []int{8, 16, 24, 32}[rand.Intn(4)], float64(time.Now().UnixNano())/1e6 - 1000}
 }
 func powGenerate(seed, diff string, cfg []any, limit int) (string, bool) {
 	target, err := hexDecode(diff)

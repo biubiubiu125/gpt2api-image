@@ -49,7 +49,7 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "8000:80"
+      - "2008:80"
     volumes:
       - ./data:/app/data
     environment:

@@ -606,7 +606,7 @@ def _release_mailbox(mailbox: dict, mail_config: dict, index: int) -> None:
         step(index, f"yyds 邮箱释放失败: {address}, {reason or 'unknown error'}", "yellow")
 
 
-from utils.sentinel import build_sentinel_token as _build_sentinel_token_tuple, ensure_browser_sentinel_runtime, prepare_sentinel_artifacts  # noqa: F401
+from utils.sentinel import build_sentinel_token as _build_sentinel_token_tuple, ensure_protocol_sentinel_runtime, prepare_sentinel_artifacts  # noqa: F401
 
 
 def _set_oai_device_cookies(session: requests.Session, device_id: str) -> None:
@@ -1198,7 +1198,7 @@ class PlatformRegistrar:
     def _ensure_sentinel_runtime(self, index: int) -> None:
         self._check_task_control()
         hints = self._sentinel_client_hints(self.session)
-        ensure_browser_sentinel_runtime(
+        ensure_protocol_sentinel_runtime(
             proxy=self.proxy,
             user_agent=hints["user_agent"],
             sec_ch_ua=hints["sec_ch_ua"],
@@ -1251,7 +1251,7 @@ class PlatformRegistrar:
             }
         )
         so_header = str(getattr(artifacts, "so_header", "") or "")
-        if include_so and strict_so and not so_header:
+        if include_so and strict_so and getattr(artifacts, "so_required", False) and not so_header:
             raise RuntimeError("sentinel_so_token_failed")
         headers = self._json_headers(referer, device_id)
         headers["openai-sentinel-token"] = str(getattr(artifacts, "sentinel_header", "") or "")

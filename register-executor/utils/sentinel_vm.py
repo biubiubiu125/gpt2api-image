@@ -326,13 +326,10 @@ class SentinelDxVm:
             self._set(9, queue)
             self._drain_queue()
         except Exception as error:
-            if fallback_result is not None:
-                return fallback_result(self.instruction_count)
-            return _b64_encode_text(f"{self.instruction_count}: {error}")
+            self.error = _to_text(error)
+            return None
         if self.error is not None:
-            if fallback_result is not None:
-                return fallback_result(self.instruction_count)
-            return self.error
+            return None
         if self.result is not None:
             return self.result
         if fallback_result is not None:

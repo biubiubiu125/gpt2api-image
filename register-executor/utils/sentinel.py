@@ -2,17 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import random
 import re
-import shutil
-import subprocess
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from utils.sentinel_vm import SessionObserverRuntime, build_browser_environment, solve_turnstile_dx
@@ -35,21 +31,6 @@ DEFAULT_SENTINEL_FLOW = "chat-requirements"
 DEFAULT_SENTINEL_PAGE_URL = "https://chatgpt.com/"
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 SDK_CACHE_SECONDS = 3600
-DEFAULT_SENTINEL_RUNTIME_CHECK_FLOW = "oauth_create_account"
-DEFAULT_SENTINEL_OBSERVER_WAIT_MS = 5_000
-DEFAULT_SENTINEL_REQ_CAPTURE_WAIT_MS = 10_000
-DEFAULT_BROWSER_LAUNCH_TIMEOUT_MS = 60_000
-DEFAULT_BROWSER_NAVIGATION_TIMEOUT_MS = 60_000
-BROWSER_HELPER_BUFFER_MS = 15_000
-BROWSER_HELPER_TIMEOUT_MS = (
-    DEFAULT_BROWSER_LAUNCH_TIMEOUT_MS
-    + DEFAULT_BROWSER_NAVIGATION_TIMEOUT_MS
-    + DEFAULT_SENTINEL_OBSERVER_WAIT_MS
-    + DEFAULT_SENTINEL_REQ_CAPTURE_WAIT_MS
-    + BROWSER_HELPER_BUFFER_MS
-)
-DEFAULT_BROWSER_CHANNEL = "chrome"
-SENTINEL_HELPER_SCRIPT = Path(__file__).with_name("sentinel_browser.js")
 DEVICE_COOKIE_DOMAINS = [
     ".auth.openai.com",
     "auth.openai.com",
@@ -67,28 +48,13 @@ _sdk_cache = {
     "version": DEFAULT_SENTINEL_SDK_VERSION,
     "url": DEFAULT_SENTINEL_SDK_URL,
 }
-_browser_runtime_cache_lock = threading.Lock()
-_browser_runtime_cache = {
+_protocol_runtime_cache_lock = threading.Lock()
+_protocol_runtime_cache = {
     "key": "",
     "ok": False,
 }
 _CHROME_VERSION_RE = re.compile(r"Chrome/(?P<version>\d+(?:\.\d+){0,3})")
 _BRAND_ENTRY_RE = re.compile(r'"([^"]+)";v="([^"]+)"')
-
-
-def _legacy_vm_env_enabled() -> bool:
-    return any(
-        str(os.environ.get(name) or "").strip() == "1"
-        for name in (
-            "GPT2API_IMAGE_SENTINEL_FORCE_LEGACY_VM",
-            "GPT2API_IMAGE_SENTINEL_ALLOW_LEGACY_VM",
-        )
-    )
-
-
-def _assert_browser_sdk_required() -> None:
-    if _legacy_vm_env_enabled():
-        raise RuntimeError("sentinel_legacy_vm_disabled: browser_sdk_required")
 
 
 def _b64_json(data: Any) -> str:
@@ -211,187 +177,7 @@ def _json_object(value: object) -> dict[str, Any]:
     return dict(parsed) if isinstance(parsed, dict) else {}
 
 
-def _session_cookie_records(session: "Session") -> list[dict[str, Any]]:
-    jar = getattr(getattr(session, "cookies", None), "jar", None) or getattr(session, "cookies", None)
-    if jar is None:
-        return []
-    result: list[dict[str, Any]] = []
-    try:
-        items = list(jar)
-    except Exception:
-        items = []
-    for cookie in items:
-        name = str(getattr(cookie, "name", "") or "").strip()
-        if not name:
-            continue
-        record: dict[str, Any] = {
-            "name": name,
-            "value": str(getattr(cookie, "value", "") or ""),
-            "domain": str(getattr(cookie, "domain", "") or "").strip(),
-            "path": str(getattr(cookie, "path", "") or "").strip() or "/",
-            "secure": bool(getattr(cookie, "secure", False)),
-            "expires": getattr(cookie, "expires", None),
-            "httpOnly": False,
-        }
-        rest = getattr(cookie, "_rest", {}) or {}
-        for key in ("HttpOnly", "httponly"):
-            if key in rest:
-                record["httpOnly"] = bool(rest.get(key))
-                break
-        same_site = ""
-        for key in ("SameSite", "samesite"):
-            if key in rest and rest.get(key):
-                same_site = str(rest.get(key) or "").strip()
-                break
-        if same_site:
-            record["sameSite"] = same_site
-        result.append(record)
-    return result
-
-
-def _resolve_node_executable() -> str:
-    candidates = [
-        os.environ.get("GPT2API_IMAGE_SENTINEL_NODE_PATH"),
-        os.environ.get("SENTINEL_NODE_PATH"),
-        shutil.which("node"),
-        str(Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "node" / "bin" / "node.exe"),
-        str(Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "node" / "bin" / "node"),
-        str(Path(os.environ.get("ProgramFiles", "")) / "nodejs" / "node.exe"),
-        str(Path(os.environ.get("ProgramFiles(x86)", "")) / "nodejs" / "node.exe"),
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        path = Path(str(candidate)).expanduser()
-        if path.is_file():
-            return str(path)
-    raise RuntimeError("sentinel_browser_runtime_unavailable: node_not_found")
-
-
-def _node_module_candidates(node_path: str) -> list[str]:
-    values = [
-        os.environ.get("GPT2API_IMAGE_SENTINEL_NODE_MODULES"),
-        os.environ.get("NODE_PATH"),
-    ]
-    node_file = Path(node_path)
-    base = node_file.parent.parent
-    values.append(str(base / "node_modules"))
-    values.append(str(base / "node_modules" / ".pnpm" / "node_modules"))
-    return [item for item in values if item]
-
-
-def _browser_subprocess_env(node_path: str) -> dict[str, str]:
-    env = dict(os.environ)
-    paths: list[str] = []
-    for item in _node_module_candidates(node_path):
-        for value in str(item).split(os.pathsep):
-            value = value.strip()
-            if value and value not in paths:
-                paths.append(value)
-    if paths:
-        existing = str(env.get("NODE_PATH") or "").strip()
-        if existing:
-            for value in existing.split(os.pathsep):
-                value = value.strip()
-                if value and value not in paths:
-                    paths.append(value)
-        env["NODE_PATH"] = os.pathsep.join(paths)
-    env.setdefault("GPT2API_IMAGE_SENTINEL_BROWSER_CHANNEL", DEFAULT_BROWSER_CHANNEL)
-    return env
-
-
-def _browser_runtime_cache_key(node_path: str, proxy: str = "") -> str:
-    values = [
-        node_path,
-        str(os.environ.get("GPT2API_IMAGE_SENTINEL_NODE_MODULES") or "").strip(),
-        str(os.environ.get("NODE_PATH") or "").strip(),
-        str(os.environ.get("GPT2API_IMAGE_SENTINEL_BROWSER_CHANNEL", DEFAULT_BROWSER_CHANNEL) or "").strip(),
-        str(os.environ.get("GPT2API_IMAGE_SENTINEL_BROWSER_PATH") or "").strip(),
-        str(proxy or "").strip(),
-    ]
-    return "|".join(values)
-
-
-def _browser_helper_timeout_seconds(payload: dict[str, Any]) -> float:
-    launch_timeout_ms = max(0, int(payload.get("launchTimeoutMs") or 0))
-    navigation_timeout_ms = max(0, int(payload.get("navigationTimeoutMs") or 0))
-    observer_wait_ms = max(0, int(payload.get("observerWaitMs") or 0))
-    req_capture_wait_ms = max(0, int(payload.get("reqCaptureWaitMs") or DEFAULT_SENTINEL_REQ_CAPTURE_WAIT_MS))
-    budget_ms = launch_timeout_ms + navigation_timeout_ms + observer_wait_ms + req_capture_wait_ms + BROWSER_HELPER_BUFFER_MS
-    return max(30.0, max(BROWSER_HELPER_TIMEOUT_MS, budget_ms) / 1000.0)
-
-
-def _run_browser_helper_subprocess(
-    node_path: str,
-    payload: dict[str, Any],
-    *,
-    timeout_seconds: float,
-    check_control=None,
-) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
-        [node_path, str(SENTINEL_HELPER_SCRIPT)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=_browser_subprocess_env(node_path),
-    )
-    try:
-        if process.stdin is not None:
-            try:
-                process.stdin.write(json.dumps(payload, ensure_ascii=False))
-            finally:
-                process.stdin.close()
-        started = time.monotonic()
-        while process.poll() is None:
-            if callable(check_control):
-                check_control()
-            if time.monotonic() - started >= max(1.0, float(timeout_seconds or 0.0)):
-                process.kill()
-                stdout, stderr = process.communicate()
-                raise RuntimeError(
-                    _browser_error_message(
-                        subprocess.TimeoutExpired(
-                            cmd=[node_path, str(SENTINEL_HELPER_SCRIPT)],
-                            timeout=max(1.0, float(timeout_seconds or 0.0)),
-                            output=stdout,
-                            stderr=stderr,
-                        )
-                    )
-                )
-            time.sleep(0.1)
-        stdout, stderr = process.communicate()
-        return subprocess.CompletedProcess(
-            args=[node_path, str(SENTINEL_HELPER_SCRIPT)],
-            returncode=int(process.returncode or 0),
-            stdout=stdout,
-            stderr=stderr,
-        )
-    except BaseException:
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=5)
-        raise
-
-
-def _browser_error_message(error: subprocess.CalledProcessError | subprocess.TimeoutExpired | Exception) -> str:
-    if isinstance(error, subprocess.TimeoutExpired):
-        return "sentinel_browser_timeout"
-    if isinstance(error, subprocess.CalledProcessError):
-        stderr = str(getattr(error, "stderr", "") or "").strip()
-        payload = _json_object(stderr)
-        if payload.get("error"):
-            return str(payload.get("error") or "").strip()
-        stdout = str(getattr(error, "stdout", "") or "").strip()
-        if stdout:
-            return stdout[:500]
-        return stderr[:500] or "sentinel_browser_subprocess_failed"
-    return str(error or "sentinel_browser_failed").strip()
-
-
-def ensure_browser_sentinel_runtime(
+def ensure_protocol_sentinel_runtime(
     *,
     proxy: str = "",
     user_agent: str = "",
@@ -399,74 +185,19 @@ def ensure_browser_sentinel_runtime(
     sec_ch_ua_full_version_list: str = "",
     check_control=None,
 ) -> None:
-    _assert_browser_sdk_required()
-    node_path = _resolve_node_executable()
-    if not SENTINEL_HELPER_SCRIPT.is_file():
-        raise RuntimeError("sentinel_browser_runtime_unavailable: helper_script_missing")
     hints = build_user_agent_client_hints(
         user_agent or DEFAULT_SENTINEL_USER_AGENT,
         sec_ch_ua=sec_ch_ua,
         sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
     )
-    cache_key = _browser_runtime_cache_key(node_path, proxy=proxy) + "|" + hints["user_agent"] + "|" + hints["sec_ch_ua"]
-    with _browser_runtime_cache_lock:
-        if _browser_runtime_cache.get("ok") and _browser_runtime_cache.get("key") == cache_key:
+    cache_key = "protocol|" + str(proxy or "").strip() + "|" + hints["user_agent"] + "|" + hints["sec_ch_ua"]
+    with _protocol_runtime_cache_lock:
+        if _protocol_runtime_cache.get("ok") and _protocol_runtime_cache.get("key") == cache_key:
             return
-    payload = {
-        "runtimeCheckOnly": True,
-        "flow": DEFAULT_SENTINEL_RUNTIME_CHECK_FLOW,
-        "includeSo": True,
-        "observerWaitMs": DEFAULT_SENTINEL_OBSERVER_WAIT_MS,
-        "reqCaptureWaitMs": DEFAULT_SENTINEL_REQ_CAPTURE_WAIT_MS,
-        "proxy": str(proxy or "").strip(),
-        "pageUrl": DEFAULT_SENTINEL_PAGE_URL,
-        "wrapperUrl": DEFAULT_SENTINEL_WRAPPER_URL,
-        "userAgent": hints["user_agent"],
-        "secChUa": hints["sec_ch_ua"],
-        "secChUaFullVersionList": hints["sec_ch_ua_full_version_list"],
-        "userAgentMetadata": hints["user_agent_metadata"],
-        "browserChannel": os.environ.get("GPT2API_IMAGE_SENTINEL_BROWSER_CHANNEL", DEFAULT_BROWSER_CHANNEL),
-        "browserPath": os.environ.get("GPT2API_IMAGE_SENTINEL_BROWSER_PATH", "").strip(),
-        "launchTimeoutMs": DEFAULT_BROWSER_LAUNCH_TIMEOUT_MS,
-        "navigationTimeoutMs": DEFAULT_BROWSER_NAVIGATION_TIMEOUT_MS,
-    }
-    try:
-        completed = _run_browser_helper_subprocess(
-            node_path,
-            payload,
-            timeout_seconds=_browser_helper_timeout_seconds(payload),
-            check_control=check_control,
-        )
-    except (OSError, RuntimeError) as error:
-        raise RuntimeError(f"sentinel_browser_runtime_unavailable: {_browser_error_message(error)}") from error
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"sentinel_browser_runtime_unavailable: {_browser_error_message(subprocess.CalledProcessError(
-                completed.returncode,
-                completed.args,
-                output=completed.stdout,
-                stderr=completed.stderr,
-            ))}"
-        )
-    data = _json_object(completed.stdout)
-    if not data.get("ok") or not data.get("runtimeReady"):
-        message = str(data.get("error") or "runtime_check_failed").strip()
-        raise RuntimeError(f"sentinel_browser_runtime_unavailable: {message}")
-    with _browser_runtime_cache_lock:
-        _browser_runtime_cache.update({"key": cache_key, "ok": True})
-
-
-def _parse_validated_header(name: str, header_value: str, *, require_body_key: str, require_challenge: bool = True) -> dict[str, Any]:
-    payload = _json_object(header_value)
-    if not payload:
-        raise RuntimeError(f"{name}_failed: empty_header")
-    if str(payload.get("e") or "").strip():
-        raise RuntimeError(f"{name}_failed: {str(payload.get('e') or '').strip()}")
-    if require_body_key and not str(payload.get(require_body_key) or "").strip():
-        raise RuntimeError(f"{name}_failed: missing_{require_body_key}")
-    if require_challenge and not str(payload.get("c") or "").strip():
-        raise RuntimeError(f"{name}_failed: missing_c")
-    return payload
+    if callable(check_control):
+        check_control()
+    with _protocol_runtime_cache_lock:
+        _protocol_runtime_cache.update({"key": cache_key, "ok": True})
 
 
 def _resolve_sdk_info(
@@ -640,73 +371,10 @@ class SentinelArtifacts:
     turnstile_required: bool = False
     so_required: bool = False
     req_payload: dict[str, Any] = field(default_factory=dict)
-    executor: str = "browser_sdk"
+    executor: str = "protocol"
 
 
-def _run_browser_sentinel(
-    session: "Session",
-    device_id: str,
-    flow: str,
-    *,
-    include_so: bool,
-    observer_wait_ms: int,
-    user_agent: str,
-    sec_ch_ua: str,
-    sec_ch_ua_full_version_list: str,
-    proxy: str,
-    check_control=None,
-) -> dict[str, Any]:
-    node_path = _resolve_node_executable()
-    if not SENTINEL_HELPER_SCRIPT.is_file():
-        raise RuntimeError("sentinel_browser_runtime_unavailable: helper_script_missing")
-    _prime_device_cookies(session, device_id)
-    hints = build_user_agent_client_hints(
-        user_agent,
-        sec_ch_ua=sec_ch_ua,
-        sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
-    )
-    payload = {
-        "flow": str(flow or DEFAULT_SENTINEL_FLOW),
-        "deviceId": str(device_id or ""),
-        "includeSo": bool(include_so),
-        "observerWaitMs": max(0, int(observer_wait_ms or 0)),
-        "reqCaptureWaitMs": DEFAULT_SENTINEL_REQ_CAPTURE_WAIT_MS,
-        "wrapperUrl": DEFAULT_SENTINEL_WRAPPER_URL,
-        "pageUrl": DEFAULT_SENTINEL_PAGE_URL,
-        "userAgent": hints["user_agent"],
-        "secChUa": hints["sec_ch_ua"],
-        "secChUaFullVersionList": hints["sec_ch_ua_full_version_list"],
-        "userAgentMetadata": hints["user_agent_metadata"],
-        "proxy": str(proxy or "").strip(),
-        "cookies": _session_cookie_records(session),
-        "browserChannel": os.environ.get("GPT2API_IMAGE_SENTINEL_BROWSER_CHANNEL", DEFAULT_BROWSER_CHANNEL),
-        "browserPath": os.environ.get("GPT2API_IMAGE_SENTINEL_BROWSER_PATH", "").strip(),
-        "launchTimeoutMs": DEFAULT_BROWSER_LAUNCH_TIMEOUT_MS,
-        "navigationTimeoutMs": DEFAULT_BROWSER_NAVIGATION_TIMEOUT_MS,
-    }
-    try:
-        completed = _run_browser_helper_subprocess(
-            node_path,
-            payload,
-            timeout_seconds=_browser_helper_timeout_seconds(payload),
-            check_control=check_control,
-        )
-    except (RuntimeError, OSError) as error:
-        raise RuntimeError(_browser_error_message(error)) from error
-    if completed.returncode != 0:
-        raise RuntimeError(_browser_error_message(subprocess.CalledProcessError(
-            completed.returncode,
-            completed.args,
-            output=completed.stdout,
-            stderr=completed.stderr,
-        )))
-    data = _json_object(completed.stdout)
-    if not data.get("ok"):
-        raise RuntimeError(str(data.get("error") or "sentinel_browser_failed").strip())
-    return data
-
-
-def _prepare_sentinel_artifacts_legacy(
+def _prepare_sentinel_artifacts_protocol(
     session: "Session",
     device_id: str,
     flow: str,
@@ -775,11 +443,12 @@ def _prepare_sentinel_artifacts_legacy(
         page_url=DEFAULT_SENTINEL_PAGE_URL,
     )
     turnstile_data = data.get("turnstile") if isinstance(data, dict) else {}
+    turnstile_required = bool((turnstile_data if isinstance(turnstile_data, dict) else {}).get("required"))
     turnstile_token = ""
     if isinstance(turnstile_data, dict) and str(turnstile_data.get("dx") or "").strip():
         turnstile_token = str(solve_turnstile_dx(str(turnstile_data["dx"]), requirements_token, env) or "").strip()
-        if strict_turnstile and not turnstile_token:
-            raise RuntimeError("sentinel_turnstile_token_failed")
+    if strict_turnstile and turnstile_required and not turnstile_token:
+        raise RuntimeError("sentinel_turnstile_token_failed")
     sentinel_header = _payload_json(
         {
             "p": proof_token,
@@ -793,7 +462,8 @@ def _prepare_sentinel_artifacts_legacy(
     so_token = ""
     so_header = ""
     so_data = data.get("so") if isinstance(data, dict) else {}
-    if include_so and isinstance(so_data, dict) and so_data.get("required") and str(so_data.get("snapshot_dx") or "").strip():
+    so_required = bool((so_data if isinstance(so_data, dict) else {}).get("required"))
+    if include_so and so_required and isinstance(so_data, dict) and str(so_data.get("snapshot_dx") or "").strip():
         if callable(check_control):
             check_control()
         observer = SessionObserverRuntime(env, requirements_token)
@@ -809,10 +479,10 @@ def _prepare_sentinel_artifacts_legacy(
                     check_control()
                 time.sleep(min(0.1, max(0.0, delay - (time.monotonic() - started))))
         so_token = str(observer.run_snapshot(str(so_data.get("snapshot_dx") or "")) or "").strip()
-        if strict_so and not so_token:
-            raise RuntimeError("sentinel_so_token_failed")
         if so_token:
             so_header = _payload_json({"so": so_token, "c": challenge_token}, device_id, flow)
+    if include_so and strict_so and so_required and not so_token:
+        raise RuntimeError("sentinel_so_token_failed")
 
     oai_sc_value = "0" + challenge_token
     _set_cookie_best_effort(
@@ -833,10 +503,10 @@ def _prepare_sentinel_artifacts_legacy(
         turnstile_token=turnstile_token,
         session_observer_token=so_token,
         proof_required=bool(((data.get("proofofwork") or {}) if isinstance(data, dict) else {}).get("required")),
-        turnstile_required=bool(((data.get("turnstile") or {}) if isinstance(data, dict) else {}).get("required")),
-        so_required=bool(((data.get("so") or {}) if isinstance(data, dict) else {}).get("required")),
+        turnstile_required=turnstile_required,
+        so_required=so_required,
         req_payload=data if isinstance(data, dict) else {},
-        executor="legacy_vm",
+        executor="protocol",
     )
 
 
@@ -855,123 +525,18 @@ def prepare_sentinel_artifacts(
     proxy: str = "",
     check_control=None,
 ) -> SentinelArtifacts:
-    _assert_browser_sdk_required()
-    hints = build_user_agent_client_hints(
-        user_agent or DEFAULT_SENTINEL_USER_AGENT,
-        sec_ch_ua=sec_ch_ua,
-        sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
-    )
-    ua = hints["user_agent"]
-    ch_ua = hints["sec_ch_ua"]
-    ch_ua_full_version_list = hints["sec_ch_ua_full_version_list"]
-    payload = _run_browser_sentinel(
+    return _prepare_sentinel_artifacts_protocol(
         session,
         device_id,
         flow,
         include_so=include_so,
         observer_wait_ms=observer_wait_ms,
-        user_agent=ua,
-        sec_ch_ua=ch_ua,
-        sec_ch_ua_full_version_list=ch_ua_full_version_list,
-        proxy=proxy,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
+        strict_turnstile=strict_turnstile,
+        strict_so=strict_so,
         check_control=check_control,
-    )
-    req_status = 0
-    try:
-        req_status = int(payload.get("reqStatus") or 0)
-    except (TypeError, ValueError):
-        req_status = 0
-    req_count = 0
-    try:
-        req_count = int(payload.get("reqCount") or 0)
-    except (TypeError, ValueError):
-        req_count = 0
-    req_matched_count = 0
-    try:
-        req_matched_count = int(payload.get("reqMatchedCount") or 0)
-    except (TypeError, ValueError):
-        req_matched_count = 0
-    req_payload = payload.get("reqPayload") if isinstance(payload.get("reqPayload"), dict) else {}
-    sentinel_header = str(payload.get("sentinelHeader") or "").strip()
-    so_header = str(payload.get("soHeader") or "").strip()
-    try:
-        sentinel_payload = _parse_validated_header("sentinel_token", sentinel_header, require_body_key="p")
-    except RuntimeError as error:
-        if req_status == 403:
-            raise RuntimeError("sentinel_req_failed_403") from error
-        raise
-    so_payload = _json_object(so_header)
-    sentinel_challenge = str(sentinel_payload.get("c") or "").strip()
-    so_challenge = str(so_payload.get("c") or "").strip()
-    challenge_token = sentinel_challenge or so_challenge
-    if not challenge_token:
-        raise RuntimeError("sentinel_token_failed: missing_c")
-    if bool(payload.get("challengeMismatch")) or (sentinel_challenge and so_challenge and sentinel_challenge != so_challenge):
-        raise RuntimeError("sentinel_challenge_mismatch: header_challenge_mismatch")
-    if req_count > 0 and req_matched_count == 0:
-        raise RuntimeError("sentinel_challenge_mismatch: req_token_unmatched")
-    if req_payload:
-        req_challenge = str(req_payload.get("token") or "").strip()
-        if not req_challenge:
-            raise RuntimeError("sentinel_challenge_mismatch: missing_req_token")
-        if req_challenge != challenge_token:
-            raise RuntimeError("sentinel_challenge_mismatch: req_token_mismatch")
-    if req_matched_count > 0 and req_status >= 400:
-        raise RuntimeError(f"sentinel_req_failed_{req_status}")
-    if (strict_turnstile or strict_so or include_so) and not req_payload:
-        raise RuntimeError("sentinel_req_metadata_missing")
-    if req_payload:
-        turnstile_required = bool(((req_payload.get("turnstile") or {}) if isinstance(req_payload, dict) else {}).get("required"))
-        so_required = bool(((req_payload.get("so") or {}) if isinstance(req_payload, dict) else {}).get("required"))
-        proof_required = bool(((req_payload.get("proofofwork") or {}) if isinstance(req_payload, dict) else {}).get("required"))
-    else:
-        turnstile_required = False
-        so_required = False
-        proof_required = bool(sentinel_payload.get("p"))
-    if include_so and str(so_payload.get("e") or "").strip():
-        raise RuntimeError(f"sentinel_so_token_failed: {str(so_payload.get('e') or '').strip()}")
-    if strict_so and so_required and not so_header:
-        raise RuntimeError("sentinel_so_token_failed")
-    if so_header:
-        so_payload = _parse_validated_header("sentinel_so_token", so_header, require_body_key="so")
-    if strict_turnstile and turnstile_required and not str(sentinel_payload.get("t") or "").strip():
-        raise RuntimeError("sentinel_turnstile_token_failed")
-    if strict_so and so_required and not str(so_payload.get("so") or "").strip():
-        raise RuntimeError("sentinel_so_token_failed")
-    sdk_version = str(payload.get("sdkVersion") or "").strip()
-    sdk_url = str(payload.get("sdkUrl") or "").strip()
-    if not sdk_version or not sdk_url:
-        resolved_version, resolved_url = _resolve_sdk_info(
-            session,
-            user_agent=ua,
-            sec_ch_ua=ch_ua,
-            sec_ch_ua_full_version_list=ch_ua_full_version_list,
-        )
-        sdk_version = sdk_version or resolved_version
-        sdk_url = sdk_url or resolved_url
-    oai_sc_value = "0" + challenge_token
-    _set_cookie_best_effort(
-        session,
-        "oai-sc",
-        oai_sc_value,
-        [".auth.openai.com", "auth.openai.com", ".openai.com", "openai.com", ".chatgpt.com", "chatgpt.com"],
-    )
-    return SentinelArtifacts(
-        sentinel_header=sentinel_header,
-        so_header=so_header,
-        oai_sc_cookie=oai_sc_value,
-        sdk_version=sdk_version,
-        sdk_url=sdk_url,
-        challenge_token=challenge_token,
-        requirements_token="",
-        proof_token=str(sentinel_payload.get("p") or "").strip(),
-        turnstile_token=str(sentinel_payload.get("t") or "").strip(),
-        session_observer_token=str(so_payload.get("so") or "").strip(),
-        proof_required=proof_required,
-        turnstile_required=turnstile_required,
-        so_required=so_required,
-        req_payload=req_payload if isinstance(req_payload, dict) else {},
-        executor=str(payload.get("executor") or "browser_sdk"),
     )
 
 

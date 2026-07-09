@@ -81,10 +81,7 @@ def check_outlook_pool(register_config: dict[str, Any], limit: int = 5) -> dict[
     limit = max(1, min(int(limit or 5), 50))
     selected = credentials[:limit]
     checked: list[dict[str, Any]] = []
-    proxy = str(register_config.get("proxy") or "").strip()
-    mail_cfg = register_config.get("mail") if isinstance(register_config.get("mail"), dict) else {}
-    if not bool(mail_cfg.get("api_use_register_proxy", True)):
-        proxy = ""
+    proxy = ""
     if selected:
         workers = min(10, len(selected))
         with ThreadPoolExecutor(max_workers=workers) as executor:

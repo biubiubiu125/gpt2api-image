@@ -52,7 +52,7 @@ type RegisterMailConfig struct {
 func (c *RegisterMailConfig) UnmarshalJSON(data []byte) error {
 	type alias RegisterMailConfig
 	next := alias{
-		APIUseRegisterProxy: true,
+		APIUseRegisterProxy: false,
 	}
 	if err := json.Unmarshal(data, &next); err != nil {
 		return err
@@ -102,7 +102,7 @@ func defaultRegisterConfig() RegisterConfig {
 			RequestTimeout:      30,
 			WaitTimeout:         30,
 			WaitInterval:        2,
-			APIUseRegisterProxy: true,
+			APIUseRegisterProxy: false,
 			Providers:           []map[string]any{},
 		},
 		Proxy:                   "",
@@ -184,7 +184,7 @@ func normalizeRegisterConfig(cfg RegisterConfig) RegisterConfig {
 	if cfg.Mail.Providers == nil {
 		cfg.Mail.Providers = []map[string]any{}
 	}
-	cfg.Mail.APIUseRegisterProxy = boolAny(cfg.Mail.APIUseRegisterProxy, true)
+	cfg.Mail.APIUseRegisterProxy = false
 	for i := range cfg.Mail.Providers {
 		stripRegisterProviderRuntimeFields(cfg.Mail.Providers[i])
 		if strings.TrimSpace(strAny(cfg.Mail.Providers[i]["provider_id"], "")) == "" {

@@ -174,7 +174,7 @@ config = {
         "request_timeout": 30,
         "wait_timeout": 30,
         "wait_interval": 2,
-        "api_use_register_proxy": True,
+        "api_use_register_proxy": False,
         "providers": [],
     },
     "proxy": "",
@@ -523,10 +523,8 @@ def _is_cloudflare_challenge(resp) -> bool:
 def _mail_config(register_proxy: str = "", deadline: float | None = None, check_control=None) -> dict:
     mail = dict(config.get("mail") if isinstance(config.get("mail"), dict) else {})
     mail.pop("proxy", None)
-    if mail.get("api_use_register_proxy", True):
-        proxy = str(register_proxy or "").strip()
-        if proxy:
-            mail["proxy"] = proxy
+    # Keep registration proxy isolated to OpenAI signup; mailbox provider APIs must stay direct.
+    mail["api_use_register_proxy"] = False
     if deadline is not None:
         mail["_deadline"] = deadline
     if callable(check_control):

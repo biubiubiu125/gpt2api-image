@@ -389,7 +389,7 @@ def _normalize(raw: dict) -> dict:
     auto_refill["check_interval"] = max(10, int(auto_refill.get("check_interval") or 300))
     cfg["auto_refill"] = auto_refill
     if isinstance(cfg.get("mail"), dict):
-        cfg["mail"]["api_use_register_proxy"] = bool(cfg["mail"].get("api_use_register_proxy", True))
+        cfg["mail"]["api_use_register_proxy"] = False
         cfg["mail"].pop("proxy", None)
         cfg["mail"].pop("yyds_delete_after_success", None)
     _normalize_mail_providers(cfg)

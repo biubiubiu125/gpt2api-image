@@ -610,8 +610,8 @@ export function RegisterCard() {
               </div>
             </div>
             <label className="flex items-center gap-2.5 text-sm text-foreground">
-              <Checkbox checked={Boolean(config.mail.api_use_register_proxy ?? true)} onCheckedChange={(checked) => setMailUseRegisterProxy(Boolean(checked))} disabled={isTaskActive} />
-              <span>邮箱 API 请求使用注册代理</span>
+              <Checkbox checked={false} onCheckedChange={(checked) => setMailUseRegisterProxy(Boolean(checked))} disabled />
+              <span>邮箱 API 直连（注册代理仅用于注册）</span>
             </label>
 
             <div className="space-y-3">

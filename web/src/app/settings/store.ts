@@ -58,7 +58,7 @@ function buildRegisterMailPayload(config: RegisterConfig["mail"]): RegisterConfi
     request_timeout: Number(config.request_timeout || 30),
     wait_timeout: Number(config.wait_timeout || 180),
     wait_interval: Number(config.wait_interval || 5),
-    api_use_register_proxy: Boolean(config.api_use_register_proxy ?? true),
+    api_use_register_proxy: false,
     providers: sanitizeRegisterProviders(config.providers),
   };
 }
@@ -70,7 +70,7 @@ function normalizeRegister(config: RegisterConfig): RegisterConfig {
       request_timeout: Number(config.mail?.request_timeout || 30),
       wait_timeout: Number(config.mail?.wait_timeout || 180),
       wait_interval: Number(config.mail?.wait_interval || 5),
-      api_use_register_proxy: Boolean(config.mail?.api_use_register_proxy ?? true),
+      api_use_register_proxy: false,
       providers: Array.isArray(config.mail?.providers) ? config.mail.providers : [],
     },
     proxy: String(config.proxy || ""),

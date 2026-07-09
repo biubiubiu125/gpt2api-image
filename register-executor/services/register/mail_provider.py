@@ -494,6 +494,8 @@ def is_yyds_domain_blacklisted(domain: Any) -> bool:
 
 def _yyds_openai_domain_reject_reason(error: Exception | str | None) -> str:
     text = str(error or "").lower()
+    if "user_register_http_400" in text or "create_account_http_400" in text:
+        return "registration_disallowed"
     if "unsupported_email" in text or "email you provided is not supported" in text:
         return "unsupported_email"
     if "disposable email" in text or "temporary email" in text:
@@ -610,6 +612,32 @@ def _is_yyds_rate_limit_error(data: Any) -> bool:
         for key in ("errorCode", "error", "message", "msg")
     ).lower()
     return "429" in text or "rate limit" in text or "too many" in text
+
+
+def _yyds_auth_hint(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    code = str(data.get("errorCode") or data.get("code") or "").strip()
+    error = str(data.get("error") or data.get("message") or data.get("msg") or "").strip()
+    if code == "temp_inbox_web_app_only" or "Anonymous temp inbox creation" in error:
+        return "hint=YYDS API Key was not recognized. Use an AC-... API Key from YYDS API Key manager; mailbox API is direct and does not use the register proxy."
+    return ""
+
+
+def _yyds_response_body(resp: Any, limit: int = 300) -> str:
+    body = str(getattr(resp, "text", "") or "")[:limit]
+    try:
+        data = resp.json()
+    except Exception:
+        return body
+    hint = _yyds_auth_hint(data)
+    return f"{body}; {hint}" if hint else body
+
+
+def _yyds_failure_reason(data: dict[str, Any]) -> str:
+    reason = str(data.get("errorCode") or data.get("error") or data.get("message") or data.get("msg") or data).strip()
+    hint = _yyds_auth_hint(data)
+    return f"{reason}; {hint}" if hint else reason
 
 
 def _yyds_account_id(data: dict[str, Any]) -> str:
@@ -1594,7 +1622,7 @@ class YydsMailProvider(BaseMailProvider):
                 if attempt < max_attempts - 1:
                     continue
             if resp.status_code not in expected:
-                raise RuntimeError(f"YYDSMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+                raise RuntimeError(f"YYDSMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={_yyds_response_body(resp)}")
             if resp.status_code == 204:
                 return {}
             data = resp.json()
@@ -1603,7 +1631,7 @@ class YydsMailProvider(BaseMailProvider):
                     _mark_yyds_rate_limited(attempt, resp)
                     if attempt < max_attempts - 1:
                         continue
-                raise RuntimeError(f"YYDSMail 请求失败: {data.get('errorCode') or data.get('error')}")
+                raise RuntimeError(f"YYDSMail 请求失败: {_yyds_failure_reason(data)}")
             return data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)) else data
         raise RuntimeError(f"YYDSMail 请求失败: {method} {path}, HTTP 429")
 
@@ -1752,9 +1780,9 @@ class YydsMailProvider(BaseMailProvider):
                     ).lower()
                     if "404" in detail or "not found" in detail or "不存在" in detail:
                         return True, ""
-                    return False, f"YYDSMail 删除邮箱失败: {data.get('errorCode') or data.get('error') or data}"
+                    return False, f"YYDSMail 删除邮箱失败: {_yyds_failure_reason(data)}"
                 return True, ""
-            last_error = f"YYDSMail 删除邮箱失败: DELETE {path}, HTTP {resp.status_code}, body={resp.text[:300]}"
+            last_error = f"YYDSMail 删除邮箱失败: DELETE {path}, HTTP {resp.status_code}, body={_yyds_response_body(resp)}"
             break
         return False, last_error or f"YYDSMail 删除邮箱失败: DELETE {path}"
 

@@ -51,6 +51,26 @@ class OrderedMap:
         return self.values.get(_to_text(key), default)
 
 
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, OrderedMap):
+        return {key: _jsonable(value.values.get(key)) for key in value.keys}
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = _to_text(key)
+            if key_text in {"window", "self", "document", "body"}:
+                continue
+            if callable(item):
+                continue
+            out[key_text] = _jsonable(item)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if callable(value):
+        return _to_text(value)
+    return value
+
+
 class EventTarget:
     def __init__(self, env: "BrowserEnvironment", name: str) -> None:
         self._env = env
@@ -463,7 +483,7 @@ class SentinelDxVm:
         self._set(destination, json.loads(_to_text(self._get(source))))
 
     def _op_json_stringify(self, destination: Any, source: Any) -> None:
-        self._set(destination, json.dumps(self._get(source), separators=(",", ":"), ensure_ascii=False))
+        self._set(destination, json.dumps(_jsonable(self._get(source)), separators=(",", ":"), ensure_ascii=False))
 
     def _op_atob(self, destination: Any) -> None:
         self._set(destination, _b64_decode_text(self._get(destination)))

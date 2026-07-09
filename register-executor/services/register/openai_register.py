@@ -1737,7 +1737,9 @@ class PlatformRegistrar:
 
     def register(self, index: int) -> dict:
         mail_config = _mail_config(self.proxy, self.deadline, self._check_task_control)
-        for _attempt in range(1):
+        mailbox_attempts = 8
+        last_error: Exception | None = None
+        for mailbox_attempt in range(mailbox_attempts):
             self._check_task_control()
             self.otp_verified = False
             step(index, "创建邮箱")
@@ -1758,7 +1760,6 @@ class PlatformRegistrar:
                 password = fixed_password or _random_password()
                 first_name, last_name = _random_name()
                 self._platform_authorize(email, index)
-                self._submit_signup_email(email, index)
                 self._register_user(email, password, index)
                 self._send_otp(index)
                 step(index, "等待邮箱验证码")
@@ -1783,11 +1784,40 @@ class PlatformRegistrar:
                     _release_mailbox(mailbox, mail_config, index)
                 raise
             except Exception as error:
+                last_error = error
+                yyds_hard_reject = mail_provider.mark_yyds_mailbox_error(mailbox, error)
                 if code_consumed:
                     mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
                     _release_mailbox(mailbox, mail_config, index)
                 else:
                     _release_mailbox(mailbox, mail_config, index)
+                if yyds_hard_reject and mailbox_attempt < mailbox_attempts - 1:
+                    source_domain = _normalize_domain_name(mailbox.get("source_domain") or mailbox.get("domain") or email)
+                    detail = f"：{source_domain}" if source_domain else ""
+                    step(index, f"YYDS 邮箱域名被 OpenAI 拒绝，已自动加入黑名单{detail}，切换邮箱重试 ({mailbox_attempt + 2}/{mailbox_attempts})", "yellow")
+                    cooldown = min(10.0, 3.0 + mailbox_attempt * 1.5)
+                    deadline = time.monotonic() + cooldown
+                    while time.monotonic() < deadline:
+                        self._check_task_control()
+                        wait_seconds = min(0.5, max(0.0, deadline - time.monotonic()))
+                        if wait_seconds <= 0:
+                            break
+                        if self.stop_event is not None:
+                            if self.stop_event.wait(wait_seconds):
+                                raise RegisterStopped("register_task_stopped")
+                        else:
+                            time.sleep(wait_seconds)
+                    try:
+                        self.session.close()
+                    except Exception:
+                        pass
+                    self.session = create_session(self.proxy)
+                    self.device_id = str(uuid.uuid4())
+                    self.code_verifier = ""
+                    self.platform_auth_state = ""
+                    self.platform_auth_code = ""
+                    self.platform_continue_url = ""
+                    continue
                 raise
             mail_provider.mark_mailbox_result(mailbox, success=True)
             return {
@@ -1801,6 +1831,8 @@ class PlatformRegistrar:
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "_mailbox": dict(mailbox or {}),
             }
+        if last_error:
+            raise last_error
         raise RuntimeError("register_failed_without_exception")
 
 def _task_timeout_seconds(value: object = None) -> int:

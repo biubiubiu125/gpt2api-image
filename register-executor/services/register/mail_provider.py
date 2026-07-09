@@ -1642,10 +1642,8 @@ class YydsMailProvider(BaseMailProvider):
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         if self.configured_domain_count > 0 and not self.domain:
             raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
-        attempts = max(1, len(self.domain))
+        attempts = max(1, len(self.domain)) if self.configured_domain_count > 0 else 8
         last_error: RuntimeError | None = None
-        source_domain = ""
-        data: dict[str, Any] = {}
         for _ in range(attempts):
             payload = {"localPart": username or _random_mailbox_name()}
             source_domain = ""
@@ -1661,8 +1659,6 @@ class YydsMailProvider(BaseMailProvider):
                 result = self._request("POST", "/accounts/wildcard" if self.wildcard else "/accounts", payload=payload)
                 if not isinstance(result, dict):
                     raise RuntimeError("YYDSMail 返回数据格式异常")
-                data = result
-                break
             except RuntimeError as error:
                 last_error = error
                 if source_domain and _is_http_400_error(error):
@@ -1675,65 +1671,46 @@ class YydsMailProvider(BaseMailProvider):
                     self.domain = [domain for domain in self.domain if domain != source_domain]
                     continue
                 raise
-        else:
-            if self.configured_domain_count > 0 and not self.domain and last_error and _is_http_400_error(last_error):
-                raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
-            if last_error:
+
+            address = str(result.get("address") or result.get("email") or "").strip()
+            token = str(result.get("token") or result.get("temp_token") or result.get("tempToken") or result.get("access_token") or "").strip()
+            if not address or not token:
+                raise RuntimeError("YYDSMail 缺少 address 或 token")
+            account_id = _yyds_account_id(result)
+            address_domain = _normalize_domain(address)
+            mailbox = {
+                "provider": self.name,
+                "provider_id": self.provider_id,
+                "provider_ref": self.provider_ref,
+                "address": address,
+                "domain": address_domain,
+                "source_domain": source_domain or address_domain,
+                "token": token,
+            }
+            if account_id:
+                mailbox["account_id"] = account_id
+
+            blocked_domain = ""
+            if source_domain and is_yyds_domain_blacklisted(source_domain):
+                blocked_domain = source_domain
+            elif address_domain and is_yyds_domain_blacklisted(address_domain) and address_domain != source_domain:
+                blocked_domain = address_domain
+            if blocked_domain:
+                released, reason = self.release_mailbox(mailbox)
+                detail = f", release_error={reason}" if not released and reason else ""
+                last_error = RuntimeError(f"YYDSMail 域名已被黑名单过滤: {blocked_domain}{detail}")
+                if self.configured_domain_count == 0:
+                    continue
                 raise last_error
-        if not data:
-            if self.configured_domain_count > 0 and not self.domain:
-                raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
-            if last_error:
-                raise last_error
+            return mailbox
+
+        if self.configured_domain_count > 0 and not self.domain and last_error and _is_http_400_error(last_error):
             raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
-        address = str(data.get("address") or data.get("email") or "").strip()
-        token = str(data.get("token") or data.get("temp_token") or data.get("tempToken") or data.get("access_token") or "").strip()
-        if not address or not token:
-            raise RuntimeError("YYDSMail 缺少 address 或 token")
-        account_id = _yyds_account_id(data)
-        address_domain = _normalize_domain(address)
-        if source_domain and is_yyds_domain_blacklisted(source_domain):
-            mailbox = {
-                "provider": self.name,
-                "provider_id": self.provider_id,
-                "provider_ref": self.provider_ref,
-                "address": address,
-                "domain": address_domain,
-                "source_domain": source_domain or address_domain,
-                "token": token,
-            }
-            if account_id:
-                mailbox["account_id"] = account_id
-            released, reason = self.release_mailbox(mailbox)
-            detail = f", release_error={reason}" if not released and reason else ""
-            raise RuntimeError(f"YYDSMail 域名已被黑名单过滤: {source_domain}{detail}")
-        if address_domain and is_yyds_domain_blacklisted(address_domain) and address_domain != source_domain:
-            mailbox = {
-                "provider": self.name,
-                "provider_id": self.provider_id,
-                "provider_ref": self.provider_ref,
-                "address": address,
-                "domain": address_domain,
-                "source_domain": source_domain or address_domain,
-                "token": token,
-            }
-            if account_id:
-                mailbox["account_id"] = account_id
-            released, reason = self.release_mailbox(mailbox)
-            detail = f", release_error={reason}" if not released and reason else ""
-            raise RuntimeError(f"YYDSMail 域名已被黑名单过滤: {address_domain}{detail}")
-        mailbox = {
-            "provider": self.name,
-            "provider_id": self.provider_id,
-            "provider_ref": self.provider_ref,
-            "address": address,
-            "domain": address_domain,
-            "source_domain": source_domain or address_domain,
-            "token": token,
-        }
-        if account_id:
-            mailbox["account_id"] = account_id
-        return mailbox
+        if last_error:
+            raise last_error
+        if self.configured_domain_count > 0 and not self.domain:
+            raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
+        raise RuntimeError("YYDSMail 未能创建可用邮箱")
 
     def _delete_mailbox_candidate(
         self,

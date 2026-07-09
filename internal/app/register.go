@@ -10,6 +10,14 @@ import (
 
 const registerSecretPlaceholder = "********"
 
+var registerProviderRuntimeFields = []string{
+	"auto_domain_blacklist",
+	"auto_domain_blacklist_entries",
+	"mailboxes_count",
+	"mailboxes_preview",
+	"mailboxes_stats",
+}
+
 type RegisterConfig struct {
 	Enabled                 bool                   `json:"enabled"`
 	Lifecycle               string                 `json:"lifecycle,omitempty"`
@@ -39,6 +47,18 @@ type RegisterMailConfig struct {
 	WaitInterval        int              `json:"wait_interval"`
 	APIUseRegisterProxy bool             `json:"api_use_register_proxy"`
 	Providers           []map[string]any `json:"providers"`
+}
+
+func (c *RegisterMailConfig) UnmarshalJSON(data []byte) error {
+	type alias RegisterMailConfig
+	next := alias{
+		APIUseRegisterProxy: true,
+	}
+	if err := json.Unmarshal(data, &next); err != nil {
+		return err
+	}
+	*c = RegisterMailConfig(next)
+	return nil
 }
 
 type RegisterStats struct {
@@ -149,6 +169,9 @@ func (s *Store) UpdateRegisterConfig(fn func(RegisterConfig) RegisterConfig) (Re
 
 func normalizeRegisterConfig(cfg RegisterConfig) RegisterConfig {
 	def := defaultRegisterConfig()
+	if cfg.Mail.RequestTimeout <= 0 && cfg.Mail.WaitTimeout <= 0 && cfg.Mail.WaitInterval <= 0 && cfg.Mail.Providers == nil {
+		cfg.Mail = def.Mail
+	}
 	if cfg.Mail.RequestTimeout <= 0 {
 		cfg.Mail.RequestTimeout = def.Mail.RequestTimeout
 	}
@@ -163,6 +186,7 @@ func normalizeRegisterConfig(cfg RegisterConfig) RegisterConfig {
 	}
 	cfg.Mail.APIUseRegisterProxy = boolAny(cfg.Mail.APIUseRegisterProxy, true)
 	for i := range cfg.Mail.Providers {
+		stripRegisterProviderRuntimeFields(cfg.Mail.Providers[i])
 		if strings.TrimSpace(strAny(cfg.Mail.Providers[i]["provider_id"], "")) == "" {
 			cfg.Mail.Providers[i]["provider_id"] = randID(16)
 		}
@@ -193,6 +217,12 @@ func normalizeRegisterConfig(cfg RegisterConfig) RegisterConfig {
 		cfg.Executor = def.Executor
 	}
 	return cfg
+}
+
+func stripRegisterProviderRuntimeFields(provider map[string]any) {
+	for _, key := range registerProviderRuntimeFields {
+		delete(provider, key)
+	}
 }
 
 func (s *Server) registerSnapshot() RegisterConfig {
@@ -327,6 +357,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if !readBody(w, r, &body) {
 			return
+		}
+		if v, ok := body["proxy"]; ok {
+			proxy, err := normalizeProxyURL(strAny(v, ""))
+			if err != nil {
+				writeErr(w, 400, "invalid register proxy: "+err.Error())
+				return
+			}
+			body["proxy"] = proxy
 		}
 		_, err := s.store.UpdateRegisterConfig(func(cfg RegisterConfig) RegisterConfig {
 			applyRegisterUpdates(&cfg, body)

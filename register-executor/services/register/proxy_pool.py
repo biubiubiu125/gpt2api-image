@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from services.proxy_service import normalize_proxy_url
+from services.proxy_service import validate_proxy_url
 
 
 @dataclass
@@ -20,7 +20,7 @@ class RegisterProxySelection:
 
 
 def parse_proxy_lines(text: str) -> list[str]:
-    proxy = normalize_proxy_url(str(text or "").strip())
+    proxy = validate_proxy_url(str(text or "").strip())
     return [proxy] if proxy else []
 
 
@@ -59,12 +59,18 @@ def classify_register_failure(error: object) -> str:
         return "platform_authorize_failed"
     if "token_exchange" in text or "token 交换" in text or "oauth" in text:
         return "token_exchange_failed"
-    if "create_account_http" in text or "profile" in text and "account" in text:
-        return "account_profile_failed"
+    if "registration_disallowed" in text or "registration is disabled" in text:
+        return "registration_disallowed"
     if "unsupported_email" in text or "email you provided is not supported" in text:
         return "unsupported_email"
+    if "account_creation_failed" in text or "create_account_failed" in text or "failed to create account" in text:
+        return "account_create_failed"
+    if "create_account_http" in text or "profile" in text and "account" in text:
+        return "account_profile_failed"
     if "timed out" in text or "timeout" in text or "curl: (28)" in text:
         return "maybe_network_timeout"
+    if "sentinel_req_failed_403" in text:
+        return "sentinel_req_failed_403"
     if "cloudflare" in text or "just a moment" in text or "cf-chl" in text or "status=403" in text:
         return "cloudflare_blocked"
     if "proxy" in text or "socks" in text or "connection" in text or "connect" in text or "network" in text:
@@ -73,7 +79,7 @@ def classify_register_failure(error: object) -> str:
         return "mail_failed"
     if "token" in text:
         return "token_exchange_failed"
-    if "create_account" in text or "user_register" in text or "failed to create account" in text:
+    if "create_account" in text or "user_register" in text:
         return "account_create_failed"
     return "unknown_error"
 
@@ -83,7 +89,7 @@ class RegisterProxyPool:
         self._single_proxy = ""
 
     def configure(self, cfg: dict[str, Any]) -> None:
-        self._single_proxy = normalize_proxy_url(str(cfg.get("proxy") or ""))
+        self._single_proxy = validate_proxy_url(str(cfg.get("proxy") or ""))
 
     def prepare(self, force: bool = True) -> None:
         return None

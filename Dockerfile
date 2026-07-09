@@ -20,7 +20,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -buildvcs=fals
 
 FROM alpine:3.20 AS app
 WORKDIR /app
-RUN apk add --no-cache su-exec && adduser -D -H app && mkdir -p /app/data /app/web_dist && chown -R app:app /app
+RUN apk add --no-cache su-exec tzdata \
+    && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
+    && adduser -D -H app \
+    && mkdir -p /app/data /app/web_dist \
+    && chown -R app:app /app
 COPY --from=go-build /out/gpt2api-image /app/gpt2api-image
 COPY --from=web-build /app/web/out /app/web_dist
 COPY config.example.json /app/config.example.json

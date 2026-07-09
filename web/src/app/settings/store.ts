@@ -40,6 +40,29 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
   };
 }
 
+function sanitizeRegisterProviders(providers: Array<Record<string, unknown>> | undefined): Array<Record<string, unknown>> {
+  return (providers || []).map((provider) => {
+    const nextProvider = { ...provider };
+    delete nextProvider.auto_domain_blacklist;
+    delete nextProvider.auto_domain_blacklist_entries;
+    delete nextProvider.mailboxes_count;
+    delete nextProvider.mailboxes_preview;
+    delete nextProvider.mailboxes_stats;
+    return nextProvider;
+  });
+}
+
+function buildRegisterMailPayload(config: RegisterConfig["mail"]): RegisterConfig["mail"] {
+  return {
+    ...config,
+    request_timeout: Number(config.request_timeout || 30),
+    wait_timeout: Number(config.wait_timeout || 180),
+    wait_interval: Number(config.wait_interval || 5),
+    api_use_register_proxy: Boolean(config.api_use_register_proxy ?? true),
+    providers: sanitizeRegisterProviders(config.providers),
+  };
+}
+
 function normalizeRegister(config: RegisterConfig): RegisterConfig {
   return {
     ...config,
@@ -408,7 +431,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await updateRegisterConfig({
-        mail: registerConfig.mail,
+        mail: buildRegisterMailPayload(registerConfig.mail),
         proxy: registerConfig.proxy.trim(),
         total: Math.max(1, Number(registerConfig.total) || 1),
         threads: Math.max(1, Number(registerConfig.threads) || 1),
@@ -447,7 +470,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     try {
       if (!runtime.isRunning) {
         await updateRegisterConfig({
-          mail: registerConfig.mail,
+          mail: buildRegisterMailPayload(registerConfig.mail),
           proxy: registerConfig.proxy.trim(),
           total: Math.max(1, Number(registerConfig.total) || 1),
           threads: Math.max(1, Number(registerConfig.threads) || 1),

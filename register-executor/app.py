@@ -82,6 +82,8 @@ def update_register(body: RegisterConfigRequest, x_register_internal_key: str | 
     _require_internal(x_register_internal_key, authorization)
     try:
         return {"register": register_service.update(body.model_dump(exclude_none=True))}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RegisterTaskActiveError as exc:
         _raise_task_active(exc)
 
@@ -89,13 +91,19 @@ def update_register(body: RegisterConfigRequest, x_register_internal_key: str | 
 @app.post("/api/register/start")
 def start_register(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
-    return {"register": register_service.start()}
+    try:
+        return {"register": register_service.start()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/register/repair-abnormal")
 def repair_abnormal_register(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
-    return {"register": register_service.repair_abnormal()}
+    try:
+        return {"register": register_service.repair_abnormal()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/register/stop")
@@ -131,7 +139,7 @@ def test_outlook_pool(body: OutlookPoolTestRequest, x_register_internal_key: str
 @app.get("/api/register/yyds-domain-blacklist")
 def get_yyds_domain_blacklist(x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
     _require_internal(x_register_internal_key, authorization)
-    return {"items": mail_provider.yyds_domain_blacklist_items()}
+    return mail_provider.yyds_domain_blacklist_state()
 
 
 @app.post("/api/register/yyds-domain-blacklist")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 
 def _colon_proxy_to_url(url: str) -> str:
@@ -28,6 +28,37 @@ def normalize_proxy_url(url: str) -> str:
         candidate = _colon_proxy_to_url(candidate)
     if candidate.lower().startswith("socks://"):
         return "socks5://" + candidate[len("socks://") :]
+    return candidate
+
+
+def validate_proxy_url(url: str) -> str:
+    candidate = normalize_proxy_url(url)
+    if not candidate:
+        return ""
+    if any(char.isspace() for char in candidate):
+        raise ValueError("proxy URL contains whitespace")
+    parsed = urlparse(candidate)
+    if not parsed.scheme:
+        raise ValueError("proxy URL missing scheme")
+    if not parsed.netloc:
+        raise ValueError("proxy URL missing host")
+    if not parsed.hostname:
+        raise ValueError("proxy URL missing host")
+    host_part = parsed.netloc.rsplit("@", 1)[-1]
+    if host_part.endswith(":"):
+        raise ValueError("proxy URL invalid port")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("proxy URL invalid port") from exc
+    if port is not None and port < 1:
+        raise ValueError("proxy URL invalid port")
+    if parsed.scheme.lower() not in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}:
+        raise ValueError(f"unsupported proxy scheme {parsed.scheme!r}")
+    if parsed.path not in {"", "/"}:
+        raise ValueError("proxy URL must not include a path")
+    if parsed.query or parsed.fragment:
+        raise ValueError("proxy URL must not include query or fragment")
     return candidate
 
 

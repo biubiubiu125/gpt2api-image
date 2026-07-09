@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -27,6 +30,51 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"detail": map[string]any{"error": msg}})
 }
+
+func normalizeProxyURL(value string) (string, error) {
+	proxy := strings.TrimSpace(value)
+	if proxy == "" {
+		return "", nil
+	}
+	if strings.IndexFunc(proxy, unicode.IsSpace) >= 0 {
+		return "", fmt.Errorf("proxy URL contains whitespace")
+	}
+	parsed, err := url.Parse(proxy)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "" {
+		return "", fmt.Errorf("proxy URL missing scheme")
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("proxy URL missing host")
+	}
+	if parsed.Hostname() == "" {
+		return "", fmt.Errorf("proxy URL missing host")
+	}
+	if strings.HasSuffix(parsed.Host, ":") {
+		return "", fmt.Errorf("proxy URL invalid port")
+	}
+	if port := parsed.Port(); port != "" {
+		value, err := strconv.Atoi(port)
+		if err != nil || value < 1 || value > 65535 {
+			return "", fmt.Errorf("proxy URL invalid port")
+		}
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks", "socks4", "socks4a", "socks5", "socks5h":
+	default:
+		return "", fmt.Errorf("unsupported proxy scheme %q", parsed.Scheme)
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return "", fmt.Errorf("proxy URL must not include a path")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("proxy URL must not include query or fragment")
+	}
+	return proxy, nil
+}
+
 func methodNotAllowed(w http.ResponseWriter, allow string) {
 	if strings.TrimSpace(allow) != "" {
 		w.Header().Set("Allow", allow)

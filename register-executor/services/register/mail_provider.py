@@ -32,6 +32,12 @@ OUTLOOK_UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
 
 YYDS_DOMAIN_BLACKLIST_FILE = DATA_DIR / "yyds_domain_blacklist.json"
 _yyds_domain_blacklist_lock = Lock()
+_yyds_rate_limit_lock = Lock()
+_yyds_next_request_at = 0.0
+_yyds_backoff_until = 0.0
+_YYDS_MIN_REQUEST_INTERVAL_SECONDS = 0.35
+_YYDS_429_BACKOFF_SECONDS = (2.0, 5.0, 10.0)
+_YYDS_MAX_BACKOFF_SECONDS = 30.0
 
 
 def _load_ddg_aliases() -> set[str]:
@@ -214,32 +220,158 @@ def _normalize_domain(value: Any) -> str:
     return text.lstrip("@").strip().strip(".")
 
 
-def _load_yyds_domain_blacklist() -> set[str]:
+def _yyds_blacklist_entry(domain: str, *, manual: bool = False, auto_source: str = "", reason: str = "", provider_ref: str = "", hit_count: int = 0, first_seen_at: str = "", last_seen_at: str = "") -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "domain": domain,
+        "manual": bool(manual),
+        "auto_source": str(auto_source or "").strip(),
+        "reason": str(reason or ("manual" if manual else "")).strip(),
+        "provider_ref": str(provider_ref or "").strip(),
+        "hit_count": max(0, int(hit_count or 0)),
+        "first_seen_at": str(first_seen_at or now),
+        "last_seen_at": str(last_seen_at or now),
+    }
+
+
+def _yyds_blacklist_source(entry: dict[str, Any]) -> str:
+    manual = bool(entry.get("manual"))
+    auto_source = str(entry.get("auto_source") or "").strip()
+    if manual and auto_source:
+        return f"manual+{auto_source}"
+    if manual:
+        return "manual"
+    return auto_source
+
+
+def _yyds_blacklist_blocked(entry: dict[str, Any] | None) -> bool:
+    return bool(entry) and (bool(entry.get("manual")) or bool(str(entry.get("auto_source") or "").strip()))
+
+
+def yyds_blacklist_matches_source(source: Any, expected_auto_source: str) -> bool:
+    source_text = str(source or "").strip()
+    auto_source = str(expected_auto_source or "").strip()
+    if not source_text or not auto_source:
+        return False
+    if source_text == auto_source:
+        return True
+    return source_text.startswith("manual+") and source_text.split("+", 1)[1].strip() == auto_source
+
+
+def _yyds_blacklist_view(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "domain": str(entry.get("domain") or "").strip(),
+        "source": _yyds_blacklist_source(entry),
+        "reason": str(entry.get("reason") or "").strip(),
+        "provider_ref": str(entry.get("provider_ref") or "").strip(),
+        "hit_count": max(0, int(entry.get("hit_count") or 0)),
+        "manual": bool(entry.get("manual")),
+        "auto": bool(str(entry.get("auto_source") or "").strip()),
+        "first_seen_at": str(entry.get("first_seen_at") or ""),
+        "last_seen_at": str(entry.get("last_seen_at") or ""),
+    }
+
+
+def _load_yyds_domain_blacklist_entries() -> dict[str, dict[str, Any]]:
     try:
         if not YYDS_DOMAIN_BLACKLIST_FILE.exists():
-            return set()
+            return {}
         data = json.loads(YYDS_DOMAIN_BLACKLIST_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return set()
-    values: list[Any] = []
+        return {}
+    entries: dict[str, dict[str, Any]] = {}
     if isinstance(data, list):
-        values = data
+        values: list[Any] = data
+        for item in values:
+            domain = _normalize_domain(item)
+            if not domain:
+                continue
+            entries[domain] = _yyds_blacklist_entry(domain, manual=True, reason="manual")
+        return entries
     elif isinstance(data, dict):
+        if isinstance(data.get("entries"), list):
+            for raw_entry in data["entries"]:
+                if not isinstance(raw_entry, dict):
+                    continue
+                domain = _normalize_domain(raw_entry.get("domain"))
+                if not domain:
+                    continue
+                source = str(raw_entry.get("source") or "").strip()
+                auto_source = str(raw_entry.get("auto_source") or "").strip()
+                if not auto_source and source in {"openai_hard_reject", "provider_invalid"}:
+                    auto_source = source
+                if not auto_source and source.startswith("manual+"):
+                    auto_source = source.split("+", 1)[1].strip()
+                manual = bool(raw_entry.get("manual"))
+                if not manual and (source == "manual" or source.startswith("manual+")):
+                    manual = True
+                entries[domain] = _yyds_blacklist_entry(
+                    domain,
+                    manual=manual,
+                    auto_source=auto_source,
+                    reason=str(raw_entry.get("reason") or "").strip(),
+                    provider_ref=str(raw_entry.get("provider_ref") or "").strip(),
+                    hit_count=int(raw_entry.get("hit_count") or 0),
+                    first_seen_at=str(raw_entry.get("first_seen_at") or ""),
+                    last_seen_at=str(raw_entry.get("last_seen_at") or ""),
+                )
+            return {domain: entry for domain, entry in entries.items() if _yyds_blacklist_blocked(entry)}
         if isinstance(data.get("domains"), list):
-            values = data["domains"]
-        else:
-            values = list(data.keys())
-    return {domain for item in values if (domain := _normalize_domain(item))}
+            for item in data["domains"]:
+                domain = _normalize_domain(item)
+                if not domain:
+                    continue
+                entries[domain] = _yyds_blacklist_entry(domain, manual=True, reason="manual")
+            return entries
+        for key in data.keys():
+            domain = _normalize_domain(key)
+            if not domain:
+                continue
+            entries[domain] = _yyds_blacklist_entry(domain, manual=True, reason="manual")
+        return entries
+    return {}
 
 
-def _save_yyds_domain_blacklist(domains: set[str]) -> None:
+def _save_yyds_domain_blacklist_entries(entries: dict[str, dict[str, Any]]) -> None:
     YYDS_DOMAIN_BLACKLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
-    YYDS_DOMAIN_BLACKLIST_FILE.write_text(json.dumps(sorted(domains), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    payload = {
+        "entries": [
+            _yyds_blacklist_view(entry)
+            for _domain, entry in sorted(entries.items())
+            if _yyds_blacklist_blocked(entry)
+        ]
+    }
+    YYDS_DOMAIN_BLACKLIST_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def yyds_domain_blacklist_items() -> list[str]:
+def yyds_domain_blacklist_entries() -> list[dict[str, Any]]:
     with _yyds_domain_blacklist_lock:
-        return sorted(_load_yyds_domain_blacklist())
+        entries = _load_yyds_domain_blacklist_entries()
+        return [_yyds_blacklist_view(entry) for _domain, entry in sorted(entries.items()) if _yyds_blacklist_blocked(entry)]
+
+
+def yyds_domain_blacklist_items(kind: str = "all") -> list[str]:
+    with _yyds_domain_blacklist_lock:
+        entries = _load_yyds_domain_blacklist_entries()
+        values: list[str] = []
+        for domain, entry in sorted(entries.items()):
+            if not _yyds_blacklist_blocked(entry):
+                continue
+            if kind == "manual" and not bool(entry.get("manual")):
+                continue
+            if kind == "auto" and not bool(str(entry.get("auto_source") or "").strip()):
+                continue
+            values.append(domain)
+        return values
+
+
+def yyds_domain_blacklist_state() -> dict[str, Any]:
+    return {
+        "items": yyds_domain_blacklist_items(),
+        "manual_items": yyds_domain_blacklist_items("manual"),
+        "auto_items": yyds_domain_blacklist_items("auto"),
+        "entries": yyds_domain_blacklist_entries(),
+    }
 
 
 def add_yyds_domain_blacklist(domain: Any) -> bool:
@@ -247,11 +379,15 @@ def add_yyds_domain_blacklist(domain: Any) -> bool:
     if not target:
         return False
     with _yyds_domain_blacklist_lock:
-        domains = _load_yyds_domain_blacklist()
-        if target in domains:
+        entries = _load_yyds_domain_blacklist_entries()
+        entry = dict(entries.get(target) or _yyds_blacklist_entry(target))
+        if bool(entry.get("manual")):
             return False
-        domains.add(target)
-        _save_yyds_domain_blacklist(domains)
+        entry["manual"] = True
+        entry["reason"] = str(entry.get("reason") or "manual").strip() or "manual"
+        entry["last_seen_at"] = datetime.now(timezone.utc).isoformat()
+        entries[target] = entry
+        _save_yyds_domain_blacklist_entries(entries)
         return True
 
 
@@ -260,11 +396,18 @@ def remove_yyds_domain_blacklist(domain: Any) -> bool:
     if not target:
         return False
     with _yyds_domain_blacklist_lock:
-        domains = _load_yyds_domain_blacklist()
-        if target not in domains:
+        entries = _load_yyds_domain_blacklist_entries()
+        entry = entries.get(target)
+        if not isinstance(entry, dict) or not bool(entry.get("manual")):
             return False
-        domains.remove(target)
-        _save_yyds_domain_blacklist(domains)
+        entry = dict(entry)
+        entry["manual"] = False
+        if _yyds_blacklist_blocked(entry):
+            entry["last_seen_at"] = datetime.now(timezone.utc).isoformat()
+            entries[target] = entry
+        else:
+            entries.pop(target, None)
+        _save_yyds_domain_blacklist_entries(entries)
         return True
 
 
@@ -272,15 +415,73 @@ def replace_yyds_domain_blacklist(values: list[Any]) -> list[str]:
     domains = {_normalize_domain(item) for item in values}
     domains.discard("")
     with _yyds_domain_blacklist_lock:
-        _save_yyds_domain_blacklist(domains)
+        entries = _load_yyds_domain_blacklist_entries()
+        now = datetime.now(timezone.utc).isoformat()
+        for domain in domains:
+            entry = dict(entries.get(domain) or _yyds_blacklist_entry(domain))
+            entry["manual"] = True
+            if not str(entry.get("first_seen_at") or "").strip():
+                entry["first_seen_at"] = now
+            entry["reason"] = str(entry.get("reason") or "manual").strip() or "manual"
+            entry["last_seen_at"] = now
+            entries[domain] = entry
+        for domain in list(entries.keys()):
+            if domain in domains:
+                continue
+            entry = dict(entries[domain])
+            if not bool(entry.get("manual")):
+                continue
+            entry["manual"] = False
+            if _yyds_blacklist_blocked(entry):
+                entry["last_seen_at"] = now
+                entries[domain] = entry
+            else:
+                entries.pop(domain, None)
+        _save_yyds_domain_blacklist_entries(entries)
         return sorted(domains)
 
 
 def reset_yyds_domain_blacklist() -> int:
     with _yyds_domain_blacklist_lock:
-        domains = _load_yyds_domain_blacklist()
-        _save_yyds_domain_blacklist(set())
-        return len(domains)
+        entries = _load_yyds_domain_blacklist_entries()
+        cleared = 0
+        now = datetime.now(timezone.utc).isoformat()
+        for domain in list(entries.keys()):
+            entry = dict(entries[domain])
+            if not bool(entry.get("manual")):
+                continue
+            cleared += 1
+            entry["manual"] = False
+            if _yyds_blacklist_blocked(entry):
+                entry["last_seen_at"] = now
+                entries[domain] = entry
+            else:
+                entries.pop(domain, None)
+        _save_yyds_domain_blacklist_entries(entries)
+        return cleared
+
+
+def record_yyds_domain_blacklist(domain: Any, *, source: str, reason: str = "", provider_ref: str = "") -> bool:
+    target = _normalize_domain(domain)
+    auto_source = str(source or "").strip()
+    if not target or not auto_source:
+        return False
+    with _yyds_domain_blacklist_lock:
+        entries = _load_yyds_domain_blacklist_entries()
+        entry = dict(entries.get(target) or _yyds_blacklist_entry(target))
+        was_auto = bool(str(entry.get("auto_source") or "").strip())
+        now = datetime.now(timezone.utc).isoformat()
+        entry["auto_source"] = auto_source
+        entry["reason"] = str(reason or entry.get("reason") or auto_source).strip()
+        if provider_ref:
+            entry["provider_ref"] = str(provider_ref).strip()
+        entry["hit_count"] = max(0, int(entry.get("hit_count") or 0)) + 1
+        if not str(entry.get("first_seen_at") or "").strip():
+            entry["first_seen_at"] = now
+        entry["last_seen_at"] = now
+        entries[target] = entry
+        _save_yyds_domain_blacklist_entries(entries)
+        return not was_auto
 
 
 def is_yyds_domain_blacklisted(domain: Any) -> bool:
@@ -288,11 +489,16 @@ def is_yyds_domain_blacklisted(domain: Any) -> bool:
     if not target:
         return False
     with _yyds_domain_blacklist_lock:
-        return target in _load_yyds_domain_blacklist()
+        return _yyds_blacklist_blocked(_load_yyds_domain_blacklist_entries().get(target))
 
 
-def _is_yyds_register_domain_error(error: Exception | str | None) -> bool:
-    return "user_register_http_400" in str(error or "").lower()
+def _yyds_openai_domain_reject_reason(error: Exception | str | None) -> str:
+    text = str(error or "").lower()
+    if "unsupported_email" in text or "email you provided is not supported" in text:
+        return "unsupported_email"
+    if "disposable email" in text or "temporary email" in text:
+        return "unsupported_email"
+    return ""
 
 
 def _is_http_400_error(error: Exception | str | None) -> bool:
@@ -303,10 +509,16 @@ def _is_http_400_error(error: Exception | str | None) -> bool:
 def mark_yyds_mailbox_error(mailbox: dict, error: Exception | str | None = None) -> bool:
     if str(mailbox.get("provider") or "") != YydsMailProvider.name:
         return False
-    if not _is_yyds_register_domain_error(error):
+    reason = _yyds_openai_domain_reject_reason(error)
+    if not reason:
         return False
     domain = _normalize_domain(mailbox.get("source_domain") or mailbox.get("domain") or mailbox.get("address"))
-    return add_yyds_domain_blacklist(domain)
+    return record_yyds_domain_blacklist(
+        domain,
+        source="openai_hard_reject",
+        reason=reason,
+        provider_ref=str(mailbox.get("provider_ref") or ""),
+    )
 
 
 ResultT = TypeVar("ResultT")
@@ -326,7 +538,92 @@ def _config(mail_config: dict) -> dict:
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
         "proxy": str(mail_config.get("proxy") or "").strip(),
         "deadline": mail_config.get("_deadline"),
+        "_check_control": mail_config.get("_check_control"),
     }
+
+
+def _sleep_with_control(seconds: float, check_control: Callable[[], None] | None = None, deadline: float | None = None) -> None:
+    end_at = time.monotonic() + max(0.0, seconds)
+    while True:
+        if check_control is not None:
+            check_control()
+        now = time.monotonic()
+        if deadline is not None and now >= float(deadline):
+            raise RuntimeError("register_task_timeout: yyds_rate_limit_wait_timeout")
+        remaining = end_at - now
+        if deadline is not None:
+            remaining = min(remaining, max(0.0, float(deadline) - now))
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
+
+
+def _wait_yyds_rate_limit(check_control: Callable[[], None] | None = None, deadline: float | None = None) -> None:
+    global _yyds_next_request_at
+    while True:
+        with _yyds_rate_limit_lock:
+            now = time.monotonic()
+            if deadline is not None and now >= float(deadline):
+                raise RuntimeError("register_task_timeout: yyds_rate_limit_wait_timeout")
+            wait_until = max(_yyds_next_request_at, _yyds_backoff_until)
+            if wait_until <= now:
+                _yyds_next_request_at = now + _YYDS_MIN_REQUEST_INTERVAL_SECONDS
+                return
+            wait_seconds = wait_until - now
+        _sleep_with_control(wait_seconds, check_control, deadline)
+
+
+def _retry_after_seconds(resp: Any, fallback: float) -> float:
+    headers = getattr(resp, "headers", {}) or {}
+    value = ""
+    try:
+        value = str(headers.get("Retry-After") or headers.get("retry-after") or "").strip()
+    except Exception:
+        value = ""
+    if value:
+        try:
+            return min(_YYDS_MAX_BACKOFF_SECONDS, max(0.0, float(value)))
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return min(_YYDS_MAX_BACKOFF_SECONDS, max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds()))
+            except Exception:
+                pass
+    return min(_YYDS_MAX_BACKOFF_SECONDS, fallback)
+
+
+def _mark_yyds_rate_limited(attempt: int, resp: Any = None) -> None:
+    global _yyds_backoff_until
+    fallback = _YYDS_429_BACKOFF_SECONDS[min(max(0, attempt), len(_YYDS_429_BACKOFF_SECONDS) - 1)]
+    wait_seconds = _retry_after_seconds(resp, fallback)
+    with _yyds_rate_limit_lock:
+        _yyds_backoff_until = max(_yyds_backoff_until, time.monotonic() + wait_seconds)
+
+
+def _is_yyds_rate_limit_error(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    text = " ".join(
+        str(data.get(key) or "")
+        for key in ("errorCode", "error", "message", "msg")
+    ).lower()
+    return "429" in text or "rate limit" in text or "too many" in text
+
+
+def _yyds_account_id(data: dict[str, Any]) -> str:
+    for key in ("id", "account_id", "accountId", "accountID"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("account", "mailbox"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            value = _yyds_account_id(nested)
+            if value:
+                return value
+    return ""
 
 
 def _random_mailbox_name() -> str:
@@ -1269,16 +1566,15 @@ class YydsMailProvider(BaseMailProvider):
 
     def __init__(self, entry: dict, conf: dict):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.provider_id = str(entry.get("provider_id") or "").strip()
         self.api_base = str(entry.get("api_base") or "https://maliapi.215.im/v1").rstrip("/")
         self.api_key = str(entry["api_key"]).strip()
-        manual_blacklist = {_normalize_domain(item) for item in _normalize_string_list(entry.get("domain_blacklist"))}
-        manual_blacklist.discard("")
         configured_domains = [_normalize_domain(item) for item in _normalize_string_list(entry.get("domain")) if _normalize_domain(item)]
         self.configured_domain_count = len(configured_domains)
         self.domain = [
             domain
             for domain in configured_domains
-            if domain not in manual_blacklist and not is_yyds_domain_blacklisted(domain)
+            if not is_yyds_domain_blacklisted(domain)
         ]
         self.subdomain = str(entry.get("subdomain") or "").strip()
         self.wildcard = bool(entry.get("wildcard"))
@@ -1287,15 +1583,29 @@ class YydsMailProvider(BaseMailProvider):
 
     def _request(self, method: str, path: str, token: str = "", params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200, 201, 204)):
         headers = {"Authorization": f"Bearer {token}"} if token else {"X-API-Key": self.api_key}
-        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers=headers, params=params, json=payload, timeout=self.request_timeout())
-        if resp.status_code not in expected:
-            raise RuntimeError(f"YYDSMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
-        if resp.status_code == 204:
-            return {}
-        data = resp.json()
-        if isinstance(data, dict) and data.get("success") is False:
-            raise RuntimeError(f"YYDSMail 请求失败: {data.get('errorCode') or data.get('error')}")
-        return data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)) else data
+        check_control = self.conf.get("_check_control")
+        deadline = self.conf.get("deadline")
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            _wait_yyds_rate_limit(check_control if callable(check_control) else None, deadline)
+            resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers=headers, params=params, json=payload, timeout=self.request_timeout())
+            if resp.status_code == 429:
+                _mark_yyds_rate_limited(attempt, resp)
+                if attempt < max_attempts - 1:
+                    continue
+            if resp.status_code not in expected:
+                raise RuntimeError(f"YYDSMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+            if resp.status_code == 204:
+                return {}
+            data = resp.json()
+            if isinstance(data, dict) and data.get("success") is False:
+                if _is_yyds_rate_limit_error(data):
+                    _mark_yyds_rate_limited(attempt, resp)
+                    if attempt < max_attempts - 1:
+                        continue
+                raise RuntimeError(f"YYDSMail 请求失败: {data.get('errorCode') or data.get('error')}")
+            return data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)) else data
+        raise RuntimeError(f"YYDSMail 请求失败: {method} {path}, HTTP 429")
 
     @staticmethod
     def _items(data):
@@ -1328,14 +1638,23 @@ class YydsMailProvider(BaseMailProvider):
             except RuntimeError as error:
                 last_error = error
                 if source_domain and _is_http_400_error(error):
-                    add_yyds_domain_blacklist(source_domain)
+                    record_yyds_domain_blacklist(
+                        source_domain,
+                        source="provider_invalid",
+                        reason="provider_http_400",
+                        provider_ref=self.provider_ref,
+                    )
                     self.domain = [domain for domain in self.domain if domain != source_domain]
                     continue
                 raise
         else:
+            if self.configured_domain_count > 0 and not self.domain and last_error and _is_http_400_error(last_error):
+                raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
             if last_error:
                 raise last_error
         if not data:
+            if self.configured_domain_count > 0 and not self.domain:
+                raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
             if last_error:
                 raise last_error
             raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
@@ -1343,20 +1662,140 @@ class YydsMailProvider(BaseMailProvider):
         token = str(data.get("token") or data.get("temp_token") or data.get("tempToken") or data.get("access_token") or "").strip()
         if not address or not token:
             raise RuntimeError("YYDSMail 缺少 address 或 token")
+        account_id = _yyds_account_id(data)
         address_domain = _normalize_domain(address)
         if source_domain and is_yyds_domain_blacklisted(source_domain):
-            raise RuntimeError(f"YYDSMail 域名已被黑名单过滤: {source_domain}")
-        if not source_domain and address_domain and is_yyds_domain_blacklisted(address_domain):
-            raise RuntimeError(f"YYDSMail 域名已被黑名单过滤: {address_domain}")
-        return {
+            mailbox = {
+                "provider": self.name,
+                "provider_id": self.provider_id,
+                "provider_ref": self.provider_ref,
+                "address": address,
+                "domain": address_domain,
+                "source_domain": source_domain or address_domain,
+                "token": token,
+            }
+            if account_id:
+                mailbox["account_id"] = account_id
+            released, reason = self.release_mailbox(mailbox)
+            detail = f", release_error={reason}" if not released and reason else ""
+            raise RuntimeError(f"YYDSMail 域名已被黑名单过滤: {source_domain}{detail}")
+        if address_domain and is_yyds_domain_blacklisted(address_domain) and address_domain != source_domain:
+            mailbox = {
+                "provider": self.name,
+                "provider_id": self.provider_id,
+                "provider_ref": self.provider_ref,
+                "address": address,
+                "domain": address_domain,
+                "source_domain": source_domain or address_domain,
+                "token": token,
+            }
+            if account_id:
+                mailbox["account_id"] = account_id
+            released, reason = self.release_mailbox(mailbox)
+            detail = f", release_error={reason}" if not released and reason else ""
+            raise RuntimeError(f"YYDSMail 域名已被黑名单过滤: {address_domain}{detail}")
+        mailbox = {
             "provider": self.name,
+            "provider_id": self.provider_id,
             "provider_ref": self.provider_ref,
             "address": address,
             "domain": address_domain,
             "source_domain": source_domain or address_domain,
             "token": token,
-            "account_id": str(data.get("id") or ""),
         }
+        if account_id:
+            mailbox["account_id"] = account_id
+        return mailbox
+
+    def _delete_mailbox_candidate(
+        self,
+        path: str,
+        *,
+        token: str = "",
+        params: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        headers = {"Authorization": f"Bearer {token}"} if token else {"X-API-Key": self.api_key}
+        check_control = self.conf.get("_check_control")
+        deadline = self.conf.get("deadline")
+        max_attempts = 3
+        last_error = ""
+        for attempt in range(max_attempts):
+            _wait_yyds_rate_limit(check_control if callable(check_control) else None, deadline)
+            resp = self.session.request(
+                "DELETE",
+                f"{self.api_base}{path}",
+                headers=headers,
+                params=params,
+                json=payload,
+                timeout=self.request_timeout(),
+            )
+            if resp.status_code == 429:
+                _mark_yyds_rate_limited(attempt, resp)
+                last_error = f"YYDSMail 删除邮箱失败: DELETE {path}, HTTP 429"
+                if attempt < max_attempts - 1:
+                    continue
+            if resp.status_code in {200, 202, 204, 404}:
+                if resp.status_code in {204, 404}:
+                    return True, ""
+                text = str(getattr(resp, "text", "") or "").strip()
+                if not text:
+                    return True, ""
+                try:
+                    data = resp.json()
+                except Exception:
+                    return True, ""
+                if isinstance(data, dict) and data.get("success") is False:
+                    detail = " ".join(
+                        str(data.get(key) or "")
+                        for key in ("errorCode", "error", "message", "msg")
+                    ).lower()
+                    if "404" in detail or "not found" in detail or "不存在" in detail:
+                        return True, ""
+                    return False, f"YYDSMail 删除邮箱失败: {data.get('errorCode') or data.get('error') or data}"
+                return True, ""
+            last_error = f"YYDSMail 删除邮箱失败: DELETE {path}, HTTP {resp.status_code}, body={resp.text[:300]}"
+            break
+        return False, last_error or f"YYDSMail 删除邮箱失败: DELETE {path}"
+
+    def release_mailbox(self, mailbox: dict[str, Any]) -> tuple[bool, str]:
+        account_id = str(mailbox.get("account_id") or "").strip()
+        address = str(mailbox.get("address") or "").strip()
+        token = str(mailbox.get("token") or "").strip()
+        if not account_id and not address:
+            return False, "YYDSMail 删除邮箱失败: 缺少 account_id 或 address"
+        attempts: list[dict[str, Any]] = []
+        if account_id:
+            attempts.append({"path": f"/accounts/{account_id}", "token": token})
+            attempts.append({"path": f"/accounts/{account_id}", "token": ""})
+        if address:
+            attempts.append({"path": "/accounts", "token": token, "params": {"address": address}})
+            attempts.append({"path": "/accounts", "token": token, "payload": {"address": address}})
+            attempts.append({"path": "/accounts", "token": "", "params": {"address": address}})
+            attempts.append({"path": "/accounts", "token": "", "payload": {"address": address}})
+        errors: list[str] = []
+        attempted: set[tuple[str, str, str, str]] = set()
+        for candidate in attempts:
+            key = (
+                str(candidate.get("path") or ""),
+                str(candidate.get("token") or ""),
+                json.dumps(candidate.get("params") or {}, sort_keys=True, ensure_ascii=False),
+                json.dumps(candidate.get("payload") or {}, sort_keys=True, ensure_ascii=False),
+            )
+            if key in attempted:
+                continue
+            attempted.add(key)
+            released, reason = self._delete_mailbox_candidate(
+                str(candidate.get("path") or ""),
+                token=str(candidate.get("token") or ""),
+                params=candidate.get("params"),
+                payload=candidate.get("payload"),
+            )
+            if released:
+                return True, ""
+            if reason:
+                errors.append(reason)
+        return False, "; ".join(errors[:4]) or "YYDSMail 删除邮箱失败"
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         data = self._request("GET", "/messages", token=str(mailbox.get("token") or ""), params={"address": mailbox["address"]})
@@ -1372,25 +1811,6 @@ class YydsMailProvider(BaseMailProvider):
         if isinstance(sender, dict):
             sender = sender.get("address") or sender.get("email") or sender.get("name") or ""
         return {"provider": self.name, "mailbox": mailbox["address"], "message_id": message_id, "subject": str(item.get("subject") or ""), "sender": str(sender), "text_content": text_content, "html_content": html_content, "received_at": _parse_received_at(item.get("createdAt") or item.get("created_at") or item.get("receivedAt") or item.get("date") or item.get("timestamp")), "raw": item}
-
-    def release_mailbox(self, mailbox: dict[str, Any]) -> tuple[bool, str]:
-        account_id = str(mailbox.get("account_id") or "").strip()
-        if not account_id:
-            return False, "missing account_id"
-        errors: list[str] = []
-        token = str(mailbox.get("token") or "").strip()
-        if token:
-            try:
-                self._request("DELETE", f"/accounts/{account_id}", token=token, expected=(200, 202, 204, 404))
-                return True, ""
-            except Exception as error:
-                errors.append(f"token: {error}")
-        try:
-            self._request("DELETE", f"/accounts/{account_id}", expected=(200, 202, 204, 404))
-            return True, ""
-        except Exception as error:
-            errors.append(f"api_key: {error}")
-        return False, "; ".join(errors)
 
     def close(self) -> None:
         self.session.close()
@@ -1733,11 +2153,14 @@ def _entries(mail_config: dict) -> list[dict]:
     counters: dict[str, int] = {}
     for item in mail_config["providers"]:
         idx = len(result) + 1
-        t = item.get("type", "")
+        t = str(item.get("type", "")).strip()
         cnt = counters.get(t, 0) + 1
         counters[t] = cnt
+        provider_id = str(item.get("provider_id") or item.get("id") or "").strip()
+        provider_ref = f"{t}:{provider_id}" if provider_id else f"{t}#{idx}"
+        legacy_provider_ref = f"{t}#{idx}"
         label = f"DDG-{cnt}" if t == "ddg_mail" else f"{t}#{idx}"
-        result.append({**item, "provider_ref": f"{item['type']}#{idx}", "label": label})
+        result.append({**item, "provider_id": provider_id, "provider_ref": provider_ref, "legacy_provider_ref": legacy_provider_ref, "label": label})
     return result
 
 
@@ -1759,9 +2182,34 @@ def _next_entry(mail_config: dict) -> dict:
         return value
 
 
-def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = "") -> BaseMailProvider:
-    entry = next((dict(item) for item in _entries(mail_config) if provider_ref and item["provider_ref"] == provider_ref), None)
-    entry = entry or next((dict(item) for item in _enabled_entries(mail_config) if provider and item["type"] == provider), None) or _next_entry(mail_config)
+def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = "", provider_id: str = "") -> BaseMailProvider:
+    provider = str(provider or "").strip()
+    provider_ref = str(provider_ref or "").strip()
+    provider_id = str(provider_id or "").strip()
+    entries = _entries(mail_config)
+    enabled_entries = [item for item in entries if item.get("enable")]
+    if provider_id:
+        entry = next((dict(item) for item in enabled_entries if item.get("provider_id") == provider_id and (not provider or item.get("type") == provider)), None)
+        if entry is None:
+            raise RuntimeError(f"mail provider_id not available: {provider_id}")
+    elif provider_ref:
+        entry = next((dict(item) for item in enabled_entries if item.get("provider_ref") == provider_ref and (not provider or item.get("type") == provider)), None)
+        if entry is None:
+            legacy_matches = [
+                item
+                for item in enabled_entries
+                if item.get("legacy_provider_ref") == provider_ref and (not provider or item.get("type") == provider) and not item.get("provider_id")
+            ]
+            if len(legacy_matches) == 1:
+                entry = dict(legacy_matches[0])
+            else:
+                same_type = [item for item in enabled_entries if provider and item.get("type") == provider]
+                if len(same_type) == 1:
+                    entry = dict(same_type[0])
+                else:
+                    raise RuntimeError(f"mail provider_ref not available: {provider_ref}")
+    else:
+        entry = next((dict(item) for item in enabled_entries if provider and item["type"] == provider), None) or _next_entry(mail_config)
     conf = _config(mail_config)
     if entry["type"] == "cloudmail_gen":
         return CloudMailGenProvider(entry, conf)
@@ -1786,6 +2234,18 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 
+def _create_mailbox_error_allows_fallback(provider: BaseMailProvider, error: Exception | str | None) -> bool:
+    text = str(error or "")
+    if provider.name == "ddg_mail" and "DDG日上限已达" in text:
+        return True
+    if provider.name == YydsMailProvider.name and (
+        "YYDSMail 可用域名为空，已被黑名单过滤" in text
+        or "YYDSMail 域名已被黑名单过滤" in text
+    ):
+        return True
+    return False
+
+
 def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
     enabled = _enabled_entries(mail_config)
     tried: set[str] = set()
@@ -1801,8 +2261,9 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
             return mailbox
         except RuntimeError as error:
             last_error = str(error)
-            if "DDG日上限已达" not in last_error:
-                raise
+            if _create_mailbox_error_allows_fallback(provider, error):
+                continue
+            raise
         finally:
             provider.close()
     raise RuntimeError(last_error or "所有启用的邮箱提供商均无法创建邮箱")
@@ -1813,7 +2274,12 @@ def wait_for_code(
     mailbox: dict,
     check_control: Callable[[], None] | None = None,
 ) -> str | None:
-    provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
+    provider = _create_provider(
+        mail_config,
+        str(mailbox.get("provider") or ""),
+        str(mailbox.get("provider_ref") or ""),
+        str(mailbox.get("provider_id") or ""),
+    )
     try:
         return provider.wait_for_code(mailbox, check_control)
     finally:
@@ -1826,8 +2292,6 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     仅对 outlook_token 邮箱生效：成功标记 used；失败时若是 token 失效标记 token_invalid，
     其余失败标记 failed（保留邮箱占用以便排查，可通过重置释放）。
     """
-    if not success:
-        mark_yyds_mailbox_error(mailbox, error)
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         return
     address = str(mailbox.get("address") or "").strip()
@@ -1843,26 +2307,42 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
         _set_outlook_token_state(address, "failed", reason[:300])
 
 
-def release_mailbox(mailbox: dict, mail_config: dict | None = None) -> tuple[bool, str]:
+def _release_mailbox_legacy_unused(mailbox: dict, mail_config: dict | None = None) -> tuple[bool, str]:
     """把 outlook_token 邮箱从 in_use 释放回未使用（用于流程主动放弃且未消费验证码时）。"""
     provider = str(mailbox.get("provider") or "")
-    if provider == YydsMailProvider.name:
-        if not mail_config:
-            return False, "missing mail_config"
-        try:
-            provider_instance = _create_provider(mail_config, provider, str(mailbox.get("provider_ref") or ""))
-            try:
-                if isinstance(provider_instance, YydsMailProvider):
-                    return provider_instance.release_mailbox(mailbox)
-            finally:
-                provider_instance.close()
-        except Exception as error:
-            return False, str(error)
-        return False, "yyds provider not available"
     if provider != OutlookTokenProvider.name:
         return True, ""
     _release_outlook_token_state(str(mailbox.get("address") or ""))
     return True, ""
+
+
+def release_mailbox(mailbox: dict, mail_config: dict | None = None) -> tuple[bool, str]:
+    """释放流程中提前放弃的邮箱资源。"""
+    provider = str(mailbox.get("provider") or "")
+    if provider == OutlookTokenProvider.name:
+        _release_outlook_token_state(str(mailbox.get("address") or ""))
+        return True, ""
+    if mail_config is None:
+        return True, ""
+    try:
+        handler = _create_provider(
+            mail_config,
+            provider,
+            str(mailbox.get("provider_ref") or ""),
+            str(mailbox.get("provider_id") or ""),
+        )
+    except Exception as error:
+        return False, str(error)
+    try:
+        releaser = getattr(handler, "release_mailbox", None)
+        if callable(releaser):
+            result = releaser(mailbox)
+            if isinstance(result, tuple) and len(result) == 2:
+                return bool(result[0]), str(result[1] or "")
+            return bool(result), ""
+        return True, ""
+    finally:
+        handler.close()
 
 
 def get_existing_mailbox(mail_config: dict, email: str) -> dict:

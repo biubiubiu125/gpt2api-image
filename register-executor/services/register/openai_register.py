@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from curl_cffi import requests
 
 from services.account_service import account_service
-from services.proxy_service import ClearanceBundle, proxy_settings
+from services.proxy_service import proxy_settings
 from services.register import mail_provider
 from services.register.proxy_pool import RegisterProxySelection, classify_register_failure, register_proxy_pool
 from utils.log import logger
@@ -676,26 +676,12 @@ def _request_timeout(deadline: float | None, fallback: float = default_timeout) 
     return _remaining_timeout(deadline, fallback)
 
 
-def _apply_clearance_to_session(session: requests.Session, bundle: ClearanceBundle | None) -> None:
-    if bundle is None:
-        return
-    if bundle.user_agent:
-        session.headers["User-Agent"] = bundle.user_agent
-        session.headers["user-agent"] = bundle.user_agent
-    for name, value in bundle.cookies.items():
-        try:
-            session.cookies.set(name, value, domain=f".{bundle.target_host or 'openai.com'}")
-            session.cookies.set(name, value, domain=bundle.target_host or "auth.openai.com")
-        except Exception:
-            continue
-
-
 def _set_case_insensitive_header(headers: dict[str, str], name: str, value: str) -> None:
     target_key = next((key for key in headers if key.lower() == name.lower()), name)
     headers[target_key] = value
 
 
-def _headers_with_clearance(
+def _build_request_headers(
     headers: dict[str, str],
     target_url: str,
     proxy: str = "",
@@ -726,7 +712,7 @@ def _resolve_user_agent_override(value: object) -> str:
     return str(value or "").strip()
 
 
-def _request_with_clearance_retry(
+def _request_with_retry_headers(
     session: requests.Session,
     method: str,
     url: str,
@@ -734,53 +720,32 @@ def _request_with_clearance_retry(
     headers: dict[str, str],
     proxy: str = "",
     user_agent_override: object = "",
-    refresh_clearance=None,
     stop_event: threading.Event | None = None,
     deadline: float | None = None,
     retry_attempts: int = 3,
     **kwargs,
 ) -> tuple[object | None, str]:
-    def build_headers() -> dict[str, str]:
-        return _headers_with_clearance(
+    return request_with_local_retry(
+        session,
+        method,
+        url,
+        headers=_build_request_headers(
             dict(headers),
             url,
             proxy,
             _resolve_user_agent_override(user_agent_override),
-        )
-
-    resp, error = request_with_local_retry(
-        session,
-        method,
-        url,
-        headers=build_headers(),
+        ),
         retry_attempts=retry_attempts,
         stop_event=stop_event,
         deadline=deadline,
         **kwargs,
     )
-    if _is_cloudflare_challenge(resp) and callable(refresh_clearance):
-        try:
-            refreshed = bool(refresh_clearance(url))
-        except Exception:
-            refreshed = False
-        if refreshed:
-            resp, error = request_with_local_retry(
-                session,
-                method,
-                url,
-                headers=build_headers(),
-                retry_attempts=retry_attempts,
-                stop_event=stop_event,
-                deadline=deadline,
-                **kwargs,
-            )
-    return resp, error
 
 
 def _cloudflare_block_message(resp, prefix: str = "遇到 Cloudflare 拦截", reason: str = "") -> str:
     status = getattr(resp, "status_code", "unknown")
     debug = _response_debug_detail(resp)
-    reason = reason or "clearance 未生效，可能是清障失败或代理 IP/环境被拦截"
+    reason = reason or "当前代理 IP 或环境被 Cloudflare 拦截"
     return f"{prefix}: {reason}: status={status}, {debug}"
 
 
@@ -899,7 +864,6 @@ def extract_oauth_callback_params_from_consent_session(
     *,
     proxy: str = "",
     user_agent_override: object = "",
-    refresh_clearance=None,
     expected_state: str = "",
 ) -> dict[str, str] | None:
     current_url = _absolute_auth_url(consent_url)
@@ -911,14 +875,13 @@ def extract_oauth_callback_params_from_consent_session(
     state_mismatch_found = False
     for _ in range(10):
         _check_task_control(stop_event, deadline)
-        resp, _error = _request_with_clearance_retry(
+        resp, _error = _request_with_retry_headers(
             session,
             "get",
             current_url,
             headers=headers,
             proxy=proxy,
             user_agent_override=user_agent_override,
-            refresh_clearance=refresh_clearance,
             allow_redirects=False,
             stop_event=stop_event,
             deadline=deadline,
@@ -965,7 +928,7 @@ def extract_oauth_callback_params_from_consent_session(
     headers["referer"] = current_url
     headers["oai-device-id"] = device_id
     headers.update(_make_trace_headers())
-    resp, _error = _request_with_clearance_retry(
+    resp, _error = _request_with_retry_headers(
         session,
         "post",
         f"{auth_base}/api/accounts/workspace/select",
@@ -973,7 +936,6 @@ def extract_oauth_callback_params_from_consent_session(
         headers=headers,
         proxy=proxy,
         user_agent_override=user_agent_override,
-        refresh_clearance=refresh_clearance,
         allow_redirects=False,
         stop_event=stop_event,
         deadline=deadline,
@@ -1006,7 +968,7 @@ def extract_oauth_callback_params_from_consent_session(
     body = {"org_id": org_id}
     if project_id:
         body["project_id"] = project_id
-    resp, _error = _request_with_clearance_retry(
+    resp, _error = _request_with_retry_headers(
         session,
         "post",
         f"{auth_base}/api/accounts/organization/select",
@@ -1014,7 +976,6 @@ def extract_oauth_callback_params_from_consent_session(
         headers=org_headers,
         proxy=proxy,
         user_agent_override=user_agent_override,
-        refresh_clearance=refresh_clearance,
         allow_redirects=False,
         stop_event=stop_event,
         deadline=deadline,
@@ -1045,7 +1006,6 @@ def request_platform_oauth_token(
     *,
     proxy: str = "",
     user_agent_override: object = "",
-    refresh_clearance=None,
 ) -> dict | None:
     headers = {
         "accept": "*/*",
@@ -1066,7 +1026,7 @@ def request_platform_oauth_token(
         "user-agent": user_agent,
     }
     _check_task_control(stop_event, deadline)
-    resp, _error = _request_with_clearance_retry(
+    resp, _error = _request_with_retry_headers(
         session,
         "post",
         f"{auth_base}/api/accounts/oauth/token",
@@ -1080,7 +1040,6 @@ def request_platform_oauth_token(
         },
         proxy=proxy,
         user_agent_override=user_agent_override,
-        refresh_clearance=refresh_clearance,
         stop_event=stop_event,
         deadline=deadline,
         timeout=_request_timeout(deadline, 60),
@@ -1107,7 +1066,6 @@ def exchange_platform_tokens(
     *,
     proxy: str = "",
     user_agent_override: object = "",
-    refresh_clearance=None,
     expected_state: str = "",
 ) -> dict | None:
     callback_params = extract_oauth_callback_params_from_consent_session(
@@ -1118,7 +1076,6 @@ def exchange_platform_tokens(
         deadline,
         proxy=proxy,
         user_agent_override=user_agent_override,
-        refresh_clearance=refresh_clearance,
         expected_state=expected_state,
     )
     if not callback_params:
@@ -1126,14 +1083,13 @@ def exchange_platform_tokens(
             fallback_headers = dict(navigate_headers)
             fallback_headers["referer"] = auth_base
             fallback_headers["oai-device-id"] = device_id
-            resp, _error = _request_with_clearance_retry(
+            resp, _error = _request_with_retry_headers(
                 session,
                 "get",
                 _absolute_auth_url(consent_url),
                 headers=fallback_headers,
                 proxy=proxy,
                 user_agent_override=user_agent_override,
-                refresh_clearance=refresh_clearance,
                 allow_redirects=True,
                 stop_event=stop_event,
                 deadline=deadline,
@@ -1168,7 +1124,6 @@ def exchange_platform_tokens(
         deadline,
         proxy=proxy,
         user_agent_override=user_agent_override,
-        refresh_clearance=refresh_clearance,
     )
     if not tokens:
         return None
@@ -1192,8 +1147,6 @@ class PlatformRegistrar:
         self.stop_event = stop_event
         self.deadline = deadline
         self.run_id = str(run_id or "")
-        self.clearance_user_agent = ""
-        self.clearance_failure_reason = ""
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_state = ""
@@ -1234,83 +1187,24 @@ class PlatformRegistrar:
         headers.update(_make_trace_headers())
         return headers
 
-    def _sentinel_user_agent(self) -> str:
-        return str(self.clearance_user_agent or "").strip() or user_agent
+    def _sentinel_user_agent(self, session: requests.Session | None = None) -> str:
+        active_session = session or self.session
+        session_headers = getattr(active_session, "headers", {}) or {}
+        return str(session_headers.get("User-Agent") or session_headers.get("user-agent") or user_agent).strip() or user_agent
 
-    def _sentinel_client_hints(self) -> dict[str, str]:
-        return _resolve_user_agent_client_hints(self._sentinel_user_agent())
+    def _sentinel_client_hints(self, session: requests.Session | None = None) -> dict[str, str]:
+        return _resolve_user_agent_client_hints(self._sentinel_user_agent(session))
 
     def _ensure_sentinel_runtime(self, index: int) -> None:
         self._check_task_control()
-        hints = self._sentinel_client_hints()
-        try:
-            ensure_browser_sentinel_runtime(
-                proxy=self.proxy,
-                user_agent=hints["user_agent"],
-                sec_ch_ua=hints["sec_ch_ua"],
-                sec_ch_ua_full_version_list=hints["sec_ch_ua_full_version_list"],
-                check_control=self._check_task_control,
-            )
-        except RuntimeError as error:
-            error_text = str(error)
-            refresh_target = ""
-            if "sentinel_req_failed_403" in error_text:
-                refresh_target = "https://sentinel.openai.com"
-            elif any(
-                marker in error_text
-                for marker in (
-                    "sentinel_browser_page_load_failed",
-                    "sentinel_sdk_load_failed",
-                    "sentinel_sdk_missing",
-                )
-            ):
-                refresh_target = "https://chatgpt.com"
-            if refresh_target:
-                bundle = self._refresh_cloudflare_clearance(refresh_target, index, session=self.session)
-                if bundle is not None:
-                    refreshed_hints = self._sentinel_client_hints()
-                    ensure_browser_sentinel_runtime(
-                        proxy=self.proxy,
-                        user_agent=refreshed_hints["user_agent"],
-                        sec_ch_ua=refreshed_hints["sec_ch_ua"],
-                        sec_ch_ua_full_version_list=refreshed_hints["sec_ch_ua_full_version_list"],
-                        check_control=self._check_task_control,
-                    )
-                    return
-            raise
-
-    def _refresh_cloudflare_clearance(
-        self,
-        target_url: str,
-        index: int,
-        *,
-        session: requests.Session | None = None,
-    ) -> ClearanceBundle | None:
-        self._check_task_control()
-        self.clearance_failure_reason = ""
-        profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True, select_pool=False)
-        if not profile.clearance_enabled:
-            self.clearance_failure_reason = "未配置可用 clearance，请更换注册代理或手动配置 Cookie"
-            step(index, f"跳过 Cloudflare 清障：{self.clearance_failure_reason}", "yellow")
-            return None
-        step(index, "遇到 Cloudflare 拦截，刷新 clearance", "yellow")
-        bundle = proxy_settings.refresh_clearance(
-            target_url=target_url,
+        hints = self._sentinel_client_hints(self.session)
+        ensure_browser_sentinel_runtime(
             proxy=self.proxy,
-            force=True,
-            upstream=True,
-            select_pool=False,
+            user_agent=hints["user_agent"],
+            sec_ch_ua=hints["sec_ch_ua"],
+            sec_ch_ua_full_version_list=hints["sec_ch_ua_full_version_list"],
+            check_control=self._check_task_control,
         )
-        if bundle is not None:
-            _apply_clearance_to_session(self.session, bundle)
-            if session is not None and session is not self.session:
-                _apply_clearance_to_session(session, bundle)
-            self.clearance_user_agent = bundle.user_agent or self.clearance_user_agent
-            step(index, "Cloudflare clearance 刷新成功，继续注册", "yellow")
-        else:
-            self.clearance_failure_reason = "clearance 刷新失败，请检查手动 Cookie 或代理 IP"
-            step(index, f"Cloudflare clearance 失败：{self.clearance_failure_reason}", "yellow")
-        return bundle
 
     def _prepare_sentinel_headers(
         self,
@@ -1326,57 +1220,23 @@ class PlatformRegistrar:
         strict_turnstile: bool = True,
         strict_so: bool = False,
         log_event: str = "register_sentinel",
-        refresh_on_failure: bool = True,
     ) -> tuple[dict[str, str], object]:
         _set_oai_device_cookies(session, device_id)
-        sentinel_hints = self._sentinel_client_hints()
-        try:
-            artifacts = prepare_sentinel_artifacts(
-                session,
-                device_id,
-                flow,
-                include_so=include_so,
-                observer_wait_ms=observer_wait_ms,
-                user_agent=sentinel_hints["user_agent"],
-                sec_ch_ua=sentinel_hints["sec_ch_ua"],
-                sec_ch_ua_full_version_list=sentinel_hints["sec_ch_ua_full_version_list"],
-                strict_turnstile=strict_turnstile,
-                strict_so=strict_so,
-                proxy=self.proxy,
-                check_control=self._check_task_control,
-            )
-        except RuntimeError as error:
-            error_text = str(error)
-            refresh_target = ""
-            if "sentinel_req_failed_403" in error_text:
-                refresh_target = "https://sentinel.openai.com"
-            elif any(
-                marker in error_text
-                for marker in (
-                    "sentinel_browser_page_load_failed",
-                    "sentinel_sdk_load_failed",
-                    "sentinel_sdk_missing",
-                )
-            ):
-                refresh_target = "https://chatgpt.com"
-            if refresh_on_failure and refresh_target:
-                bundle = self._refresh_cloudflare_clearance(refresh_target, index, session=session)
-                if bundle is not None:
-                    return self._prepare_sentinel_headers(
-                        session,
-                        device_id,
-                        flow,
-                        index,
-                        referer=referer,
-                        target_url=target_url,
-                        include_so=include_so,
-                        observer_wait_ms=observer_wait_ms,
-                        strict_turnstile=strict_turnstile,
-                        strict_so=strict_so,
-                        log_event=log_event,
-                        refresh_on_failure=False,
-                    )
-            raise
+        sentinel_hints = self._sentinel_client_hints(session)
+        artifacts = prepare_sentinel_artifacts(
+            session,
+            device_id,
+            flow,
+            include_so=include_so,
+            observer_wait_ms=observer_wait_ms,
+            user_agent=sentinel_hints["user_agent"],
+            sec_ch_ua=sentinel_hints["sec_ch_ua"],
+            sec_ch_ua_full_version_list=sentinel_hints["sec_ch_ua_full_version_list"],
+            strict_turnstile=strict_turnstile,
+            strict_so=strict_so,
+            proxy=self.proxy,
+            check_control=self._check_task_control,
+        )
         logger.info(
             {
                 "event": log_event,
@@ -1390,12 +1250,14 @@ class PlatformRegistrar:
                 "so_required": getattr(artifacts, "so_required", False),
             }
         )
+        so_header = str(getattr(artifacts, "so_header", "") or "")
+        if include_so and strict_so and not so_header:
+            raise RuntimeError("sentinel_so_token_failed")
         headers = self._json_headers(referer, device_id)
         headers["openai-sentinel-token"] = str(getattr(artifacts, "sentinel_header", "") or "")
-        so_header = str(getattr(artifacts, "so_header", "") or "")
         if include_so and so_header:
             headers["openai-sentinel-so-token"] = so_header
-        return _headers_with_clearance(headers, target_url, self.proxy, self.clearance_user_agent), artifacts
+        return _build_request_headers(headers, target_url, self.proxy, user_agent_override=sentinel_hints["user_agent"]), artifacts
 
     def _platform_authorize(self, email: str, index: int) -> None:
         self._check_task_control()
@@ -1426,16 +1288,15 @@ class PlatformRegistrar:
             "auth0Client": platform_auth0_client,
         }
         target_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
-        headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
+        headers = _build_request_headers(
+            self._navigate_headers(f"{platform_base}/"),
+            target_url,
+            self.proxy,
+            user_agent_override=self._sentinel_user_agent(self.session),
+        )
         resp, error = self._request(self.session, "get", target_url, headers=headers, allow_redirects=True, stop_event=self.stop_event, deadline=self.deadline)
         if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
-            resp, error = self._request(self.session, "get", target_url, headers=headers, allow_redirects=True, stop_event=self.stop_event, deadline=self.deadline)
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 仍未通过"))
+            raise RuntimeError(_cloudflare_block_message(resp))
         if resp is None or resp.status_code != 200:
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
@@ -1472,28 +1333,7 @@ class PlatformRegistrar:
                 deadline=self.deadline,
             )
             if _is_cloudflare_challenge(response):
-                bundle = self._refresh_cloudflare_clearance(auth_base, index)
-                if bundle is None:
-                    raise RuntimeError(_cloudflare_block_message(response, reason=self.clearance_failure_reason))
-                headers, _artifacts = self._prepare_sentinel_headers(
-                    self.session,
-                    self.device_id,
-                    "authorize_continue",
-                    index,
-                    referer=f"{auth_base}/create-account?usernameKind=email",
-                    target_url=url,
-                    log_event="register_authorize_continue_sentinel",
-                )
-                response, error = self._request(
-                    self.session,
-                    "post",
-                    url,
-                    json={"username": {"kind": "email", "value": email}},
-                    headers=headers,
-                    allow_redirects=False,
-                    stop_event=self.stop_event,
-                    deadline=self.deadline,
-                )
+                raise RuntimeError(_cloudflare_block_message(response))
             if response is not None and getattr(response, "status_code", 0) == 409 and attempt < 2:
                 step(index, f"注册邮箱 409/会话失效，重新 authorize 后重试 ({attempt + 2}/3)", "yellow")
                 self._platform_authorize(email, index)
@@ -1520,21 +1360,7 @@ class PlatformRegistrar:
         )
         resp, error = self._request(self.session, "post", url, json={"username": email, "password": password}, headers=headers, stop_event=self.stop_event, deadline=self.deadline)
         if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers, _artifacts = self._prepare_sentinel_headers(
-                self.session,
-                self.device_id,
-                "username_password_create",
-                index,
-                referer=f"{auth_base}/create-account/password",
-                target_url=url,
-                log_event="register_username_password_create_sentinel",
-            )
-            resp, error = self._request(self.session, "post", url, json={"username": email, "password": password}, headers=headers, stop_event=self.stop_event, deadline=self.deadline)
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 仍未通过"))
+            raise RuntimeError(_cloudflare_block_message(resp))
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
             if data.get("message") == "Failed to create account. Please try again.":
@@ -1547,16 +1373,15 @@ class PlatformRegistrar:
         self._check_task_control()
         step(index, "发送邮箱验证码")
         url = f"{auth_base}/api/accounts/email-otp/send"
-        headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
+        headers = _build_request_headers(
+            self._navigate_headers(f"{auth_base}/create-account/password"),
+            url,
+            self.proxy,
+            user_agent_override=self._sentinel_user_agent(self.session),
+        )
         resp, error = self._request(self.session, "get", url, headers=headers, allow_redirects=True, stop_event=self.stop_event, deadline=self.deadline)
         if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
-            resp, error = self._request(self.session, "get", url, headers=headers, allow_redirects=True, stop_event=self.stop_event, deadline=self.deadline)
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 仍未通过"))
+            raise RuntimeError(_cloudflare_block_message(resp))
         if resp is None or resp.status_code not in (200, 302):
             raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         step(index, "邮箱验证码已发送")
@@ -1571,21 +1396,6 @@ class PlatformRegistrar:
         log_event: str,
     ) -> tuple[object | None, str]:
         url = f"{auth_base}/api/accounts/email-otp/validate"
-        headers = dict(common_headers)
-        headers["referer"] = f"{auth_base}/email-verification"
-        headers["oai-device-id"] = device_id
-        headers.update(_make_trace_headers())
-        resp, error = self._request(
-            session,
-            "post",
-            url,
-            json={"code": code},
-            headers=headers,
-            stop_event=self.stop_event,
-            deadline=self.deadline,
-        )
-        if resp is not None and resp.status_code == 200:
-            return resp, ""
         headers, _artifacts = self._prepare_sentinel_headers(
             session,
             device_id,
@@ -1605,27 +1415,7 @@ class PlatformRegistrar:
             deadline=self.deadline,
         )
         if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index, session=session)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers, _artifacts = self._prepare_sentinel_headers(
-                session,
-                device_id,
-                "authorize_continue",
-                index,
-                referer=f"{auth_base}/email-verification",
-                target_url=url,
-                log_event=log_event,
-            )
-            resp, error = self._request(
-                session,
-                "post",
-                url,
-                json={"code": code},
-                headers=headers,
-                stop_event=self.stop_event,
-                deadline=self.deadline,
-            )
+            raise RuntimeError(_cloudflare_block_message(resp))
         return resp, error
 
     def _validate_otp(self, code: str, index: int) -> None:
@@ -1672,13 +1462,7 @@ class PlatformRegistrar:
         headers = _create_headers()
         resp, error = self._request(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, stop_event=self.stop_event, deadline=self.deadline)
         if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers = _create_headers()
-            resp, error = self._request(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, stop_event=self.stop_event, deadline=self.deadline)
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 仍未通过"))
+            raise RuntimeError(_cloudflare_block_message(resp))
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
             if data.get("message") == "Failed to create account. Please try again.":
@@ -1716,7 +1500,7 @@ class PlatformRegistrar:
     def _exchange_registered_tokens(self, index: int) -> dict:
         self._check_task_control()
         step(index, "交换 token")
-        refresh_clearance = lambda target_url: self._refresh_cloudflare_clearance(target_url, index, session=self.session) is not None
+        user_agent_override = self._sentinel_user_agent(self.session)
         if self.platform_auth_code:
             tokens = request_platform_oauth_token(
                 self.session,
@@ -1725,8 +1509,7 @@ class PlatformRegistrar:
                 self.stop_event,
                 self.deadline,
                 proxy=self.proxy,
-                user_agent_override=lambda: self.clearance_user_agent,
-                refresh_clearance=refresh_clearance,
+                user_agent_override=user_agent_override,
             )
         elif self.platform_continue_url:
             tokens = exchange_platform_tokens(
@@ -1737,8 +1520,7 @@ class PlatformRegistrar:
                 self.stop_event,
                 self.deadline,
                 proxy=self.proxy,
-                user_agent_override=lambda: self.clearance_user_agent,
-                refresh_clearance=refresh_clearance,
+                user_agent_override=user_agent_override,
                 expected_state=self.platform_auth_state,
             )
         else:
@@ -1796,16 +1578,17 @@ class PlatformRegistrar:
 
         def _do_login_authorize(label: str) -> tuple[object | None, str]:
             target_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
-            headers = _headers_with_clearance(_login_nav_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
+            headers = _build_request_headers(
+                _login_nav_headers(f"{platform_base}/"),
+                target_url,
+                self.proxy,
+                user_agent_override=self._sentinel_user_agent(login_session),
+            )
             resp, error = self._request(login_session, "get", target_url, headers=headers, allow_redirects=True, stop_event=self.stop_event, deadline=self.deadline)
             if resp is None:
                 raise RuntimeError(error or f"platform_login_authorize_{label}_failed")
             if _is_cloudflare_challenge(resp):
-                bundle = self._refresh_cloudflare_clearance(auth_base, index, session=login_session)
-                if bundle is None:
-                    raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-                headers = _headers_with_clearance(_login_nav_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
-                resp, error = self._request(login_session, "get", target_url, headers=headers, allow_redirects=True, stop_event=self.stop_event, deadline=self.deadline)
+                raise RuntimeError(_cloudflare_block_message(resp))
             if resp is None or getattr(resp, "status_code", 0) not in (200, 302):
                 raise RuntimeError(error or f"platform_login_authorize_{label}_http_{getattr(resp, 'status_code', 'unknown')}")
             step(index, "登录 authorize 完成" if label == "initial" else f"登录 authorize 完成[{label}]")
@@ -1824,19 +1607,7 @@ class PlatformRegistrar:
             )
             resp, error = self._request(login_session, "post", url, json={"username": {"kind": "email", "value": email}}, headers=headers, allow_redirects=False, stop_event=self.stop_event, deadline=self.deadline)
             if _is_cloudflare_challenge(resp):
-                bundle = self._refresh_cloudflare_clearance(auth_base, index, session=login_session)
-                if bundle is None:
-                    raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-                headers, _artifacts = self._prepare_sentinel_headers(
-                    login_session,
-                    login_device_id,
-                    "authorize_continue",
-                    index,
-                    referer=f"{auth_base}/log-in?usernameKind=email",
-                    target_url=url,
-                    log_event="login_authorize_continue_sentinel",
-                )
-                resp, error = self._request(login_session, "post", url, json={"username": {"kind": "email", "value": email}}, headers=headers, allow_redirects=False, stop_event=self.stop_event, deadline=self.deadline)
+                raise RuntimeError(_cloudflare_block_message(resp))
             return resp, error
 
         def _submit_email_with_reauth() -> None:
@@ -1870,19 +1641,7 @@ class PlatformRegistrar:
             )
             resp, error = self._request(login_session, "post", url, json={"password": password}, headers=headers, allow_redirects=False, stop_event=self.stop_event, deadline=self.deadline)
             if _is_cloudflare_challenge(resp):
-                bundle = self._refresh_cloudflare_clearance(auth_base, index, session=login_session)
-                if bundle is None:
-                    raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-                headers, _artifacts = self._prepare_sentinel_headers(
-                    login_session,
-                    login_device_id,
-                    "password_verify",
-                    index,
-                    referer=f"{auth_base}/log-in/password",
-                    target_url=url,
-                    log_event="login_password_verify_sentinel",
-                )
-                resp, error = self._request(login_session, "post", url, json={"password": password}, headers=headers, allow_redirects=False, stop_event=self.stop_event, deadline=self.deadline)
+                raise RuntimeError(_cloudflare_block_message(resp))
             return resp, error
 
         def _verify_password_with_reauth() -> None:
@@ -1948,7 +1707,7 @@ class PlatformRegistrar:
                 error_prefix="login_callback",
             )
             code = str((callback_params or {}).get("code") or "").strip()
-            refresh_clearance = lambda target_url: self._refresh_cloudflare_clearance(target_url, index, session=login_session) is not None
+            login_user_agent_override = self._sentinel_user_agent(login_session)
             if code:
                 tokens = request_platform_oauth_token(
                     login_session,
@@ -1957,8 +1716,7 @@ class PlatformRegistrar:
                     self.stop_event,
                     self.deadline,
                     proxy=self.proxy,
-                    user_agent_override=lambda: self.clearance_user_agent,
-                    refresh_clearance=refresh_clearance,
+                    user_agent_override=login_user_agent_override,
                 )
             else:
                 tokens = exchange_platform_tokens(
@@ -1969,8 +1727,7 @@ class PlatformRegistrar:
                     self.stop_event,
                     self.deadline,
                     proxy=self.proxy,
-                    user_agent_override=lambda: self.clearance_user_agent,
-                    refresh_clearance=refresh_clearance,
+                    user_agent_override=login_user_agent_override,
                     expected_state=login_auth_state,
                 )
             if not tokens:

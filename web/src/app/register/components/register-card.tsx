@@ -25,7 +25,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { fetchYYDSDomainBlacklist, replaceYYDSDomainBlacklist, resetYYDSDomainBlacklist } from "@/lib/api";
+import { fetchYYDSDomainBlacklist, replaceYYDSDomainBlacklist, resetYYDSDomainBlacklist, type YYDSDomainBlacklistEntry } from "@/lib/api";
 import { getRegisterRuntimeState } from "@/lib/register-runtime";
 import { cn } from "@/lib/utils";
 
@@ -84,15 +84,21 @@ export function RegisterCard() {
   }, [logs.length]);
 
   useEffect(() => {
-    if (!hasYYDSProvider) return;
+    if (!hasYYDSProvider) {
+      setYydsDomainBlacklistText("");
+      setIsYydsDomainBlacklistLoading(false);
+      return;
+    }
     let cancelled = false;
     setIsYydsDomainBlacklistLoading(true);
     fetchYYDSDomainBlacklist()
       .then((data) => {
-        if (!cancelled) setYydsDomainBlacklistText((data.items || []).join("\n"));
+        if (cancelled) return;
+        setYydsDomainBlacklistText((data.manual_items || data.items || []).join("\n"));
       })
       .catch(() => {
-        if (!cancelled) setYydsDomainBlacklistText("");
+        if (cancelled) return;
+        setYydsDomainBlacklistText("");
       })
       .finally(() => {
         if (!cancelled) setIsYydsDomainBlacklistLoading(false);
@@ -119,11 +125,41 @@ export function RegisterCard() {
   const isTaskActive = runtime.isActive;
   const statusLabel = isDraining ? "停止中" : runtime.isRepairing ? "修复中" : runtime.isRunning ? "运行中" : "空闲";
   const providers = config.mail.providers || [];
+  const firstYYDSProviderIndex = providers.findIndex(
+    (provider) => String((provider as Record<string, unknown>).type || "") === "yyds_mail",
+  );
+  const yydsAutoEntryMap = new Map<string, YYDSDomainBlacklistEntry>();
+  providers.forEach((provider) => {
+    if (String((provider as Record<string, unknown>).type || "") !== "yyds_mail") return;
+    const rawEntries = (provider as Record<string, unknown>).auto_domain_blacklist_entries;
+    if (!Array.isArray(rawEntries)) return;
+    rawEntries.forEach((entry) => {
+      if (!entry || typeof entry !== "object") return;
+      const normalized = entry as YYDSDomainBlacklistEntry;
+      const key = `${String(normalized.domain || "")}::${String(normalized.source || "")}`;
+      if (!key.trim() || yydsAutoEntryMap.has(key)) return;
+      yydsAutoEntryMap.set(key, normalized);
+    });
+  });
+  const yydsAutoDomainEntries = Array.from(yydsAutoEntryMap.values()).filter(
+    (entry) => {
+      const source = String(entry.source || "").trim();
+      return source === "openai_hard_reject" || source === "manual+openai_hard_reject";
+    },
+  );
   const isRepairingAbnormal = runtime.isRepairing;
   const failureReasons = Object.entries(stats.failure_reasons || {})
     .filter(([, count]) => Number(count) > 0)
     .sort((a, b) => Number(b[1]) - Number(a[1]))
     .slice(0, 4);
+  const yydsDomainStats = Object.entries(stats.provider_domain_stats || {})
+    .filter(([, item]) => {
+      const provider = String(item?.provider || "").trim().toLowerCase();
+      const providerRef = String(item?.provider_ref || "").trim().toLowerCase();
+      return provider === "yyds_mail" || providerRef.startsWith("yyds_mail:");
+    })
+    .sort((a, b) => Number(b[1]?.attempts || 0) - Number(a[1]?.attempts || 0))
+    .slice(0, 10);
 
   const targetTotal =
     config.mode === "quota"
@@ -178,7 +214,7 @@ export function RegisterCard() {
     setIsYydsDomainBlacklistLoading(true);
     try {
       const data = await replaceYYDSDomainBlacklist(domains);
-      setYydsDomainBlacklistText((data.items || []).join("\n"));
+      setYydsDomainBlacklistText((data.manual_items || data.items || []).join("\n"));
       toast.success("yyds 禁用域名已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存 yyds 禁用域名失败");
@@ -191,7 +227,7 @@ export function RegisterCard() {
     setIsYydsDomainBlacklistLoading(true);
     try {
       const data = await resetYYDSDomainBlacklist();
-      setYydsDomainBlacklistText((data.items || []).join("\n"));
+      setYydsDomainBlacklistText((data.manual_items || data.items || []).join("\n"));
       toast.success("yyds 禁用域名已清空");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "清空 yyds 禁用域名失败");
@@ -582,7 +618,6 @@ export function RegisterCard() {
               {providers.map((provider, index) => {
                 const type = String(provider.type || "tempmail_lol");
                 const domains = Array.isArray(provider.domain) ? provider.domain.map(String).join("\n") : "";
-                const yydsManualDomainBlacklist = Array.isArray(provider.domain_blacklist) ? provider.domain_blacklist.map(String).join("\n") : "";
                 const outlookMailboxes = Array.isArray(provider.mailboxes) ? provider.mailboxes.map(String).join("\n") : String(provider.mailboxes || "");
                 return (
                   <div key={index} className="space-y-3 rounded-lg border border-border bg-secondary/30 p-3">
@@ -701,23 +736,13 @@ export function RegisterCard() {
                         <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) })} placeholder={type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : type === "cloudmail" ? "每行一个域名，支持多域名轮询，可加 @ 前缀" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-lg border-border bg-background font-data text-[12px]" disabled={isTaskActive} />
                       </div>
                     ) : null}
-                    {type === "yyds_mail" ? (
+                    {type === "yyds_mail" && index === firstYYDSProviderIndex ? (
                       <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50/60 p-3">
-                        <div className="space-y-1.5">
-                          <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-amber-700 uppercase">手动禁用域名后缀</label>
-                          <Textarea
-                            value={yydsManualDomainBlacklist}
-                            onChange={(event) => updateProvider(index, { domain_blacklist: event.target.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean) })}
-                            placeholder="每行一个域名后缀，会和自动黑名单一起跳过"
-                            className="min-h-16 rounded-lg border-amber-200 bg-white font-data text-[12px]"
-                            disabled={isTaskActive}
-                          />
-                        </div>
                         <div className="flex items-center justify-between gap-3">
                           <div>
-                            <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-amber-700 uppercase">YYDS 禁用域名后缀</label>
+                            <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-amber-700 uppercase">YYDS 手工禁用域名</label>
                             <div className="mt-1 text-xs leading-5 text-amber-700/80">
-                              注册阶段返回 user_register_http_400 后会自动加入这里，后续生成邮箱会跳过这些域名。
+                              这里是统一的 YYDS 手工禁用列表。旧版 provider 内的 `domain_blacklist` 会自动迁移到这里。
                             </div>
                           </div>
                           {isYydsDomainBlacklistLoading ? <LoaderCircle className="size-4 animate-spin text-amber-700" /> : null}
@@ -736,6 +761,48 @@ export function RegisterCard() {
                           <Button type="button" variant="outline" className="h-8 cursor-pointer rounded-lg border-border bg-white px-3 text-xs text-muted-foreground" onClick={() => void clearYYDSDomainBlacklist()} disabled={isTaskActive || isYydsDomainBlacklistLoading || !yydsDomainBlacklistText.trim()}>
                             清空
                           </Button>
+                        </div>
+                        <div className="space-y-1.5 rounded-lg border border-amber-200/70 bg-white/80 p-3">
+                          <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-amber-700 uppercase">OpenAI 明确拒绝域名</label>
+                          {yydsAutoDomainEntries.length > 0 ? (
+                            <div className="space-y-2">
+                              {yydsAutoDomainEntries.slice(0, 8).map((entry) => (
+                                <div key={`${entry.domain}-${entry.source}`} className="rounded-lg border border-amber-100 bg-amber-50/70 px-3 py-2 text-xs text-amber-900">
+                                  <div className="font-data font-semibold">{entry.domain}</div>
+                                  <div className="mt-1 text-[11px] text-amber-800/80">
+                                    {entry.source || "auto"} / {entry.reason || "unknown"} / 命中 {Number(entry.hit_count || 0)}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="text-xs text-amber-800/70">当前还没有命中 OpenAI 明确拒绝的域名。</div>
+                          )}
+                        </div>
+                        <div className="space-y-1.5 rounded-lg border border-amber-200/70 bg-white/80 p-3">
+                          <label className="font-data text-[10px] font-semibold tracking-[0.16em] text-amber-700 uppercase">域名统计</label>
+                          {yydsDomainStats.length > 0 ? (
+                            <div className="space-y-2">
+                              {yydsDomainStats.map(([key, item]) => {
+                                const displayDomain = String(item?.domain || "").trim() || key.split("::").slice(1).join("::") || key;
+                                const providerRef = String(item?.provider_ref || "").trim();
+                                return (
+                                  <div key={key} className="rounded-lg border border-border/70 bg-white px-3 py-2 text-xs text-foreground">
+                                  <div className="flex items-center justify-between gap-3">
+                                    <span className="font-data font-semibold">{displayDomain}</span>
+                                    <span className="text-muted-foreground">成功率 {Number(item?.success_rate || 0)}%</span>
+                                  </div>
+                                  <div className="mt-1 text-[11px] text-muted-foreground">
+                                    尝试 {Number(item?.attempts || 0)} / 可用成功 {Number(item?.usable_success || 0)} / unsupported_email {Number(item?.unsupported_email || 0)} / registration_disallowed {Number(item?.registration_disallowed || 0)}
+                                  </div>
+                                  {providerRef ? <div className="mt-1 text-[11px] text-muted-foreground/80">{providerRef}</div> : null}
+                                </div>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <div className="text-xs text-amber-800/70">当前还没有域名统计数据。</div>
+                          )}
                         </div>
                       </div>
                     ) : null}

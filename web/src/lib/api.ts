@@ -264,6 +264,56 @@ export type AuthIdentity = {
   chat_total_remaining: number | null;
 };
 
+export type RegisterSourceStats = {
+  attempts: number;
+  success: number;
+  usable_success: number;
+  fail: number;
+  saved?: number;
+  otp_verified?: number;
+  post_otp_fail?: number;
+  unsupported_email?: number;
+  registration_disallowed?: number;
+  success_rate?: number;
+  failure_reasons?: Record<string, number>;
+  updated_at?: string;
+  provider?: string;
+  provider_ref?: string;
+  domain?: string;
+};
+
+export type RegisterStats = {
+  job_id?: string;
+  job_kind?: string;
+  success: number;
+  usable_success?: number;
+  fail: number;
+  done: number;
+  saved?: number;
+  refresh_failed?: number;
+  token_acquired_refresh_failed?: number;
+  running: number;
+  threads: number;
+  elapsed_seconds?: number;
+  avg_seconds?: number;
+  success_rate?: number;
+  current_quota?: number;
+  current_available?: number;
+  started_at?: string;
+  updated_at?: string;
+  finished_at?: string;
+  trigger?: string;
+  workers?: Array<Record<string, unknown>>;
+  failure_reasons?: Record<string, number>;
+  provider_stats?: Record<string, RegisterSourceStats>;
+  domain_stats?: Record<string, RegisterSourceStats>;
+  provider_domain_stats?: Record<string, RegisterSourceStats>;
+  proxy_pool?: Record<string, unknown>;
+  lifecycle?: string;
+  is_running?: boolean;
+  is_stopping?: boolean;
+};
+
 export type RegisterConfig = {
   enabled: boolean;
   lifecycle?: string;
@@ -292,34 +342,7 @@ export type RegisterConfig = {
     batch_total: number;
     check_interval: number;
   };
-  stats: {
-    job_id?: string;
-    job_kind?: string;
-    success: number;
-    usable_success?: number;
-    fail: number;
-    done: number;
-    saved?: number;
-    refresh_failed?: number;
-    token_acquired_refresh_failed?: number;
-    running: number;
-    threads: number;
-    elapsed_seconds?: number;
-    avg_seconds?: number;
-    success_rate?: number;
-    current_quota?: number;
-    current_available?: number;
-    started_at?: string;
-    updated_at?: string;
-    finished_at?: string;
-    trigger?: string;
-    workers?: Array<Record<string, unknown>>;
-    failure_reasons?: Record<string, number>;
-    proxy_pool?: Record<string, unknown>;
-    lifecycle?: string;
-    is_running?: boolean;
-    is_stopping?: boolean;
-  };
+  stats: RegisterStats;
   logs?: Array<{
     time: string;
     text: string;
@@ -711,10 +734,26 @@ export async function testRegisterOutlookPool(limit = 5) {
   });
 }
 
+export type YYDSDomainBlacklistEntry = {
+  domain: string;
+  source: string;
+  reason: string;
+  provider_ref?: string;
+  hit_count?: number;
+  manual?: boolean;
+  auto?: boolean;
+  first_seen_at?: string;
+  last_seen_at?: string;
+};
+
 export type YYDSDomainBlacklistResponse = {
   items: string[];
+  manual_items?: string[];
+  auto_items?: string[];
+  entries?: YYDSDomainBlacklistEntry[];
   added?: number;
   removed?: number;
+  replaced?: number;
   cleared?: number;
   executor?: string;
 };

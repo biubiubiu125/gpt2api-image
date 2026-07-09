@@ -25,7 +25,11 @@ type curlImpersonateClient struct {
 }
 
 func newCurlImpersonateClient(proxyURL string, binGetter func() (string, error)) (*curlImpersonateClient, error) {
-	return &curlImpersonateClient{binGetter: binGetter, proxyURL: strings.TrimSpace(proxyURL)}, nil
+	proxy, err := normalizeProxyURL(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	return &curlImpersonateClient{binGetter: binGetter, proxyURL: proxy}, nil
 }
 
 func (c *curlImpersonateClient) Do(req *http.Request) (*http.Response, error) {

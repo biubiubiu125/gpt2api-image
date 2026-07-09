@@ -11,6 +11,7 @@ from pathlib import Path
 from services.account_service import account_service
 from services.config import DATA_DIR
 from services.log_service import LOG_TYPE_ACCOUNT, log_service
+from services.proxy_service import validate_proxy_url
 from services.register import mail_provider, openai_register
 from services.register.proxy_pool import register_proxy_pool
 
@@ -19,6 +20,14 @@ REGISTER_FILE = DATA_DIR / "register.json"
 REGISTER_STALL_FAILURE_REASON = "register_task_stalled"
 SECRET_PLACEHOLDER = "********"
 REGISTER_RUNTIME_FIELDS = {"enabled", "stats", "logs", "executor", "lifecycle", "is_running", "is_stopping"}
+REGISTER_PROVIDER_RUNTIME_FIELDS = {
+    "auto_domain_blacklist",
+    "auto_domain_blacklist_entries",
+    "mailboxes_count",
+    "mailboxes_preview",
+    "mailboxes_stats",
+}
+SOURCE_AUTO_BLACKLIST_REASONS = {"unsupported_email"}
 
 
 class RegisterTaskActiveError(RuntimeError):
@@ -83,6 +92,8 @@ def _normalize_mail_providers(cfg: dict) -> None:
     for provider in providers:
         if isinstance(provider, dict):
             provider["provider_id"] = _provider_id(provider.get("provider_id") or provider.get("id"))
+            for runtime_key in REGISTER_PROVIDER_RUNTIME_FIELDS:
+                provider.pop(runtime_key, None)
 
 
 def _enabled_provider(provider: dict) -> bool:
@@ -94,6 +105,18 @@ def _non_empty_list(value: object) -> list[str]:
         return [str(item).strip() for item in value if str(item).strip()]
     text = str(value or "").strip()
     return [text] if text else []
+
+
+def _split_domain_values(value: object) -> list[str]:
+    if isinstance(value, list):
+        values: list[str] = []
+        for item in value:
+            values.extend(_split_domain_values(item))
+        return values
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in text.replace(",", "\n").splitlines() if item.strip()]
 
 
 def _validate_mail_providers(cfg: dict) -> None:
@@ -108,6 +131,28 @@ def _validate_mail_providers(cfg: dict) -> None:
             continue
         if provider.get("type") == "cloudmail_gen" and not _non_empty_list(provider.get("domain")):
             raise ValueError("CloudMailGen 需要至少配置一个 domain")
+
+
+def _migrate_yyds_provider_domain_blacklist(cfg: dict) -> tuple[bool, int]:
+    mail = cfg.get("mail")
+    if not isinstance(mail, dict):
+        return False, 0
+    providers = mail.get("providers")
+    if not isinstance(providers, list):
+        return False, 0
+    changed = False
+    migrated = 0
+    for provider in providers:
+        if not isinstance(provider, dict) or provider.get("type") != "yyds_mail":
+            continue
+        if "domain_blacklist" not in provider:
+            continue
+        changed = True
+        for domain in _split_domain_values(provider.get("domain_blacklist")):
+            if mail_provider.add_yyds_domain_blacklist(domain):
+                migrated += 1
+        provider.pop("domain_blacklist", None)
+    return changed, migrated
 
 
 def _now() -> str:
@@ -140,6 +185,123 @@ def _bump_failure_reason(counts: dict[str, int], reason: object, amount: int = 1
     if amount <= 0:
         return
     counts[key] = counts.get(key, 0) + amount
+
+
+def _source_stats_key(value: object, default: str = "unknown") -> str:
+    key = str(value or "").strip().lower()
+    return key if key else default
+
+
+def _provider_domain_stats_key(provider_key: object, domain_key: object) -> str:
+    provider = str(provider_key or "").strip()
+    domain = _source_stats_key(domain_key, "")
+    if provider and domain:
+        return f"{provider}::{domain}"
+    return provider or domain
+
+
+def _normalize_source_stats(raw: object) -> dict[str, dict]:
+    data = raw if isinstance(raw, dict) else {}
+    normalized: dict[str, dict] = {}
+    for key, item in data.items():
+        if not isinstance(item, dict):
+            continue
+        failure_reasons = {}
+        raw_reasons = item.get("failure_reasons") if isinstance(item.get("failure_reasons"), dict) else {}
+        for reason, count in raw_reasons.items():
+            normalized_reason = _failure_reason_key(reason)
+            numeric_count = int(count or 0)
+            if normalized_reason and numeric_count > 0:
+                failure_reasons[normalized_reason] = numeric_count
+        source_key = _source_stats_key(key)
+        normalized_item = {
+            "attempts": max(0, _int_or_default(item.get("attempts"), 0)),
+            "success": max(0, _int_or_default(item.get("success"), 0)),
+            "usable_success": max(0, _int_or_default(item.get("usable_success"), 0)),
+            "fail": max(0, _int_or_default(item.get("fail"), 0)),
+            "saved": max(0, _int_or_default(item.get("saved"), 0)),
+            "otp_verified": max(0, _int_or_default(item.get("otp_verified"), 0)),
+            "post_otp_fail": max(0, _int_or_default(item.get("post_otp_fail"), 0)),
+            "unsupported_email": max(0, _int_or_default(item.get("unsupported_email"), 0)),
+            "registration_disallowed": max(0, _int_or_default(item.get("registration_disallowed"), 0)),
+            "success_rate": round(float(item.get("success_rate") or 0), 1),
+            "failure_reasons": failure_reasons,
+            "updated_at": str(item.get("updated_at") or ""),
+        }
+        provider = str(item.get("provider") or "").strip()
+        provider_ref = str(item.get("provider_ref") or "").strip()
+        domain = _source_stats_key(item.get("domain"), "")
+        if provider:
+            normalized_item["provider"] = provider
+        if provider_ref:
+            normalized_item["provider_ref"] = provider_ref
+        if domain:
+            normalized_item["domain"] = domain
+        normalized[source_key] = normalized_item
+    return normalized
+
+
+def _update_source_stats(
+    bucket: dict[str, dict],
+    key: object,
+    result: dict,
+    *,
+    updated_at: str,
+    provider: object = "",
+    provider_ref: object = "",
+    domain: object = "",
+) -> None:
+    source_key = _source_stats_key(key)
+    item = bucket.setdefault(
+        source_key,
+        {
+            "attempts": 0,
+            "success": 0,
+            "usable_success": 0,
+            "fail": 0,
+            "saved": 0,
+            "otp_verified": 0,
+            "post_otp_fail": 0,
+            "unsupported_email": 0,
+            "registration_disallowed": 0,
+            "success_rate": 0.0,
+            "failure_reasons": {},
+            "updated_at": "",
+            "provider": "",
+            "provider_ref": "",
+            "domain": "",
+        },
+    )
+    provider_value = str(provider or "").strip()
+    provider_ref_value = str(provider_ref or "").strip()
+    domain_value = _source_stats_key(domain, "")
+    if provider_value:
+        item["provider"] = provider_value
+    if provider_ref_value:
+        item["provider_ref"] = provider_ref_value
+    if domain_value:
+        item["domain"] = domain_value
+    item["attempts"] += 1
+    if result.get("otp_verified"):
+        item["otp_verified"] += 1
+    if result.get("ok"):
+        item["success"] += 1
+        if result.get("usable"):
+            item["usable_success"] += 1
+        if result.get("saved"):
+            item["saved"] += 1
+    else:
+        item["fail"] += 1
+        reason = _failure_reason_key(result.get("reason"))
+        _bump_failure_reason(item["failure_reasons"], reason)
+        if reason == "unsupported_email":
+            item["unsupported_email"] += 1
+        elif reason == "registration_disallowed":
+            item["registration_disallowed"] += 1
+        if result.get("otp_verified"):
+            item["post_otp_fail"] += 1
+    item["success_rate"] = round(item["usable_success"] * 100 / max(1, item["attempts"]), 1)
+    item["updated_at"] = updated_at
 
 
 def _image_account_usable(item: dict) -> bool:
@@ -186,6 +348,9 @@ def _default_config() -> dict:
             "current_quota": 0,
             "current_available": 0,
             "failure_reasons": {},
+            "provider_stats": {},
+            "domain_stats": {},
+            "provider_domain_stats": {},
         },
     }
 
@@ -226,6 +391,7 @@ def _normalize(raw: dict) -> dict:
     if isinstance(cfg.get("mail"), dict):
         cfg["mail"]["api_use_register_proxy"] = bool(cfg["mail"].get("api_use_register_proxy", True))
         cfg["mail"].pop("proxy", None)
+        cfg["mail"].pop("yyds_delete_after_success", None)
     _normalize_mail_providers(cfg)
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
@@ -234,6 +400,10 @@ def _normalize(raw: dict) -> dict:
         stats.pop(runtime_key, None)
     cfg["stats"] = stats
     return cfg
+
+
+def _validate_register_proxy(cfg: dict) -> None:
+    cfg["proxy"] = validate_proxy_url(str(cfg.get("proxy") or ""))
 
 
 class RegisterService:
@@ -247,9 +417,10 @@ class RegisterService:
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
+        self._sanitize_loaded_config()
         self._sync_proxy_pool_state_locked(force=True)
         if self._config["enabled"]:
-            self.start()
+            self._auto_start_loaded_config()
 
     def _load(self) -> dict:
         try:
@@ -260,6 +431,40 @@ class RegisterService:
     def _save(self) -> None:
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
         self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _save_loaded_config_migration(self) -> None:
+        try:
+            self._save()
+        except Exception as exc:
+            self._append_log(f"注册配置迁移保存失败：{exc}", "red")
+
+    def _sanitize_loaded_config(self) -> None:
+        changed = False
+        original_proxy = str(self._config.get("proxy") or "")
+        try:
+            _validate_register_proxy(self._config)
+        except ValueError as exc:
+            self._config["proxy"] = ""
+            self._config["enabled"] = False
+            changed = True
+            self._append_log(f"注册配置中的代理无效，已清空并停止自动启动：{exc}", "yellow")
+        else:
+            changed = self._config.get("proxy") != original_proxy
+        migrated_blacklist, migrated_count = _migrate_yyds_provider_domain_blacklist(self._config)
+        if migrated_blacklist:
+            changed = True
+            if migrated_count > 0:
+                self._append_log(f"已将 {migrated_count} 个旧版 YYDS provider 手工禁用域名迁移到统一黑名单", "yellow")
+        if changed:
+            self._save_loaded_config_migration()
+
+    def _auto_start_loaded_config(self) -> None:
+        try:
+            self.start()
+        except Exception as exc:
+            self._config["enabled"] = False
+            self._append_log(f"注册任务自动启动失败，已停止自动启动：{exc}", "red")
+            self._save_loaded_config_migration()
 
     def _runtime_state_locked(self) -> dict:
         running = bool(self._runner and self._runner.is_alive())
@@ -336,7 +541,12 @@ class RegisterService:
                 provider["mailboxes_preview"] = [self._mask_email(c["email"]) for c in credentials]
                 provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
             if provider.get("type") == "yyds_mail":
-                provider["auto_domain_blacklist"] = mail_provider.yyds_domain_blacklist_items()
+                provider["auto_domain_blacklist"] = mail_provider.yyds_domain_blacklist_items("auto")
+                provider["auto_domain_blacklist_entries"] = [
+                    entry
+                    for entry in mail_provider.yyds_domain_blacklist_entries()
+                    if bool(entry.get("auto")) and mail_provider.yyds_blacklist_matches_source(entry.get("source"), "openai_hard_reject")
+                ]
 
     def _drop_mail_proxy(self) -> None:
         if isinstance(self._config.get("mail"), dict):
@@ -429,12 +639,16 @@ class RegisterService:
             self._preserve_redacted_secrets(updates)
             self._merge_outlook_pools(updates)
             next_config = _normalize({**self._config, **updates})
+            _validate_register_proxy(next_config)
             _validate_mail_providers(next_config)
+            migrated_blacklist, migrated_count = _migrate_yyds_provider_domain_blacklist(next_config)
             self._config = next_config
             self._drop_mail_proxy()
             self._sync_openai_register_config(self._config)
             self._sync_proxy_pool_state_locked(force=True)
             self._save()
+            if migrated_blacklist and migrated_count > 0:
+                self._append_log(f"已将 {migrated_count} 个旧版 YYDS provider 手工禁用域名迁移到统一黑名单", "yellow")
             return self.get()
 
     def _sync_proxy_pool_state_locked(self, force: bool = False) -> None:
@@ -490,6 +704,9 @@ class RegisterService:
                 "running": 1,
                 "threads": 1,
                 "failure_reasons": {},
+                "provider_stats": {},
+                "domain_stats": {},
+                "provider_domain_stats": {},
                 **metrics,
                 "started_at": _now(),
                 "updated_at": _now(),
@@ -532,6 +749,7 @@ class RegisterService:
                 return self.get()
             run_config = _normalize({**self._config, **(run_overrides or {})})
         try:
+            _validate_register_proxy(run_config)
             _validate_mail_providers(run_config)
             metrics = self._pool_metrics()
         except Exception as exc:
@@ -576,6 +794,9 @@ class RegisterService:
                 "running": 0,
                 "threads": run_config["threads"],
                 "failure_reasons": {},
+                "provider_stats": {},
+                "domain_stats": {},
+                "provider_domain_stats": {},
                 **metrics,
                 "started_at": _now(),
                 "updated_at": _now(),
@@ -636,7 +857,7 @@ class RegisterService:
         with self._lock:
             self._require_idle_locked("resetting stats")
             self._logs = []
-            self._config["stats"] = {"success": 0, "usable_success": 0, "fail": 0, "done": 0, "saved": 0, "refresh_failed": 0, "token_acquired_refresh_failed": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "failure_reasons": {}, **self._pool_metrics(), "updated_at": _now()}
+            self._config["stats"] = {"success": 0, "usable_success": 0, "fail": 0, "done": 0, "saved": 0, "refresh_failed": 0, "token_acquired_refresh_failed": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "failure_reasons": {}, "provider_stats": {}, "domain_stats": {}, "provider_domain_stats": {}, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "usable_success": 0, "fail": 0, "saved": 0, "refresh_failed": 0, "token_acquired_refresh_failed": 0, "start_time": 0.0})
             self._save()
@@ -668,30 +889,96 @@ class RegisterService:
         with self._lock:
             self._require_idle_locked("changing YYDS domain blacklist")
             added = sum(1 for domain in domains if mail_provider.add_yyds_domain_blacklist(domain))
-            return {"items": mail_provider.yyds_domain_blacklist_items(), "added": added}
+            return {**mail_provider.yyds_domain_blacklist_state(), "added": added}
 
     def remove_yyds_domain_blacklist(self, domains: list[object]) -> dict:
         with self._lock:
             self._require_idle_locked("changing YYDS domain blacklist")
             removed = sum(1 for domain in domains if mail_provider.remove_yyds_domain_blacklist(domain))
-            return {"items": mail_provider.yyds_domain_blacklist_items(), "removed": removed}
+            return {**mail_provider.yyds_domain_blacklist_state(), "removed": removed}
 
     def replace_yyds_domain_blacklist(self, domains: list[object]) -> dict:
         with self._lock:
             self._require_idle_locked("changing YYDS domain blacklist")
             items = mail_provider.replace_yyds_domain_blacklist(domains)
-            return {"items": items, "replaced": len(items)}
+            return {**mail_provider.yyds_domain_blacklist_state(), "replaced": len(items)}
 
     def reset_yyds_domain_blacklist(self) -> dict:
         with self._lock:
             self._require_idle_locked("changing YYDS domain blacklist")
             cleared = mail_provider.reset_yyds_domain_blacklist()
-            return {"items": mail_provider.yyds_domain_blacklist_items(), "cleared": cleared}
+            return {**mail_provider.yyds_domain_blacklist_state(), "cleared": cleared}
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
+
+    def _record_source_stats(
+        self,
+        result: dict,
+        provider_stats: dict[str, dict],
+        domain_stats: dict[str, dict],
+        provider_domain_stats: dict[str, dict],
+    ) -> None:
+        if not isinstance(result, dict) or result.get("stopped"):
+            return
+        updated_at = _now()
+        provider_name = str(result.get("provider") or "").strip()
+        provider_key = result.get("provider_ref") or result.get("provider")
+        domain_key = result.get("email_domain") or result.get("source_domain")
+        if provider_key:
+            _update_source_stats(
+                provider_stats,
+                provider_key,
+                result,
+                updated_at=updated_at,
+                provider=provider_name,
+                provider_ref=provider_key,
+            )
+        if domain_key:
+            _update_source_stats(
+                domain_stats,
+                domain_key,
+                result,
+                updated_at=updated_at,
+                provider=provider_name,
+                provider_ref=provider_key,
+                domain=domain_key,
+            )
+            if provider_key:
+                _update_source_stats(
+                    provider_domain_stats,
+                    _provider_domain_stats_key(provider_key, domain_key),
+                    result,
+                    updated_at=updated_at,
+                    provider=provider_name,
+                    provider_ref=provider_key,
+                    domain=domain_key,
+                )
+            self._maybe_auto_blacklist_domain(result, domain_stats)
+
+    def _maybe_auto_blacklist_domain(self, result: dict, domain_stats: dict[str, dict]) -> None:
+        if not isinstance(result, dict) or result.get("ok") or result.get("stopped"):
+            return
+        if str(result.get("provider") or "") != "yyds_mail":
+            return
+        reason = _failure_reason_key(result.get("reason"))
+        if reason not in SOURCE_AUTO_BLACKLIST_REASONS:
+            return
+        domain = _source_stats_key(result.get("email_domain") or result.get("source_domain"), "")
+        if not domain:
+            return
+        if mail_provider.record_yyds_domain_blacklist(
+            domain,
+            source="openai_hard_reject",
+            reason=reason,
+            provider_ref=str(result.get("provider_ref") or ""),
+        ):
+            self._append_log(
+                f"YYDS 域名被 OpenAI 明确拒绝，已自动停用：{domain}（{reason}）",
+                "yellow",
+            )
 
     @staticmethod
     def _add_account_log(summary: str, detail: dict) -> None:
@@ -760,6 +1047,18 @@ class RegisterService:
                 current_reasons = self._config.get("stats", {}).get("failure_reasons")
                 if isinstance(current_reasons, dict):
                     updates["failure_reasons"] = dict(current_reasons)
+            if "provider_stats" in updates:
+                updates["provider_stats"] = _normalize_source_stats(updates.get("provider_stats"))
+            else:
+                updates["provider_stats"] = _normalize_source_stats(self._config.get("stats", {}).get("provider_stats"))
+            if "domain_stats" in updates:
+                updates["domain_stats"] = _normalize_source_stats(updates.get("domain_stats"))
+            else:
+                updates["domain_stats"] = _normalize_source_stats(self._config.get("stats", {}).get("domain_stats"))
+            if "provider_domain_stats" in updates:
+                updates["provider_domain_stats"] = _normalize_source_stats(updates.get("provider_domain_stats"))
+            else:
+                updates["provider_domain_stats"] = _normalize_source_stats(self._config.get("stats", {}).get("provider_domain_stats"))
             self._config["stats"].update(updates)
             stats = self._config["stats"]
             started_at = str(stats.get("started_at") or "")
@@ -867,6 +1166,9 @@ class RegisterService:
         submitted, done, success, usable_success, fail = 0, 0, 0, 0, 0
         saved, refresh_failed, token_acquired_refresh_failed = 0, 0, 0
         failure_reasons: dict[str, int] = {}
+        provider_stats: dict[str, dict] = {}
+        domain_stats: dict[str, dict] = {}
+        provider_domain_stats: dict[str, dict] = {}
         stall_logged = False
         shutdown_requested = False
         stopped_failure_reason = ""
@@ -893,6 +1195,7 @@ class RegisterService:
             else:
                 fail += 1
                 _bump_failure_reason(failure_reasons, result.get("reason"))
+            self._record_source_stats(result, provider_stats, domain_stats, provider_domain_stats)
 
         try:
             futures = set()
@@ -916,7 +1219,7 @@ class RegisterService:
                             f"注册任务已停止，已取消未开始任务 {cancelled_count} 个，等待运行中任务完成清理",
                             "yellow",
                         )
-                        self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons))
+                        self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons), provider_stats=dict(provider_stats), domain_stats=dict(domain_stats), provider_domain_stats=dict(provider_domain_stats))
                     if not futures:
                         break
                 stalled_workers = [] if shutdown_requested else self._stalling_worker_states(int(cfg.get("task_stall_timeout_seconds") or 0))
@@ -944,7 +1247,7 @@ class RegisterService:
                             "red",
                         )
                         stall_logged = True
-                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons))
+                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons), provider_stats=dict(provider_stats), domain_stats=dict(domain_stats), provider_domain_stats=dict(provider_domain_stats))
                     if not futures:
                         break
                 while (
@@ -956,7 +1259,7 @@ class RegisterService:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted, stop_event, None, cfg.get("task_timeout_seconds"), run_id))
                     self._set_active_futures(futures)
-                self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons))
+                self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons), provider_stats=dict(provider_stats), domain_stats=dict(domain_stats), provider_domain_stats=dict(provider_domain_stats))
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break
                 if not futures:
@@ -967,7 +1270,7 @@ class RegisterService:
                     continue
                 finished, futures = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
                 if not finished:
-                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons))
+                    self._bump(running=len(futures), done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons), provider_stats=dict(provider_stats), domain_stats=dict(domain_stats), provider_domain_stats=dict(provider_domain_stats))
                     continue
                 for future in finished:
                     done += 1
@@ -981,7 +1284,7 @@ class RegisterService:
             self._set_active_futures(set())
             executor.shutdown(wait=shutdown_wait, cancel_futures=True)
             openai_register.clear_active_run_id(run_id)
-        self._bump(running=0, done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons), finished_at=_now())
+        self._bump(running=0, done=done, success=success, usable_success=usable_success, fail=fail, saved=saved, refresh_failed=refresh_failed, token_acquired_refresh_failed=token_acquired_refresh_failed, failure_reasons=dict(failure_reasons), provider_stats=dict(provider_stats), domain_stats=dict(domain_stats), provider_domain_stats=dict(provider_domain_stats), finished_at=_now())
         with self._lock:
             self._config["enabled"] = False
             if self._stop_event is stop_event:

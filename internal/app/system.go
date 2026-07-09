@@ -31,7 +31,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		delete(next.Extra, "backup_state")
 		delete(next.Extra, "cleanup_protect_gallery")
 		if v, ok := body["proxy"]; ok {
-			next.Proxy = strAny(v, "")
+			proxy, err := normalizeProxyURL(strAny(v, ""))
+			if err != nil {
+				writeErr(w, 400, "invalid proxy: "+err.Error())
+				return
+			}
+			next.Proxy = proxy
 		}
 		if v, ok := body["base_url"]; ok {
 			next.BaseURL = strings.TrimRight(strAny(v, ""), "/")
@@ -185,7 +190,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		next := cloneConfig(s.cfg)
-		next.Proxy = strAny(b["url"], strAny(b["proxy"], next.Proxy))
+		proxy, err := normalizeProxyURL(strAny(b["url"], strAny(b["proxy"], next.Proxy)))
+		if err != nil {
+			writeErr(w, 400, "invalid proxy: "+err.Error())
+			return
+		}
+		next.Proxy = proxy
 		next.Extra["proxy"] = next.Proxy
 		if err := s.saveConfigValue(next); err != nil {
 			writeErr(w, 500, "failed to save config: "+err.Error())
@@ -204,11 +214,12 @@ func (s *Server) handleProxyTest(w http.ResponseWriter, r *http.Request) {
 	target := "https://chatgpt.com/backend-api/me"
 	client := &http.Client{Timeout: 15 * time.Second}
 	if strings.TrimSpace(s.cfg.Proxy) != "" {
-		proxyURL, err := url.Parse(s.cfg.Proxy)
+		proxy, err := normalizeProxyURL(s.cfg.Proxy)
 		if err != nil {
 			writeJSON(w, 200, map[string]any{"result": map[string]any{"ok": false, "message": err.Error()}})
 			return
 		}
+		proxyURL, _ := url.Parse(proxy)
 		client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
 	}
 	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)

@@ -55,7 +55,7 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := s.checkImageAccess(id, model, resolution); err != nil {
+	if err := s.checkImageAccess(id, model, size, resolution); err != nil {
 		s.logCallFailure(callID, endpoint, model, action, err, nil)
 		writeErr(w, 403, err.Error())
 		return
@@ -72,7 +72,7 @@ func (s *Server) imageResult(w http.ResponseWriter, r *http.Request, id *Identit
 	data := []map[string]any{}
 	savedRels := []string{}
 	urls := []string{}
-	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
+	items, err := s.generateImagesWithPoolForIdentity(ctx, id, prompt, model, size, resolution, refs, n)
 	if err != nil {
 		s.refundImage(id, n)
 		s.logCallFailure(callID, endpoint, model, action, err, map[string]any{"n": n})
@@ -410,7 +410,9 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 	if n > 4 {
 		n = 4
 	}
-	if err := s.checkImageAccess(id, model, strAny(b["resolution"], "")); err != nil {
+	size := strAny(b["size"], "")
+	resolution := strAny(b["resolution"], "")
+	if err := s.checkImageAccess(id, model, size, resolution); err != nil {
 		s.logCallFailure(callID, "/v1/chat/completions", model, "聊天生图", err, nil)
 		writeErr(w, 403, err.Error())
 		return
@@ -448,14 +450,12 @@ func (s *Server) handleV1ChatImageCompletion(w http.ResponseWriter, r *http.Requ
 		writeErr(w, 402, "画图额度不足")
 		return
 	}
-	size := strAny(b["size"], "")
-	resolution := strAny(b["resolution"], "")
 	ctx, cancel := context.WithTimeout(r.Context(), s.imageRequestTimeout())
 	defer cancel()
 	refs := extractChatImages(b)
 	data := []map[string]any{}
 	savedRels := []string{}
-	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
+	items, err := s.generateImagesWithPoolForIdentity(ctx, id, prompt, model, size, resolution, refs, n)
 	if err != nil {
 		s.refundImage(id, n)
 		s.logCallFailure(callID, "/v1/chat/completions", model, "聊天生图", err, nil)
@@ -652,7 +652,7 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 	}
 	refs := extractResponseImages(b["input"])
 	size, resolution := responseImageOptions(b, len(refs) > 0)
-	if err := s.checkImageAccess(id, model, resolution); err != nil {
+	if err := s.checkImageAccess(id, model, size, resolution); err != nil {
 		s.logCallFailure(callID, "/v1/responses", model, "Responses", err, nil)
 		writeErr(w, 403, err.Error())
 		return
@@ -689,7 +689,7 @@ func (s *Server) handleV1ResponseImage(w http.ResponseWriter, r *http.Request, i
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.imageRequestTimeout())
 	defer cancel()
-	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, 1)
+	items, err := s.generateImagesWithPoolForIdentity(ctx, id, prompt, model, size, resolution, refs, 1)
 	if err != nil {
 		s.refundImage(id, 1)
 		s.logCallFailure(callID, "/v1/responses", model, "Responses", err, nil)
@@ -933,7 +933,7 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := s.checkImageAccess(id, model, resolution); err != nil {
+	if err := s.checkImageAccess(id, model, size, resolution); err != nil {
 		s.logCallFailure(callID, endpoint, model, action, err, nil)
 		writeErr(w, 403, err.Error())
 		return
@@ -949,7 +949,7 @@ func (s *Server) imageResultStream(w http.ResponseWriter, r *http.Request, id *I
 	refs := inputs
 	w.Header().Set("Content-Type", "text/event-stream")
 	created := time.Now().Unix()
-	items, err := s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
+	items, err := s.generateImagesWithPoolForIdentity(ctx, id, prompt, model, size, resolution, refs, n)
 	if err != nil {
 		s.refundImage(id, n)
 		s.logCallFailure(callID, endpoint, model, action, err, map[string]any{"stream": true, "n": n})

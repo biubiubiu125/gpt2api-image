@@ -1077,22 +1077,34 @@ func TestImageTaskEditRejectsEmptyPromptBeforeReadingInputs(t *testing.T) {
 
 func TestFreeUserHighResolutionRejectedBeforeDBTaskCreate(t *testing.T) {
 	s := &Server{taskStore: &PGTaskStore{}}
-	_, _, err := s.createDBImageTask(context.Background(), &Identity{
+	identity := &Identity{
 		ID:                      "user-a",
 		Role:                    "user",
 		AccountTier:             "free",
 		CanUsePaidImageAccounts: false,
 		CanUseHighResolution:    false,
-	}, imageTaskCreateRequest{
-		Mode:       "generate",
-		Prompt:     "high resolution prompt",
-		Model:      "gpt-image-2",
-		Resolution: "2k",
-		N:          1,
-	})
-	var se statusError
-	if !errors.As(err, &se) || se.status != http.StatusForbidden {
-		t.Fatalf("create high resolution task err = %v, want 403 statusError", err)
+	}
+	for _, req := range []imageTaskCreateRequest{
+		{
+			Mode:       "generate",
+			Prompt:     "high resolution prompt",
+			Model:      "gpt-image-2",
+			Resolution: "2k",
+			N:          1,
+		},
+		{
+			Mode:   "generate",
+			Prompt: "direct high resolution size prompt",
+			Model:  "gpt-image-2",
+			Size:   "3840x2160",
+			N:      1,
+		},
+	} {
+		_, _, err := s.createDBImageTask(context.Background(), identity, req)
+		var se statusError
+		if !errors.As(err, &se) || se.status != http.StatusForbidden {
+			t.Fatalf("create high resolution task req=%#v err = %v, want 403 statusError", req, err)
+		}
 	}
 }
 

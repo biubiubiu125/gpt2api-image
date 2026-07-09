@@ -91,6 +91,29 @@ func serviceKeyIdentity(k UserKey) *Identity {
 	}
 }
 
+func (s *Server) taskOwnerIdentity(ownerID, ownerRole string) *Identity {
+	ownerID = strings.TrimSpace(ownerID)
+	role := strings.ToLower(strings.TrimSpace(ownerRole))
+	if s != nil && s.store != nil && ownerID != "" {
+		for _, k := range s.store.LoadAuthKeys() {
+			k = normalizeServiceKey(k)
+			if k.ID == ownerID {
+				if !k.Enabled {
+					return &Identity{ID: ownerID, Role: "user", AccountTier: "free"}
+				}
+				return serviceKeyIdentity(k)
+			}
+		}
+	}
+	if role == "admin" && ownerID == "admin" {
+		return &Identity{ID: ownerID, Role: "admin", AccountTier: "premium", CanUsePaidImageAccounts: true, CanUseHighResolution: true, Root: true}
+	}
+	if role != "user" {
+		role = "user"
+	}
+	return &Identity{ID: ownerID, Role: role, AccountTier: "free"}
+}
+
 func isRootIdentity(id *Identity) bool {
 	return id != nil && id.Root
 }
@@ -158,16 +181,18 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (*Identity
 	return id, true
 }
 
-func (s *Server) checkImageAccess(id *Identity, model, resolution string) error {
+func (s *Server) checkImageAccess(id *Identity, model, size, resolution string) error {
 	if id == nil || isRootIdentity(id) {
 		return nil
 	}
-	res := normalizeResolution(resolution)
-	if (res == "2k" || res == "4k") && !id.CanUseHighResolution {
+	if imageRequestUsesHighResolution(size, resolution) && !id.CanUseHighResolution {
 		return httpStatusError(403, "当前密钥无权使用 2K/4K 图片分辨率")
 	}
 	if isCodexImageRequest(model, resolution) && !id.CanUsePaidImageAccounts {
 		return httpStatusError(403, "当前密钥无权使用付费图片账号")
+	}
+	if err := s.checkImageRouteAccess(id); err != nil {
+		return err
 	}
 	return nil
 }

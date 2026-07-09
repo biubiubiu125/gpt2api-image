@@ -295,6 +295,67 @@ func TestPGTaskStoreIntegrationAsyncLifecycle(t *testing.T) {
 		t.Fatalf("worker failure should refund image quota, keys=%#v", keys)
 	}
 
+	workerDeniedTaskID := "task_worker_denied_" + suffix
+	workerDeniedClientTaskID := "client_worker_denied_" + suffix
+	if err := workerServer.store.SaveAuthKeys([]UserKey{{
+		ID:                 owner.ID,
+		Name:               "integration downgraded owner",
+		Role:               "user",
+		AccountTier:        "free",
+		Enabled:            true,
+		ImageDailyUsed:     1,
+		ImageMonthlyUsed:   1,
+		ImageTotalUsed:     1,
+		ChatDailyUnlimited: true,
+	}}); err != nil {
+		t.Fatalf("save downgraded owner key: %v", err)
+	}
+	workerServer.imageGenerator = func(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+		t.Fatalf("high resolution task should be rejected before image generation")
+		return nil, nil
+	}
+	_, created, err = store.CreateTask(ctx, DBImageTask{
+		ID:             workerDeniedTaskID,
+		ClientTaskID:   workerDeniedClientTaskID,
+		OwnerID:        owner.ID,
+		OwnerRole:      "admin",
+		Status:         dbTaskStatusQueued,
+		Mode:           "generate",
+		Prompt:         "worker denied high resolution prompt",
+		Model:          "gpt-image-2",
+		Size:           "3840x2160",
+		ResponseFormat: "b64_json",
+		N:              1,
+	})
+	if err != nil {
+		t.Fatalf("create worker denied task: %v", err)
+	}
+	if !created {
+		t.Fatalf("worker denied task was not created")
+	}
+	workerDeniedID := "worker_denied_" + suffix
+	workerDeniedClaimed, ok, err := store.ClaimTaskByID(ctx, workerDeniedTaskID, workerDeniedID, time.Minute)
+	if err != nil {
+		t.Fatalf("claim worker denied task: %v", err)
+	}
+	if !ok {
+		t.Fatalf("worker denied task was not claimed")
+	}
+	if err := workerServer.runDBImageTask(ctx, workerDeniedID, time.Minute, workerDeniedClaimed); err == nil || !strings.Contains(err.Error(), "2K/4K") {
+		t.Fatalf("run worker denied task err = %v, want high resolution access error", err)
+	}
+	workerDenied, err := store.GetTask(ctx, workerDeniedTaskID, owner)
+	if err != nil {
+		t.Fatalf("get worker denied task: %v", err)
+	}
+	if workerDenied.Status != dbTaskStatusError || !strings.Contains(workerDenied.Error, "2K/4K") {
+		t.Fatalf("worker denied task = %#v", workerDenied)
+	}
+	keys = workerServer.store.LoadAuthKeys()
+	if len(keys) != 1 || keys[0].ImageDailyUsed != 0 || keys[0].ImageMonthlyUsed != 0 || keys[0].ImageTotalUsed != 0 {
+		t.Fatalf("worker access denial should refund image quota, keys=%#v", keys)
+	}
+
 	_, created, err = store.CreateTask(ctx, DBImageTask{
 		ID:           cancelTaskID,
 		ClientTaskID: cancelClientTaskID,

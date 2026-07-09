@@ -557,7 +557,7 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 	var lastErr error
 	for idx, slug := range slugs {
 		traceLogf(ctx, "│  ├─ image backend model attempt %d/%d slug=%s", idx+1, len(slugs), slug)
-		items, err := c.generateImageWithModelSlug(ctx, finalPrompt, slug, cr, uploads, opts)
+		items, err := c.generateImageWithModelSlug(ctx, finalPrompt, slug, cr, uploads, size, resolution, opts)
 		if err == nil {
 			return items, nil
 		}
@@ -573,14 +573,15 @@ func (c *UpstreamClient) GenerateImage(ctx context.Context, prompt, model, size,
 	return nil, lastErr
 }
 
-func (c *UpstreamClient) generateImageWithModelSlug(ctx context.Context, prompt, modelSlug string, cr chatRequirements, uploads []map[string]any, opts imageGenerationOptions) ([]upstreamImageResult, error) {
-	traceLogf(ctx, "│  ├─ step prepare image conversation model_slug=%s", modelSlug)
-	conduit, err := c.prepareImage(ctx, prompt, modelSlug, cr)
+func (c *UpstreamClient) generateImageWithModelSlug(ctx context.Context, prompt, modelSlug string, cr chatRequirements, uploads []map[string]any, size, resolution string, opts imageGenerationOptions) ([]upstreamImageResult, error) {
+	metadataSize := imageGenerationMetadataSize(size, resolution)
+	traceLogf(ctx, "│  ├─ step prepare image conversation model_slug=%s image_generation_size=%s", modelSlug, firstNonEmpty(metadataSize, "auto"))
+	conduit, err := c.prepareImage(ctx, prompt, modelSlug, cr, size, resolution)
 	if err != nil {
 		return nil, err
 	}
-	traceLogf(ctx, "│  ├─ step start image SSE conversation model_slug=%s uploads=%d", modelSlug, len(uploads))
-	resp, err := c.startImage(ctx, prompt, modelSlug, cr, conduit, uploads)
+	traceLogf(ctx, "│  ├─ step start image SSE conversation model_slug=%s uploads=%d image_generation_size=%s", modelSlug, len(uploads), firstNonEmpty(metadataSize, "auto"))
+	resp, err := c.startImage(ctx, prompt, modelSlug, cr, conduit, uploads, size, resolution)
 	if err != nil {
 		return nil, err
 	}
@@ -700,9 +701,9 @@ func parseImageSSE(r io.Reader) imageSSEParseResult {
 	return res
 }
 
-func (c *UpstreamClient) prepareImage(ctx context.Context, prompt, modelSlug string, cr chatRequirements) (string, error) {
+func (c *UpstreamClient) prepareImage(ctx context.Context, prompt, modelSlug string, cr chatRequirements, size, resolution string) (string, error) {
 	path := "/backend-api/f/conversation/prepare"
-	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": uuid4(), "model": modelSlug, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": uuid4(), "author": map[string]any{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{prompt}}}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]any{"app_name": "chatgpt.com"}}
+	payload := map[string]any{"action": "next", "fork_from_shared_post": false, "parent_message_id": uuid4(), "model": modelSlug, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": map[string]any{"kind": "primary_assistant"}, "system_hints": []string{"picture_v2"}, "partial_query": map[string]any{"id": uuid4(), "author": map[string]any{"role": "user"}, "content": map[string]any{"content_type": "text", "parts": []string{prompt}}, "metadata": imageGenerationMetadata(size, resolution, "auto")}, "supports_buffering": true, "supported_encodings": []string{"v1"}, "client_contextual_info": map[string]any{"app_name": "chatgpt.com"}}
 	resp, err := c.do(ctx, http.MethodPost, path, c.imageHeaders(path, cr, "", "*/*"), payload, false)
 	if err != nil {
 		return "", err
@@ -716,7 +717,7 @@ func (c *UpstreamClient) prepareImage(ctx context.Context, prompt, modelSlug str
 	}
 	return token, nil
 }
-func (c *UpstreamClient) startImage(ctx context.Context, prompt, modelSlug string, cr chatRequirements, conduit string, refs []map[string]any) (*http.Response, error) {
+func (c *UpstreamClient) startImage(ctx context.Context, prompt, modelSlug string, cr chatRequirements, conduit string, refs []map[string]any, size, resolution string) (*http.Response, error) {
 	path := "/backend-api/f/conversation"
 	parts := []any{}
 	attachments := []map[string]any{}
@@ -729,7 +730,7 @@ func (c *UpstreamClient) startImage(ctx context.Context, prompt, modelSlug strin
 	if len(refs) > 0 {
 		content = map[string]any{"content_type": "multimodal_text", "parts": parts}
 	}
-	metadata := map[string]any{"developer_mode_connector_ids": []any{}, "selected_github_repos": []any{}, "selected_all_github_repos": false, "system_hints": []string{"picture_v2"}, "serialization_metadata": map[string]any{"custom_symbol_offsets": []any{}}}
+	metadata := imageGenerationMetadata(size, resolution, "auto")
 	if len(attachments) > 0 {
 		metadata["attachments"] = attachments
 	}
@@ -1775,10 +1776,11 @@ func isImageModelUnavailableMessage(s string) bool {
 }
 
 func hasImageBackendModelMarker(text string) bool {
-	return strings.Contains(text, "gpt-5-5") ||
+	return strings.Contains(text, "gpt-5.5-thinking") ||
 		strings.Contains(text, "gpt-5.5") ||
-		strings.Contains(text, "gpt-5-3") ||
 		strings.Contains(text, "gpt-5.3") ||
+		strings.Contains(text, "gpt-5-5") ||
+		strings.Contains(text, "gpt-5-3") ||
 		strings.Contains(text, "thinking") ||
 		strings.Contains(text, "instant") ||
 		strings.Contains(text, "model")
@@ -2071,6 +2073,119 @@ func buildEnhancedImagePrompt(prompt, size, resolution string, hasReferenceImage
 	}
 	return final + "\n\n" + strings.Join(instructions, "\n")
 }
+
+var imageGenerationSizePresets = map[string]string{
+	"1:1|1k":  "1024x1024",
+	"1:1|2k":  "2048x2048",
+	"1:1|4k":  "2880x2880",
+	"3:2|1k":  "1536x1024",
+	"3:2|2k":  "2160x1440",
+	"3:2|4k":  "3456x2304",
+	"2:3|1k":  "1024x1536",
+	"2:3|2k":  "1440x2160",
+	"2:3|4k":  "2304x3456",
+	"16:9|1k": "1280x720",
+	"16:9|2k": "2560x1440",
+	"16:9|4k": "3840x2160",
+	"9:16|1k": "720x1280",
+	"9:16|2k": "1440x2560",
+	"9:16|4k": "2160x3840",
+	"4:3|1k":  "1024x768",
+	"4:3|2k":  "2048x1536",
+	"4:3|4k":  "3200x2400",
+	"3:4|1k":  "768x1024",
+	"3:4|2k":  "1536x2048",
+	"3:4|4k":  "2400x3200",
+	"21:9|1k": "1280x544",
+	"21:9|2k": "2560x1088",
+	"21:9|4k": "3840x1600",
+}
+
+func normalizeImageAspectRatio(value string) string {
+	text := strings.ToLower(strings.TrimSpace(value))
+	text = strings.ReplaceAll(text, " ", "")
+	text = strings.ReplaceAll(text, "：", ":")
+	switch text {
+	case "1:1", "square":
+		return "1:1"
+	case "16:9", "landscape":
+		return "16:9"
+	case "9:16", "portrait":
+		return "9:16"
+	case "4:3":
+		return "4:3"
+	case "3:4":
+		return "3:4"
+	case "3:2":
+		return "3:2"
+	case "2:3":
+		return "2:3"
+	case "21:9":
+		return "21:9"
+	default:
+		return ""
+	}
+}
+
+func normalizeImageDimensionSize(value string) string {
+	text := strings.ToLower(strings.TrimSpace(value))
+	text = strings.ReplaceAll(text, " ", "")
+	text = strings.ReplaceAll(text, "×", "x")
+	m := regexp.MustCompile(`^([1-9]\d{0,4})x([1-9]\d{0,4})$`).FindStringSubmatch(text)
+	if len(m) != 3 {
+		return ""
+	}
+	return m[1] + "x" + m[2]
+}
+
+func imageGenerationMetadataSize(size, resolution string) string {
+	if direct := normalizeImageDimensionSize(size); direct != "" {
+		return direct
+	}
+	if direct := normalizeImageDimensionSize(resolution); direct != "" {
+		return direct
+	}
+	tier := normalizeImageResolution(resolution)
+	sizeText := strings.ToLower(strings.TrimSpace(size))
+	if tier == "" {
+		tier = normalizeImageResolution(sizeText)
+	}
+	aspect := normalizeImageAspectRatio(size)
+	if aspect == "" && tier != "" {
+		aspect = "1:1"
+	}
+	if aspect == "" || tier == "" {
+		return ""
+	}
+	return imageGenerationSizePresets[aspect+"|"+tier]
+}
+
+func imageGenerationMetadata(size, resolution, quality string) map[string]any {
+	normalizedQuality := strings.TrimSpace(quality)
+	if normalizedQuality == "" {
+		normalizedQuality = "auto"
+	}
+	metadata := map[string]any{
+		"developer_mode_connector_ids": []any{},
+		"selected_github_repos":        []any{},
+		"selected_all_github_repos":    false,
+		"system_hints":                 []string{"picture_v2"},
+		"serialization_metadata":       map[string]any{"custom_symbol_offsets": []any{}},
+	}
+	generation := map[string]any{
+		"model":         publicImageModel,
+		"output_format": "png",
+		"quality":       normalizedQuality,
+	}
+	if outputSize := imageGenerationMetadataSize(size, resolution); outputSize != "" {
+		generation["size"] = outputSize
+		metadata["requested_image_size"] = outputSize
+	}
+	metadata["requested_image_quality"] = normalizedQuality
+	metadata["image_generation"] = generation
+	return metadata
+}
+
 func normalizeAccountType(value string) string {
 	raw := strings.TrimSpace(value)
 	if raw == "" {
@@ -2127,7 +2242,7 @@ func imageModelSlug(model string) string {
 func imageModelSlugs(model string) []string {
 	switch strings.TrimSpace(strings.ToLower(model)) {
 	case "gpt-image-2":
-		return []string{"gpt-5-5-thinking", "gpt-5-5", "gpt-5-3"}
+		return []string{"gpt-5.5-thinking", "gpt-5.5", "gpt-5.3"}
 	case "codex-gpt-image-2":
 		return []string{"codex-gpt-image-2"}
 	default:

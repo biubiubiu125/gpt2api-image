@@ -1737,7 +1737,7 @@ class PlatformRegistrar:
 
     def register(self, index: int) -> dict:
         mail_config = _mail_config(self.proxy, self.deadline, self._check_task_control)
-        mailbox_attempts = 8
+        mailbox_attempts = 12
         last_error: Exception | None = None
         for mailbox_attempt in range(mailbox_attempts):
             self._check_task_control()
@@ -1786,16 +1786,24 @@ class PlatformRegistrar:
             except Exception as error:
                 last_error = error
                 yyds_hard_reject = mail_provider.mark_yyds_mailbox_error(mailbox, error)
+                yyds_mail_code_timeout = (
+                    str(mailbox.get("provider") or "") == mail_provider.YydsMailProvider.name
+                    and not code_consumed
+                    and mail_provider.is_yyds_mail_code_timeout_error(error)
+                )
                 if code_consumed:
                     mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
                     _release_mailbox(mailbox, mail_config, index)
                 else:
                     _release_mailbox(mailbox, mail_config, index)
-                if yyds_hard_reject and mailbox_attempt < mailbox_attempts - 1:
+                if (yyds_hard_reject or yyds_mail_code_timeout) and mailbox_attempt < mailbox_attempts - 1:
                     source_domain = _normalize_domain_name(mailbox.get("source_domain") or mailbox.get("domain") or email)
                     detail = f"：{source_domain}" if source_domain else ""
-                    step(index, f"YYDS 邮箱域名被 OpenAI 拒绝，已自动加入黑名单{detail}，切换邮箱重试 ({mailbox_attempt + 2}/{mailbox_attempts})", "yellow")
-                    cooldown = min(10.0, 3.0 + mailbox_attempt * 1.5)
+                    if yyds_mail_code_timeout:
+                        step(index, f"YYDS 邮箱收码超时{detail}，释放邮箱并切换重试 ({mailbox_attempt + 2}/{mailbox_attempts})", "yellow")
+                    else:
+                        step(index, f"YYDS 邮箱域名被 OpenAI 拒绝，已自动加入黑名单{detail}，切换邮箱重试 ({mailbox_attempt + 2}/{mailbox_attempts})", "yellow")
+                    cooldown = min(6.0, 1.0 + mailbox_attempt * 0.5)
                     deadline = time.monotonic() + cooldown
                     while time.monotonic() < deadline:
                         self._check_task_control()

@@ -161,7 +161,7 @@ class RegisterStatsTest(unittest.TestCase):
                     pass
 
                 def register(self, index: int) -> dict:
-                    return {"access_token": "tok", "email": "user@example.com"}
+                    return {"access_token": "tok", "refresh_token": "refresh", "id_token": "id", "email": "user@example.com"}
 
                 def close(self) -> None:
                     pass

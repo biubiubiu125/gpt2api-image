@@ -93,11 +93,73 @@ func upstreamTestResponseWithHeader(status int, body string, header http.Header)
 
 func upstreamRequestModel(t *testing.T, req *http.Request) string {
 	t.Helper()
+	return strAny(upstreamRequestBody(t, req)["model"], "")
+}
+
+func upstreamRequestBody(t *testing.T, req *http.Request) map[string]any {
+	t.Helper()
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read upstream request body: %v", err)
+	}
+	req.Body = io.NopCloser(bytes.NewReader(raw))
 	var body map[string]any
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("decode upstream request body: %v", err)
 	}
-	return strAny(body["model"], "")
+	return body
+}
+
+func assertImageGenerationMetadata(t *testing.T, metadata map[string]any, wantSize string) {
+	t.Helper()
+	generation, ok := metadata["image_generation"].(map[string]any)
+	if !ok {
+		t.Fatalf("image_generation metadata missing: %#v", metadata)
+	}
+	if got := strAny(generation["model"], ""); got != publicImageModel {
+		t.Fatalf("image_generation.model = %q, want %q", got, publicImageModel)
+	}
+	if got := strAny(generation["output_format"], ""); got != "png" {
+		t.Fatalf("image_generation.output_format = %q, want png", got)
+	}
+	if got := strAny(generation["quality"], ""); got != "auto" {
+		t.Fatalf("image_generation.quality = %q, want auto", got)
+	}
+	if wantSize != "" {
+		if got := strAny(generation["size"], ""); got != wantSize {
+			t.Fatalf("image_generation.size = %q, want %q", got, wantSize)
+		}
+	}
+}
+
+func upstreamPrepareMetadata(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+	partial, ok := body["partial_query"].(map[string]any)
+	if !ok {
+		t.Fatalf("partial_query missing: %#v", body)
+	}
+	metadata, ok := partial["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("partial_query.metadata missing: %#v", partial)
+	}
+	return metadata
+}
+
+func upstreamStartMetadata(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		t.Fatalf("messages missing: %#v", body)
+	}
+	message, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("message[0] invalid: %#v", messages[0])
+	}
+	metadata, ok := message["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("message.metadata missing: %#v", message)
+	}
+	return metadata
 }
 
 func tinyPNGBytes(t *testing.T) []byte {
@@ -736,8 +798,8 @@ func TestImageModelSlug(t *testing.T) {
 	}{
 		{"", []string{"auto"}},
 		{"auto", []string{"auto"}},
-		{"gpt-image-2", []string{"gpt-5-5-thinking", "gpt-5-5", "gpt-5-3"}},
-		{"GPT-IMAGE-2", []string{"gpt-5-5-thinking", "gpt-5-5", "gpt-5-3"}},
+		{"gpt-image-2", []string{"gpt-5.5-thinking", "gpt-5.5", "gpt-5.3"}},
+		{"GPT-IMAGE-2", []string{"gpt-5.5-thinking", "gpt-5.5", "gpt-5.3"}},
 		{"codex-gpt-image-2", []string{"codex-gpt-image-2"}},
 		{"unknown", []string{"auto"}},
 	}
@@ -752,13 +814,74 @@ func TestImageModelSlug(t *testing.T) {
 	}
 }
 
+func TestImageGenerationMetadataUsesPublicModelAndMappedSize(t *testing.T) {
+	metadata := imageGenerationMetadata("16:9", "4k", "")
+	generation, ok := metadata["image_generation"].(map[string]any)
+	if !ok {
+		t.Fatalf("image_generation metadata missing: %#v", metadata)
+	}
+	if got := strAny(generation["model"], ""); got != publicImageModel {
+		t.Fatalf("image_generation.model = %q, want %q", got, publicImageModel)
+	}
+	if got := strAny(generation["output_format"], ""); got != "png" {
+		t.Fatalf("image_generation.output_format = %q, want png", got)
+	}
+	if got := strAny(generation["size"], ""); got != "3840x2160" {
+		t.Fatalf("image_generation.size = %q, want 3840x2160", got)
+	}
+	if got := strAny(generation["quality"], ""); got != "auto" {
+		t.Fatalf("image_generation.quality = %q, want auto", got)
+	}
+	if got := strAny(metadata["requested_image_size"], ""); got != "3840x2160" {
+		t.Fatalf("requested_image_size = %q, want 3840x2160", got)
+	}
+}
+
+func TestImageGenerationMetadataKeepsUnknownSizeOut(t *testing.T) {
+	metadata := imageGenerationMetadata("", "", "")
+	generation, ok := metadata["image_generation"].(map[string]any)
+	if !ok {
+		t.Fatalf("image_generation metadata missing: %#v", metadata)
+	}
+	if _, ok := generation["size"]; ok {
+		t.Fatalf("image_generation.size should be omitted for empty size/resolution: %#v", generation)
+	}
+	if got := strAny(generation["model"], ""); got != publicImageModel {
+		t.Fatalf("image_generation.model = %q, want %q", got, publicImageModel)
+	}
+}
+
+func TestImageGenerationMetadataUsesDirectResolutionSize(t *testing.T) {
+	for _, tc := range []struct {
+		size       string
+		resolution string
+		want       string
+	}{
+		{size: "16:9", resolution: "2560x1440", want: "2560x1440"},
+		{size: "", resolution: "3840x2160", want: "3840x2160"},
+		{size: "2160×3840", resolution: "", want: "2160x3840"},
+	} {
+		metadata := imageGenerationMetadata(tc.size, tc.resolution, "")
+		generation, ok := metadata["image_generation"].(map[string]any)
+		if !ok {
+			t.Fatalf("image_generation metadata missing: %#v", metadata)
+		}
+		if got := strAny(generation["size"], ""); got != tc.want {
+			t.Fatalf("image_generation.size for size=%q resolution=%q = %q, want %q", tc.size, tc.resolution, got, tc.want)
+		}
+		if got := strAny(metadata["requested_image_size"], ""); got != tc.want {
+			t.Fatalf("requested_image_size for size=%q resolution=%q = %q, want %q", tc.size, tc.resolution, got, tc.want)
+		}
+	}
+}
+
 func TestShouldTryNextImageModelSlug(t *testing.T) {
 	for _, err := range []error{
 		errors.New("POST /backend-api/f/conversation/prepare failed: status=400 body=model_not_found"),
-		errors.New("POST /backend-api/f/conversation failed: status=400 body=gpt-5-5-thinking is not available for this account"),
+		errors.New("POST /backend-api/f/conversation failed: status=400 body=gpt-5.5-thinking is not available for this account"),
 		errors.New(`POST /backend-api/f/conversation/prepare failed: status=429 body={"error":"usage_limit_reached"}`),
-		errors.New("POST /backend-api/f/conversation/prepare failed: status=429 body=Usage limit reached for gpt-5-5-thinking"),
-		errors.New("POST /backend-api/f/conversation/prepare failed: status=429 body=You've hit the free plan limit for gpt-5-5-thinking. Try again when the limit resets."),
+		errors.New("POST /backend-api/f/conversation/prepare failed: status=429 body=Usage limit reached for gpt-5.5-thinking"),
+		errors.New("POST /backend-api/f/conversation/prepare failed: status=429 body=You've hit the free plan limit for gpt-5.5-thinking. Try again when the limit resets."),
 		errors.New("I can't generate images right now."),
 		errors.New("I can't generate this image right now."),
 		errors.New("I can\u2019t generate this image right now."),
@@ -813,25 +936,29 @@ func TestGenerateImageTriesImageModelSlugsInOrder(t *testing.T) {
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/sentinel/chat-requirements":
 				return upstreamTestResponse(200, `{"token":"requirements-token"}`), nil
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
-				model := upstreamRequestModel(t, req)
+				body := upstreamRequestBody(t, req)
+				assertImageGenerationMetadata(t, upstreamPrepareMetadata(t, body), "2560x1440")
+				model := strAny(body["model"], "")
 				prepareModels = append(prepareModels, model)
 				switch model {
-				case "gpt-5-5-thinking":
-					return upstreamTestResponse(429, `You've hit the free plan limit for gpt-5-5-thinking. Try again when the limit resets.`), nil
-				case "gpt-5-5":
-					return upstreamTestResponse(200, `{"conduit_token":"conduit-gpt-5-5"}`), nil
-				case "gpt-5-3":
-					return upstreamTestResponse(200, `{"conduit_token":"conduit-gpt-5-3"}`), nil
+				case "gpt-5.5-thinking":
+					return upstreamTestResponse(429, `You've hit the free plan limit for gpt-5.5-thinking. Try again when the limit resets.`), nil
+				case "gpt-5.5":
+					return upstreamTestResponse(200, `{"conduit_token":"conduit-gpt-5.5"}`), nil
+				case "gpt-5.3":
+					return upstreamTestResponse(200, `{"conduit_token":"conduit-gpt-5.3"}`), nil
 				default:
 					t.Fatalf("unexpected prepare model %q", model)
 				}
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
-				model := upstreamRequestModel(t, req)
+				body := upstreamRequestBody(t, req)
+				assertImageGenerationMetadata(t, upstreamStartMetadata(t, body), "2560x1440")
+				model := strAny(body["model"], "")
 				startModels = append(startModels, model)
-				if model == "gpt-5-5" {
-					return upstreamTestResponse(400, `gpt-5-5 is not available for this account`), nil
+				if model == "gpt-5.5" {
+					return upstreamTestResponse(400, `gpt-5.5 is not available for this account`), nil
 				}
-				if model != "gpt-5-3" {
+				if model != "gpt-5.3" {
 					t.Fatalf("unexpected start model %q", model)
 				}
 				sseBody := strings.Join([]string{
@@ -854,17 +981,17 @@ func TestGenerateImageTriesImageModelSlugsInOrder(t *testing.T) {
 		}),
 	}
 
-	items, err := client.GenerateImage(context.Background(), "draw a cat", "gpt-image-2", "1:1", "1k", nil, imageGenerationOptions{Timeout: time.Second, PollInterval: time.Millisecond})
+	items, err := client.GenerateImage(context.Background(), "draw a cat", "gpt-image-2", "16:9", "2k", nil, imageGenerationOptions{Timeout: time.Second, PollInterval: time.Millisecond})
 	if err != nil {
 		t.Fatalf("GenerateImage err = %v", err)
 	}
 	if len(items) != 1 || !bytes.Equal(items[0].Bytes, imageBytes) {
 		t.Fatalf("GenerateImage items = %#v, want one generated image", items)
 	}
-	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking,gpt-5-5,gpt-5-3"; got != want {
+	if got, want := strings.Join(prepareModels, ","), "gpt-5.5-thinking,gpt-5.5,gpt-5.3"; got != want {
 		t.Fatalf("prepare models = %q, want %q", got, want)
 	}
-	if got, want := strings.Join(startModels, ","), "gpt-5-5,gpt-5-3"; got != want {
+	if got, want := strings.Join(startModels, ","), "gpt-5.5,gpt-5.3"; got != want {
 		t.Fatalf("start models = %q, want %q", got, want)
 	}
 }
@@ -884,14 +1011,14 @@ func TestGenerateImageReturnsPolicyMessageWithoutFallback(t *testing.T) {
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
 				model := upstreamRequestModel(t, req)
 				prepareModels = append(prepareModels, model)
-				if model != "gpt-5-5-thinking" {
+				if model != "gpt-5.5-thinking" {
 					t.Fatalf("policy response should not try prepare model %q", model)
 				}
 				return upstreamTestResponse(200, `{"conduit_token":"conduit-policy"}`), nil
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
 				model := upstreamRequestModel(t, req)
 				startModels = append(startModels, model)
-				if model != "gpt-5-5-thinking" {
+				if model != "gpt-5.5-thinking" {
 					t.Fatalf("policy response should not try start model %q", model)
 				}
 				sseBody := strings.Join([]string{
@@ -917,10 +1044,10 @@ func TestGenerateImageReturnsPolicyMessageWithoutFallback(t *testing.T) {
 	if len(items) != 0 {
 		t.Fatalf("GenerateImage items = %#v, want none", items)
 	}
-	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking"; got != want {
+	if got, want := strings.Join(prepareModels, ","), "gpt-5.5-thinking"; got != want {
 		t.Fatalf("prepare models = %q, want %q", got, want)
 	}
-	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking"; got != want {
+	if got, want := strings.Join(startModels, ","), "gpt-5.5-thinking"; got != want {
 		t.Fatalf("start models = %q, want %q", got, want)
 	}
 }
@@ -940,14 +1067,14 @@ func TestGenerateImageReturnsModerationBlockWithoutFallback(t *testing.T) {
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
 				model := upstreamRequestModel(t, req)
 				prepareModels = append(prepareModels, model)
-				if model != "gpt-5-5-thinking" {
+				if model != "gpt-5.5-thinking" {
 					t.Fatalf("moderation block should not try prepare model %q", model)
 				}
 				return upstreamTestResponse(200, `{"conduit_token":"conduit-blocked"}`), nil
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
 				model := upstreamRequestModel(t, req)
 				startModels = append(startModels, model)
-				if model != "gpt-5-5-thinking" {
+				if model != "gpt-5.5-thinking" {
 					t.Fatalf("moderation block should not try start model %q", model)
 				}
 				sseBody := strings.Join([]string{
@@ -973,10 +1100,10 @@ func TestGenerateImageReturnsModerationBlockWithoutFallback(t *testing.T) {
 	if len(items) != 0 {
 		t.Fatalf("GenerateImage items = %#v, want none", items)
 	}
-	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking"; got != want {
+	if got, want := strings.Join(prepareModels, ","), "gpt-5.5-thinking"; got != want {
 		t.Fatalf("prepare models = %q, want %q", got, want)
 	}
-	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking"; got != want {
+	if got, want := strings.Join(startModels, ","), "gpt-5.5-thinking"; got != want {
 		t.Fatalf("start models = %q, want %q", got, want)
 	}
 }
@@ -997,14 +1124,14 @@ func TestGenerateImageReturnsContextCanceledDuringSSEWithoutFallback(t *testing.
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation/prepare":
 				model := upstreamRequestModel(t, req)
 				prepareModels = append(prepareModels, model)
-				if model != "gpt-5-5-thinking" {
+				if model != "gpt-5.5-thinking" {
 					t.Fatalf("canceled request should not try prepare model %q", model)
 				}
 				return upstreamTestResponse(200, `{"conduit_token":"conduit-canceled"}`), nil
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
 				model := upstreamRequestModel(t, req)
 				startModels = append(startModels, model)
-				if model != "gpt-5-5-thinking" {
+				if model != "gpt-5.5-thinking" {
 					t.Fatalf("canceled request should not try start model %q", model)
 				}
 				return &http.Response{
@@ -1026,10 +1153,10 @@ func TestGenerateImageReturnsContextCanceledDuringSSEWithoutFallback(t *testing.
 	if len(items) != 0 {
 		t.Fatalf("GenerateImage items = %#v, want none", items)
 	}
-	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking"; got != want {
+	if got, want := strings.Join(prepareModels, ","), "gpt-5.5-thinking"; got != want {
 		t.Fatalf("prepare models = %q, want %q", got, want)
 	}
-	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking"; got != want {
+	if got, want := strings.Join(startModels, ","), "gpt-5.5-thinking"; got != want {
 		t.Fatalf("start models = %q, want %q", got, want)
 	}
 }
@@ -1054,14 +1181,14 @@ func TestGenerateImageFallbacksOnSSETimeout(t *testing.T) {
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
 				model := upstreamRequestModel(t, req)
 				startModels = append(startModels, model)
-				if model == "gpt-5-5-thinking" {
+				if model == "gpt-5.5-thinking" {
 					return &http.Response{
 						StatusCode: 200,
 						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 						Body:       &upstreamBlockingReadCloser{closed: make(chan struct{})},
 					}, nil
 				}
-				if model != "gpt-5-5" {
+				if model != "gpt-5.5" {
 					t.Fatalf("unexpected fallback start model %q", model)
 				}
 				sseBody := strings.Join([]string{
@@ -1091,10 +1218,10 @@ func TestGenerateImageFallbacksOnSSETimeout(t *testing.T) {
 	if len(items) != 1 || !bytes.Equal(items[0].Bytes, imageBytes) {
 		t.Fatalf("GenerateImage items = %#v, want one generated image", items)
 	}
-	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking,gpt-5-5"; got != want {
+	if got, want := strings.Join(prepareModels, ","), "gpt-5.5-thinking,gpt-5.5"; got != want {
 		t.Fatalf("prepare models = %q, want %q", got, want)
 	}
-	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking,gpt-5-5"; got != want {
+	if got, want := strings.Join(startModels, ","), "gpt-5.5-thinking,gpt-5.5"; got != want {
 		t.Fatalf("start models = %q, want %q", got, want)
 	}
 }
@@ -1119,7 +1246,7 @@ func TestGenerateImageFallbacksOnGenericGenerationRefusal(t *testing.T) {
 			case req.Method == http.MethodPost && req.URL.Path == "/backend-api/f/conversation":
 				model := upstreamRequestModel(t, req)
 				startModels = append(startModels, model)
-				if model == "gpt-5-5-thinking" {
+				if model == "gpt-5.5-thinking" {
 					sseBody := strings.Join([]string{
 						`data: {"type":"server_ste_metadata","metadata":{"tool_invoked":false,"turn_use_case":"text"}}`,
 						"",
@@ -1130,7 +1257,7 @@ func TestGenerateImageFallbacksOnGenericGenerationRefusal(t *testing.T) {
 					}, "\n")
 					return upstreamTestResponseWithHeader(200, sseBody, http.Header{"Content-Type": []string{"text/event-stream"}}), nil
 				}
-				if model != "gpt-5-5" {
+				if model != "gpt-5.5" {
 					t.Fatalf("unexpected fallback start model %q", model)
 				}
 				sseBody := strings.Join([]string{
@@ -1162,10 +1289,10 @@ func TestGenerateImageFallbacksOnGenericGenerationRefusal(t *testing.T) {
 	if len(items) != 1 || !bytes.Equal(items[0].Bytes, imageBytes) {
 		t.Fatalf("GenerateImage items = %#v, want one generated image", items)
 	}
-	if got, want := strings.Join(prepareModels, ","), "gpt-5-5-thinking,gpt-5-5"; got != want {
+	if got, want := strings.Join(prepareModels, ","), "gpt-5.5-thinking,gpt-5.5"; got != want {
 		t.Fatalf("prepare models = %q, want %q", got, want)
 	}
-	if got, want := strings.Join(startModels, ","), "gpt-5-5-thinking,gpt-5-5"; got != want {
+	if got, want := strings.Join(startModels, ","), "gpt-5.5-thinking,gpt-5.5"; got != want {
 		t.Fatalf("start models = %q, want %q", got, want)
 	}
 }

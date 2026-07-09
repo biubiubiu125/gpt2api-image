@@ -31,11 +31,13 @@ OUTLOOK_RECORDED_STATES = {"used", "in_use", "token_invalid", "failed"}
 OUTLOOK_UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
 
 YYDS_DOMAIN_BLACKLIST_FILE = DATA_DIR / "yyds_domain_blacklist.json"
+YYDS_DOMAIN_SUCCESS_FILE = DATA_DIR / "yyds_domain_success.json"
 _yyds_domain_blacklist_lock = Lock()
+_yyds_domain_success_lock = Lock()
 _yyds_rate_limit_lock = Lock()
 _yyds_next_request_at = 0.0
 _yyds_backoff_until = 0.0
-_YYDS_MIN_REQUEST_INTERVAL_SECONDS = 0.35
+_YYDS_MIN_REQUEST_INTERVAL_SECONDS = 0.30
 _YYDS_429_BACKOFF_SECONDS = (2.0, 5.0, 10.0)
 _YYDS_MAX_BACKOFF_SECONDS = 30.0
 
@@ -484,6 +486,76 @@ def record_yyds_domain_blacklist(domain: Any, *, source: str, reason: str = "", 
         return not was_auto
 
 
+def _load_yyds_domain_success_entries() -> dict[str, dict[str, Any]]:
+    try:
+        if not YYDS_DOMAIN_SUCCESS_FILE.exists():
+            return {}
+        data = json.loads(YYDS_DOMAIN_SUCCESS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    raw_entries = data.get("entries") if isinstance(data, dict) else data
+    if not isinstance(raw_entries, list):
+        return {}
+    entries: dict[str, dict[str, Any]] = {}
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        domain = _normalize_domain(raw_entry.get("domain"))
+        if not domain:
+            continue
+        entries[domain] = {
+            "domain": domain,
+            "provider_ref": str(raw_entry.get("provider_ref") or "").strip(),
+            "success_count": max(0, int(raw_entry.get("success_count") or 0)),
+            "first_seen_at": str(raw_entry.get("first_seen_at") or ""),
+            "last_seen_at": str(raw_entry.get("last_seen_at") or ""),
+        }
+    return entries
+
+
+def _save_yyds_domain_success_entries(entries: dict[str, dict[str, Any]]) -> None:
+    YYDS_DOMAIN_SUCCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    blacklisted = set(yyds_domain_blacklist_items())
+    payload = {
+        "entries": [
+            entries[domain]
+            for domain in sorted(entries)
+            if _normalize_domain(domain) and _normalize_domain(domain) not in blacklisted
+        ]
+    }
+    YYDS_DOMAIN_SUCCESS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def yyds_domain_success_items(limit: int = 200) -> list[str]:
+    with _yyds_domain_success_lock:
+        entries = _load_yyds_domain_success_entries()
+    values = [
+        entry
+        for entry in entries.values()
+        if not is_yyds_domain_blacklisted(entry.get("domain"))
+    ]
+    values.sort(key=lambda item: (int(item.get("success_count") or 0), str(item.get("last_seen_at") or "")), reverse=True)
+    return [str(item.get("domain") or "") for item in values[: max(1, int(limit or 1))] if str(item.get("domain") or "")]
+
+
+def record_yyds_domain_success(domain: Any, *, provider_ref: str = "") -> bool:
+    target = _normalize_domain(domain)
+    if not target or is_yyds_domain_blacklisted(target):
+        return False
+    with _yyds_domain_success_lock:
+        entries = _load_yyds_domain_success_entries()
+        now = datetime.now(timezone.utc).isoformat()
+        entry = dict(entries.get(target) or {"domain": target, "provider_ref": "", "success_count": 0, "first_seen_at": now, "last_seen_at": now})
+        entry["provider_ref"] = str(provider_ref or entry.get("provider_ref") or "").strip()
+        entry["success_count"] = max(0, int(entry.get("success_count") or 0)) + 1
+        if not str(entry.get("first_seen_at") or "").strip():
+            entry["first_seen_at"] = now
+        entry["last_seen_at"] = now
+        entries[target] = entry
+        _save_yyds_domain_success_entries(entries)
+        return True
+
+
 def is_yyds_domain_blacklisted(domain: Any) -> bool:
     target = _normalize_domain(domain)
     if not target:
@@ -494,13 +566,27 @@ def is_yyds_domain_blacklisted(domain: Any) -> bool:
 
 def _yyds_openai_domain_reject_reason(error: Exception | str | None) -> str:
     text = str(error or "").lower()
-    if "user_register_http_400" in text or "create_account_http_400" in text:
-        return "registration_disallowed"
     if "unsupported_email" in text or "email you provided is not supported" in text:
         return "unsupported_email"
     if "disposable email" in text or "temporary email" in text:
         return "unsupported_email"
+    if (
+        "email domain" in text
+        and (
+            "not supported" in text
+            or "unsupported" in text
+            or "not allowed" in text
+            or "disallowed" in text
+            or "blocked" in text
+        )
+    ):
+        return "unsupported_email"
     return ""
+
+
+def is_yyds_mail_code_timeout_error(error: Exception | str | None) -> bool:
+    text = str(error or "").lower()
+    return "等待邮箱验证码超时" in text or "mail_code_timeout" in text
 
 
 def _is_http_400_error(error: Exception | str | None) -> bool:
@@ -638,6 +724,11 @@ def _yyds_failure_reason(data: dict[str, Any]) -> str:
     reason = str(data.get("errorCode") or data.get("error") or data.get("message") or data.get("msg") or data).strip()
     hint = _yyds_auth_hint(data)
     return f"{reason}; {hint}" if hint else reason
+
+
+def _is_yyds_message_not_found_error(error: Exception | str | None) -> bool:
+    text = str(error or "").lower()
+    return "message_not_found" in text or "message not found" in text or ("http 404" in text and "/messages/" in text)
 
 
 def _yyds_account_id(data: dict[str, Any]) -> str:
@@ -1604,6 +1695,7 @@ class YydsMailProvider(BaseMailProvider):
             for domain in configured_domains
             if not is_yyds_domain_blacklisted(domain)
         ]
+        self.preferred_domain = [] if self.configured_domain_count > 0 else yyds_domain_success_items(200)
         self.subdomain = str(entry.get("subdomain") or "").strip()
         self.wildcard = bool(entry.get("wildcard"))
         self.session = _create_session(conf)
@@ -1642,7 +1734,7 @@ class YydsMailProvider(BaseMailProvider):
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         if self.configured_domain_count > 0 and not self.domain:
             raise RuntimeError("YYDSMail 可用域名为空，已被黑名单过滤")
-        attempts = max(1, len(self.domain)) if self.configured_domain_count > 0 else 8
+        attempts = max(1, len(self.domain)) if self.configured_domain_count > 0 else max(12, len(self.preferred_domain) + 8)
         last_error: RuntimeError | None = None
         for _ in range(attempts):
             payload = {"localPart": username or _random_mailbox_name()}
@@ -1653,6 +1745,13 @@ class YydsMailProvider(BaseMailProvider):
                     break
                 source_domain = _next_domain(self.domain)
                 payload["domain"] = source_domain
+            elif self.configured_domain_count > 0:
+                break
+            elif self.preferred_domain:
+                self.preferred_domain = [domain for domain in self.preferred_domain if not is_yyds_domain_blacklisted(domain)]
+                if self.preferred_domain:
+                    source_domain = _next_domain(self.preferred_domain)
+                    payload["domain"] = source_domain
             if self.subdomain:
                 payload["subdomain"] = self.subdomain
             try:
@@ -1669,6 +1768,7 @@ class YydsMailProvider(BaseMailProvider):
                         provider_ref=self.provider_ref,
                     )
                     self.domain = [domain for domain in self.domain if domain != source_domain]
+                    self.preferred_domain = [domain for domain in self.preferred_domain if domain != source_domain]
                     continue
                 raise
 
@@ -1802,20 +1902,68 @@ class YydsMailProvider(BaseMailProvider):
                 errors.append(reason)
         return False, "; ".join(errors[:4]) or "YYDSMail 删除邮箱失败"
 
-    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+    def fetch_recent_messages(self, mailbox: dict[str, Any], limit: int = 10) -> list[dict[str, Any]]:
         data = self._request("GET", "/messages", token=str(mailbox.get("token") or ""), params={"address": mailbox["address"]})
         messages = [item for item in self._items(data) if isinstance(item, dict)]
         if not messages:
-            return None
-        item = max(messages, key=lambda value: ((_parse_received_at(value.get("createdAt") or value.get("created_at") or value.get("receivedAt") or value.get("date") or value.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(), str(value.get("id") or "")))
-        message_id = str(item.get("id") or item.get("message_id") or "").strip()
-        if message_id:
-            item = self._request("GET", f"/messages/{message_id}", token=str(mailbox.get("token") or ""), params={"address": mailbox["address"]})
-        text_content, html_content = _extract_content(item)
-        sender = item.get("from") or item.get("sender") or ""
-        if isinstance(sender, dict):
-            sender = sender.get("address") or sender.get("email") or sender.get("name") or ""
-        return {"provider": self.name, "mailbox": mailbox["address"], "message_id": message_id, "subject": str(item.get("subject") or ""), "sender": str(sender), "text_content": text_content, "html_content": html_content, "received_at": _parse_received_at(item.get("createdAt") or item.get("created_at") or item.get("receivedAt") or item.get("date") or item.get("timestamp")), "raw": item}
+            return []
+        messages.sort(
+            key=lambda value: (
+                (_parse_received_at(value.get("createdAt") or value.get("created_at") or value.get("receivedAt") or value.get("date") or value.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(),
+                str(value.get("id") or value.get("message_id") or ""),
+            ),
+            reverse=True,
+        )
+        out: list[dict[str, Any]] = []
+        for raw_item in messages[: max(1, int(limit or 1))]:
+            item = raw_item
+            message_id = str(item.get("id") or item.get("message_id") or "").strip()
+            if message_id:
+                try:
+                    item = self._request("GET", f"/messages/{message_id}", token=str(mailbox.get("token") or ""), params={"address": mailbox["address"]})
+                except RuntimeError as error:
+                    if _is_yyds_message_not_found_error(error):
+                        continue
+                    raise
+            text_content, html_content = _extract_content(item)
+            sender = item.get("from") or item.get("sender") or ""
+            if isinstance(sender, dict):
+                sender = sender.get("address") or sender.get("email") or sender.get("name") or ""
+            out.append({"provider": self.name, "mailbox": mailbox["address"], "message_id": message_id, "subject": str(item.get("subject") or ""), "sender": str(sender), "text_content": text_content, "html_content": html_content, "received_at": _parse_received_at(item.get("createdAt") or item.get("created_at") or item.get("receivedAt") or item.get("date") or item.get("timestamp")), "raw": item})
+        return out
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox, 5)
+        if messages:
+            return messages[0]
+        return None
+
+    def wait_for_code(self, mailbox: dict[str, Any], check_control: Callable[[], None] | None = None) -> str | None:
+        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+        if not isinstance(seen_value, list):
+            seen_value = []
+            mailbox["_seen_code_message_refs"] = seen_value
+        seen_refs = {str(item) for item in seen_value}
+
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        while time.monotonic() < deadline:
+            if check_control is not None:
+                check_control()
+            checked_refs: set[str] = set()
+            for message in self.fetch_recent_messages(mailbox, 10):
+                if check_control is not None:
+                    check_control()
+                ref = _message_tracking_ref(message)
+                if ref in seen_refs or ref in checked_refs:
+                    continue
+                checked_refs.add(ref)
+                code = _extract_code(message)
+                if code:
+                    seen_value.append(ref)
+                    seen_refs.add(ref)
+                    return code
+            self._sleep_with_control(max(0.2, self.conf["wait_interval"]), check_control)
+        return None
 
     def close(self) -> None:
         self.session.close()
@@ -2297,6 +2445,13 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     仅对 outlook_token 邮箱生效：成功标记 used；失败时若是 token 失效标记 token_invalid，
     其余失败标记 failed（保留邮箱占用以便排查，可通过重置释放）。
     """
+    if str(mailbox.get("provider") or "") == YydsMailProvider.name:
+        if success:
+            record_yyds_domain_success(
+                mailbox.get("source_domain") or mailbox.get("domain") or mailbox.get("address"),
+                provider_ref=str(mailbox.get("provider_ref") or ""),
+            )
+        return
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         return
     address = str(mailbox.get("address") or "").strip()

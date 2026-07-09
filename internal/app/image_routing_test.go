@@ -1,6 +1,9 @@
 package app
 
 import (
+	"context"
+	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -36,6 +39,131 @@ func TestImageRoutePlanDefaultsToWebFirst(t *testing.T) {
 				t.Fatalf("strategy %q routes = %#v, want %#v", tc.strategy, got, tc.want)
 			}
 		}
+	}
+}
+
+func TestImageRoutePlanForIdentityRespectsPaidRoutePermission(t *testing.T) {
+	freeIdentity := &Identity{ID: "free-user", Role: "user", AccountTier: "free"}
+	premiumIdentity := &Identity{ID: "premium-user", Role: "user", AccountTier: "premium", CanUsePaidImageAccounts: true}
+
+	webFirst := &Server{cfg: Config{ImageRouteStrategy: "web_first"}}
+	freeRoutes, err := webFirst.imageRoutePlanForIdentity(freeIdentity)
+	if err != nil {
+		t.Fatalf("free web_first route plan returned error: %v", err)
+	}
+	if want := []string{imageRouteWeb}; !reflect.DeepEqual(freeRoutes, want) {
+		t.Fatalf("free web_first route plan = %#v, want %#v", freeRoutes, want)
+	}
+	premiumRoutes, err := webFirst.imageRoutePlanForIdentity(premiumIdentity)
+	if err != nil {
+		t.Fatalf("premium web_first route plan returned error: %v", err)
+	}
+	if want := []string{imageRouteWeb, imageRouteCodex}; !reflect.DeepEqual(premiumRoutes, want) {
+		t.Fatalf("premium web_first route plan = %#v, want %#v", premiumRoutes, want)
+	}
+
+	for _, strategy := range []string{"codex_first", "codex_only"} {
+		s := &Server{cfg: Config{ImageRouteStrategy: strategy}}
+		err := s.checkImageAccess(freeIdentity, publicImageModel, "", "")
+		var se statusError
+		if !errors.As(err, &se) || se.status != 403 {
+			t.Fatalf("free %s access error = %#v, want 403 statusError", strategy, err)
+		}
+	}
+}
+
+func TestImageAccessRejectsHighResolutionDirectSizeForFreeIdentity(t *testing.T) {
+	s := &Server{cfg: Config{ImageRouteStrategy: "web_first"}}
+	freeIdentity := &Identity{ID: "free-user", Role: "user", AccountTier: "free"}
+	for _, size := range []string{"2048x2048", "3840x2160", "2160×3840", "2k", "4k"} {
+		err := s.checkImageAccess(freeIdentity, publicImageModel, size, "")
+		var se statusError
+		if !errors.As(err, &se) || se.status != 403 {
+			t.Fatalf("size %q access error = %#v, want 403 statusError", size, err)
+		}
+	}
+	if err := s.checkImageAccess(freeIdentity, publicImageModel, "", "2560x1440"); err == nil {
+		t.Fatal("direct high-resolution resolution should be rejected for free identity")
+	}
+	if err := s.checkImageAccess(freeIdentity, publicImageModel, "1536x1024", ""); err != nil {
+		t.Fatalf("1k-sized direct request should stay allowed, got %v", err)
+	}
+}
+
+func TestGenerateImageWithPoolForIdentityUsesImageGenerator(t *testing.T) {
+	s := &Server{}
+	called := false
+	s.imageGenerator = func(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+		called = true
+		if prompt != "prompt" || model != publicImageModel || size != "1:1" || resolution != "" || n != 1 {
+			t.Fatalf("imageGenerator args prompt=%q model=%q size=%q resolution=%q n=%d", prompt, model, size, resolution, n)
+		}
+		return []upstreamImageResult{{Bytes: []byte("ok")}}, nil
+	}
+	items, err := s.generateImageWithPoolForIdentity(context.Background(), &Identity{ID: "premium-user", CanUsePaidImageAccounts: true}, "prompt", publicImageModel, "1:1", "", nil)
+	if err != nil {
+		t.Fatalf("generate image with identity: %v", err)
+	}
+	if !called {
+		t.Fatal("imageGenerator was not called")
+	}
+	if len(items) != 1 || string(items[0].Bytes) != "ok" {
+		t.Fatalf("items = %#v, want generated image", items)
+	}
+}
+
+func TestTaskOwnerIdentityLoadsCurrentPaidImagePermission(t *testing.T) {
+	s := &Server{store: NewStore(t.TempDir())}
+	if err := s.store.SaveAuthKeys([]UserKey{{
+		ID:          "premium-user",
+		Role:        "user",
+		AccountTier: "premium",
+		Enabled:     true,
+	}}); err != nil {
+		t.Fatalf("save auth keys: %v", err)
+	}
+
+	id := s.taskOwnerIdentity("premium-user", "user")
+	if id.Role != "user" || id.AccountTier != "premium" || !id.CanUsePaidImageAccounts {
+		t.Fatalf("task owner identity = %#v, want current premium user permissions", id)
+	}
+
+	missing := s.taskOwnerIdentity("missing-user", "")
+	if missing.Role != "user" || missing.CanUsePaidImageAccounts {
+		t.Fatalf("missing task owner identity = %#v, want safe free user fallback", missing)
+	}
+
+	if err := s.store.SaveAuthKeys([]UserKey{{
+		ID:          "admin-key",
+		Role:        "user",
+		AccountTier: "free",
+		Enabled:     true,
+	}}); err != nil {
+		t.Fatalf("save downgraded admin auth key: %v", err)
+	}
+	downgraded := s.taskOwnerIdentity("admin-key", "admin")
+	if downgraded.Role != "user" || downgraded.AccountTier != "free" || downgraded.CanUsePaidImageAccounts {
+		t.Fatalf("downgraded task owner identity = %#v, want current free user permissions", downgraded)
+	}
+	if err := s.store.SaveAuthKeys([]UserKey{{
+		ID:          "disabled-premium",
+		Role:        "admin",
+		AccountTier: "premium",
+		Enabled:     false,
+	}}); err != nil {
+		t.Fatalf("save disabled premium auth key: %v", err)
+	}
+	disabled := s.taskOwnerIdentity("disabled-premium", "admin")
+	if disabled.Role != "user" || disabled.AccountTier != "free" || disabled.CanUsePaidImageAccounts || disabled.CanUseHighResolution {
+		t.Fatalf("disabled task owner identity = %#v, want safe free user fallback", disabled)
+	}
+	missingAdmin := s.taskOwnerIdentity("missing-admin-key", "admin")
+	if missingAdmin.Role != "user" || missingAdmin.CanUsePaidImageAccounts {
+		t.Fatalf("missing admin-key task owner identity = %#v, want safe free user fallback", missingAdmin)
+	}
+	root := s.taskOwnerIdentity("admin", "admin")
+	if !root.Root || !root.CanUsePaidImageAccounts || !root.CanUseHighResolution {
+		t.Fatalf("root task owner identity = %#v, want root admin fallback only for owner admin", root)
 	}
 }
 
@@ -131,3 +259,47 @@ func TestWebRouteAccountSelectionExcludesCodexAccounts(t *testing.T) {
 		t.Fatalf("picked account = %q, want web account", account.AccessToken)
 	}
 }
+
+func TestPreferPreviousImageRouteErrorKeepsWebFailureWhenCodexHasNoAccount(t *testing.T) {
+	webErr := routeErrString("POST /backend-api/sentinel/chat-requirements failed: status=401")
+	codexErr := routeErrString("no available codex Plus/Team/Pro account")
+
+	if got := preferPreviousImageRouteError(webErr, codexErr); got != webErr {
+		t.Fatalf("preferred error = %v, want original web error", got)
+	}
+	if got := preferPreviousImageRouteError(nil, codexErr); got != codexErr {
+		t.Fatalf("preferred error without previous = %v, want codex error", got)
+	}
+	nextErr := routeErrString("upstream status=503")
+	if got := preferPreviousImageRouteError(codexErr, nextErr); got != nextErr {
+		t.Fatalf("preferred non-codex error = %v, want current error", got)
+	}
+}
+
+func TestPotentialCodexImageAccountRequiresUsablePremiumCodexAccount(t *testing.T) {
+	s := &Server{store: NewStore(t.TempDir())}
+	if err := s.store.SaveAccounts([]Account{
+		{AccessToken: "web-plus", SourceType: "web", Type: "plus", Status: accountStatusNormal, Quota: 10},
+		{AccessToken: "codex-free", SourceType: "codex", Type: "free", Status: accountStatusNormal, Quota: 10},
+		{AccessToken: "codex-plus-no-refresh", SourceType: "codex", Type: "plus", Status: accountStatusNormal, Quota: 10},
+	}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+	if s.hasPotentialCodexImageAccount() {
+		t.Fatal("web, free codex, or codex without refresh_token accounts should not satisfy codex Plus/Team/Pro image fallback")
+	}
+
+	refreshToken := "refresh-token"
+	if err := s.store.SaveAccounts([]Account{
+		{AccessToken: "codex-plus", SourceType: "codex", Type: "plus", Status: accountStatusNormal, Quota: 10, RefreshToken: &refreshToken},
+	}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+	if !s.hasPotentialCodexImageAccount() {
+		t.Fatal("usable codex plus account should satisfy codex fallback")
+	}
+}
+
+type routeErrString string
+
+func (e routeErrString) Error() string { return string(e) }

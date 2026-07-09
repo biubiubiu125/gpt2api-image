@@ -92,14 +92,34 @@ func (s *Server) generateImageWithPool(ctx context.Context, prompt, model, size,
 	return s.generateImageWithPoolScoped(ctx, prompt, model, size, resolution, refs, newImageAccountAttemptScope(maxImageAccountFallbackAttempts))
 }
 
+func (s *Server) generateImageWithPoolForIdentity(ctx context.Context, id *Identity, prompt, model, size, resolution string, refs [][]byte) ([]upstreamImageResult, error) {
+	routes, err := s.imageRoutePlanForIdentity(id)
+	if err != nil {
+		return nil, err
+	}
+	if s.imageGenerator != nil {
+		return s.imageGenerator(ctx, prompt, model, size, resolution, refs, 1)
+	}
+	return s.generateImageWithPoolScopedRoutes(ctx, prompt, model, size, resolution, refs, newImageAccountAttemptScope(maxImageAccountFallbackAttempts), routes)
+}
+
 func (s *Server) generateImageWithPoolScoped(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, scope *imageAccountAttemptScope) ([]upstreamImageResult, error) {
+	return s.generateImageWithPoolScopedRoutes(ctx, prompt, model, size, resolution, refs, scope, s.imageRoutePlan())
+}
+
+func (s *Server) generateImageWithPoolScopedRoutes(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, scope *imageAccountAttemptScope, routes []string) ([]upstreamImageResult, error) {
+	requestedCodex := isCodexImageRequest(model, resolution)
 	model = normalizeImageModel(model)
-	routes := s.imageRoutePlan()
 	var lastErr error
+	var previousRouteErr error
 	for idx, route := range routes {
 		routeScope := scope
 		if idx > 0 {
 			routeScope = newImageAccountAttemptScope(maxImageAccountFallbackAttempts)
+		}
+		if idx > 0 && route == imageRouteCodex && previousRouteErr != nil && !requestedCodex && !s.hasPotentialCodexImageAccount() {
+			traceLogf(ctx, "│  └─ image route %s skipped: no available codex Plus/Team/Pro account; keep previous web error=%v", route, previousRouteErr)
+			break
 		}
 		routeModel := internalImageModelForRoute(model, route)
 		traceLogf(ctx, "├─ image route %s public_model=%s internal_model=%s", route, model, routeModel)
@@ -107,8 +127,11 @@ func (s *Server) generateImageWithPoolScoped(ctx context.Context, prompt, model,
 		if err == nil {
 			return items, nil
 		}
-		lastErr = err
+		lastErr = preferPreviousImageRouteError(previousRouteErr, err)
 		traceLogf(ctx, "│  └─ image route %s failed error=%v", route, err)
+		if previousRouteErr == nil {
+			previousRouteErr = err
+		}
 		if !shouldTryNextImageRoute(err, ctx.Err()) {
 			break
 		}
@@ -331,8 +354,23 @@ func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size
 	if s.imageGenerator != nil {
 		return s.imageGenerator(ctx, prompt, model, size, resolution, refs, n)
 	}
+	return s.generateImagesWithPoolRoutes(ctx, prompt, model, size, resolution, refs, n, s.imageRoutePlan())
+}
+
+func (s *Server) generateImagesWithPoolForIdentity(ctx context.Context, id *Identity, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+	routes, err := s.imageRoutePlanForIdentity(id)
+	if err != nil {
+		return nil, err
+	}
+	if s.imageGenerator != nil {
+		return s.imageGenerator(ctx, prompt, model, size, resolution, refs, n)
+	}
+	return s.generateImagesWithPoolRoutes(ctx, prompt, model, size, resolution, refs, n, routes)
+}
+
+func (s *Server) generateImagesWithPoolRoutes(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int, routes []string) ([]upstreamImageResult, error) {
 	if n <= 1 {
-		return s.generateImageWithPool(ctx, prompt, model, size, resolution, refs)
+		return s.generateImageWithPoolScopedRoutes(ctx, prompt, model, size, resolution, refs, newImageAccountAttemptScope(maxImageAccountFallbackAttempts), routes)
 	}
 	limit := s.cfg.ImageAccountConcurrency
 	if limit <= 0 {
@@ -358,7 +396,7 @@ func (s *Server) generateImagesWithPool(ctx context.Context, prompt, model, size
 			}
 			defer func() { <-sem }()
 			scope := newImageAccountAttemptScope(maxImageAccountFallbackAttempts)
-			items, err := s.generateImageWithPoolScoped(ctx, prompt, model, size, resolution, refs, scope)
+			items, err := s.generateImageWithPoolScopedRoutes(ctx, prompt, model, size, resolution, refs, scope, routes)
 			if err != nil {
 				errs[i] = err
 				return
@@ -412,6 +450,10 @@ func isNonSwallowableImageBatchError(err error) bool {
 
 func (s *Server) generateTaskImages(ctx context.Context, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
 	return s.generateImagesWithPool(ctx, prompt, model, size, resolution, refs, n)
+}
+
+func (s *Server) generateTaskImagesForIdentity(ctx context.Context, id *Identity, prompt, model, size, resolution string, refs [][]byte, n int) ([]upstreamImageResult, error) {
+	return s.generateImagesWithPoolForIdentity(ctx, id, prompt, model, size, resolution, refs, n)
 }
 
 func shouldRetryImageAccount(err error) bool {

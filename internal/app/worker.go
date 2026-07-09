@@ -109,7 +109,7 @@ func (s *Server) workerExpireLoop(ctx context.Context, interval time.Duration) {
 func (s *Server) runDBImageTask(parent context.Context, workerID string, ttl time.Duration, task DBImageTask) error {
 	deadline := time.Unix(0, int64(task.DeadlineTS*1e9))
 	timeout := time.Until(deadline)
-	identity := &Identity{ID: task.OwnerID, Role: task.OwnerRole}
+	identity := s.taskOwnerIdentity(task.OwnerID, task.OwnerRole)
 	endpoint := "/api/image-tasks/generations"
 	action := "async image generation"
 	if task.Mode == "edit" {
@@ -159,7 +159,15 @@ func (s *Server) runDBImageTask(parent context.Context, workerID string, ttl tim
 	if count < 1 {
 		count = 1
 	}
-	items, err := s.generateTaskImages(ctx, task.Prompt, task.Model, task.Size, task.Resolution, refs, count)
+	if err := s.checkImageAccess(identity, task.Model, task.Size, task.Resolution); err != nil {
+		if changed, _ := s.taskStore.FailTask(parent, task.ID, workerID, err.Error()); changed {
+			s.refundImage(identity, count)
+			s.cleanupTaskInputPaths(task.InputPaths)
+			s.logCallFailure(callID, endpoint, task.Model, action, err, map[string]any{"task_id": task.ID})
+		}
+		return err
+	}
+	items, err := s.generateTaskImagesForIdentity(ctx, identity, task.Prompt, task.Model, task.Size, task.Resolution, refs, count)
 	if err != nil {
 		if errors.Is(err, errImageAccountBusy) {
 			if changed, _ := s.taskStore.RequeueTask(parent, task.ID, workerID, time.Duration(s.cfg.ImageWorkerPollIntervalSecs+1)*time.Second); changed {

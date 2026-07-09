@@ -468,7 +468,7 @@ func (s *Server) createDBImageTask(ctx context.Context, id *Identity, req imageT
 	if err := s.checkContent(req.Prompt); err != nil {
 		return ImageTask{}, false, httpStatusError(400, "%s", err.Error())
 	}
-	if err := s.checkImageAccess(id, req.Model, req.Resolution); err != nil {
+	if err := s.checkImageAccess(id, req.Model, req.Size, req.Resolution); err != nil {
 		return ImageTask{}, false, err
 	}
 	taskID := imageTaskID(id.ID, req.ClientTaskID)
@@ -678,7 +678,7 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, 200, item)
 		return
 	}
-	if err := s.checkImageAccess(id, b.Model, b.Resolution); err != nil {
+	if err := s.checkImageAccess(id, b.Model, b.Size, b.Resolution); err != nil {
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/generations", b.Model, "文生图任务", err, nil)
@@ -720,7 +720,7 @@ func (s *Server) handleImageTaskGeneration(w http.ResponseWriter, r *http.Reques
 		defer cancel()
 		data := []map[string]any{}
 		savedRels := []string{}
-		items, err := s.generateImagesWithPool(ctx, b.Prompt, b.Model, b.Size, b.Resolution, nil, b.N)
+		items, err := s.generateImagesWithPoolForIdentity(ctx, identity, b.Prompt, b.Model, b.Size, b.Resolution, nil, b.N)
 		if err != nil {
 			if ctx.Err() != nil {
 				updated, updateErr := s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
@@ -854,7 +854,7 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, item)
 		return
 	}
-	if err := s.checkImageAccess(id, model, r.FormValue("resolution")); err != nil {
+	if err := s.checkImageAccess(id, model, r.FormValue("size"), r.FormValue("resolution")); err != nil {
 		t.Status = "error"
 		t.Error = err.Error()
 		s.logCallFailure(callID, "/api/image-tasks/edits", model, "图生图任务", err, nil)
@@ -925,7 +925,7 @@ func (s *Server) handleImageTaskEdit(w http.ResponseWriter, r *http.Request) {
 	go func(task ImageTask, identity *Identity) {
 		defer s.popTaskCancel(task.ID)
 		defer cancel()
-		items, err := s.generateImageWithPool(ctx, prompt, model, r.FormValue("size"), r.FormValue("resolution"), inputs)
+		items, err := s.generateImageWithPoolForIdentity(ctx, identity, prompt, model, r.FormValue("size"), r.FormValue("resolution"), inputs)
 		if err != nil {
 			if ctx.Err() != nil {
 				updated, updateErr := s.updateTaskStatus(task.ID, "canceled", "canceled", nil)
@@ -1275,7 +1275,7 @@ func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, i
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := s.checkImageAccess(id, model, strAny(b["resolution"], "")); err != nil {
+	if err := s.checkImageAccess(id, model, strAny(b["size"], ""), strAny(b["resolution"], "")); err != nil {
 		s.logCallFailure(callID, "/api/chat/stream", model, "聊天", err, map[string]any{"image": true})
 		writeErr(w, 403, err.Error())
 		return
@@ -1313,7 +1313,7 @@ func (s *Server) handleChatStreamImage(w http.ResponseWriter, r *http.Request, i
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.imageRequestTimeout())
 	defer cancel()
-	items, err := s.generateImagesWithPool(ctx, prompt, model, strAny(b["size"], ""), strAny(b["resolution"], ""), extractChatImages(b), 1)
+	items, err := s.generateImagesWithPoolForIdentity(ctx, id, prompt, model, strAny(b["size"], ""), strAny(b["resolution"], ""), extractChatImages(b), 1)
 	w.Header().Set("Content-Type", "text/event-stream")
 	cid := "conv_" + randID(8)
 	if err != nil {

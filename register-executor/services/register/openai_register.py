@@ -110,6 +110,56 @@ def _resolve_user_agent_client_hints(user_agent_value: object) -> dict[str, str]
     }
 
 
+def _browser_fingerprint(fingerprint: dict[str, str] | None = None) -> dict[str, str]:
+    return _complete_browser_fingerprint(fingerprint or DEFAULT_BROWSER_FINGERPRINT)
+
+
+def _header_fingerprint(headers: dict[str, str], fingerprint: dict[str, str] | None = None) -> dict[str, str]:
+    fp = _browser_fingerprint(fingerprint)
+    next_headers = dict(headers)
+    _set_case_insensitive_header(next_headers, "user-agent", fp["user_agent"])
+    _set_case_insensitive_header(next_headers, "sec-ch-ua", fp["sec_ch_ua"])
+    _set_case_insensitive_header(next_headers, "sec-ch-ua-full-version-list", fp["sec_ch_ua_full_version_list"])
+    _set_case_insensitive_header(next_headers, "sec-ch-ua-platform-version", f'"{fp["platform_version"]}"')
+    _set_case_insensitive_header(next_headers, "accept-language", fp["accept_language"])
+    return next_headers
+
+
+def _extract_chrome_version_from_user_agent(value: str) -> tuple[str, str]:
+    ua = str(value or "")
+    for marker in ("Chrome/", "Chromium/", "Edg/"):
+        if marker not in ua:
+            continue
+        tail = ua.split(marker, 1)[1]
+        version = tail.split(" ", 1)[0].strip()
+        major = version.split(".", 1)[0].strip()
+        if major.isdigit():
+            return major, version or f"{major}.0.0.0"
+    return "", ""
+
+
+def _fingerprint_with_user_agent(fingerprint: dict[str, str] | None, value: str) -> dict[str, str]:
+    ua = str(value or "").strip()
+    if not ua:
+        return _browser_fingerprint(fingerprint)
+    fp = _browser_fingerprint(fingerprint)
+    major, full_version = _extract_chrome_version_from_user_agent(ua)
+    major = major or fp["major"]
+    full_version = full_version or f"{major}.0.0.0"
+    return _complete_browser_fingerprint({
+        **fp,
+        "major": major,
+        "full_version": full_version,
+        "user_agent": ua,
+        "sec_ch_ua": _chrome_sec_ch_ua(major),
+        "sec_ch_ua_full_version_list": _chrome_sec_ch_ua_full_version_list(major, full_version),
+    })
+
+
+def _make_browser_fingerprint() -> dict[str, str]:
+    return _complete_browser_fingerprint(secrets.choice(REGISTER_BROWSER_PROFILES))
+
+
 def _saved_image_account_usable(item: dict | None) -> bool:
     if not isinstance(item, dict):
         return False
@@ -197,13 +247,76 @@ platform_oauth_client_id = "app_2SKx67EdpoN0G6j64rFvigXD"
 platform_oauth_redirect_uri = f"{platform_base}/auth/callback"
 platform_oauth_audience = "https://api.openai.com/v1"
 platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
-user_agent = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/145.0.0.0 Safari/537.36"
+REGISTER_BROWSER_PROFILES: tuple[dict[str, str], ...] = (
+    {
+        "impersonate": "chrome142",
+        "major": "142",
+        "full_version": "142.0.0.0",
+        "platform_version": "10.0.0",
+        "accept_language": "en-US,en;q=0.9",
+    },
+    {
+        "impersonate": "chrome136",
+        "major": "136",
+        "full_version": "136.0.0.0",
+        "platform_version": "10.0.0",
+        "accept_language": "en-US,en;q=0.9",
+    },
+    {
+        "impersonate": "chrome131",
+        "major": "131",
+        "full_version": "131.0.0.0",
+        "platform_version": "10.0.0",
+        "accept_language": "en-US,en;q=0.9",
+    },
 )
-sec_ch_ua = '"Google Chrome";v="145", "Not?A_Brand";v="8", "Chromium";v="145"'
-sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.0.0"'
+
+
+def _chrome_user_agent(major: str, full_version: str) -> str:
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{full_version} Safari/537.36"
+    )
+
+
+def _chrome_sec_ch_ua(major: str) -> str:
+    return f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not_A Brand";v="99"'
+
+
+def _chrome_sec_ch_ua_full_version_list(major: str, full_version: str) -> str:
+    return (
+        f'"Chromium";v="{full_version}", '
+        f'"Google Chrome";v="{full_version}", '
+        '"Not_A Brand";v="99.0.0.0"'
+    )
+
+
+def _complete_browser_fingerprint(profile: dict[str, str] | None) -> dict[str, str]:
+    source = dict(profile or {})
+    major = str(source.get("major") or "142").strip()
+    full_version = str(source.get("full_version") or f"{major}.0.0.0").strip()
+    return {
+        **source,
+        "major": major,
+        "full_version": full_version,
+        "user_agent": str(source.get("user_agent") or _chrome_user_agent(major, full_version)),
+        "sec_ch_ua": str(source.get("sec_ch_ua") or _chrome_sec_ch_ua(major)),
+        "sec_ch_ua_full_version_list": str(
+            source.get("sec_ch_ua_full_version_list") or _chrome_sec_ch_ua_full_version_list(major, full_version)
+        ),
+        "accept_language": str(source.get("accept_language") or "en-US,en;q=0.9"),
+        "platform_version": str(source.get("platform_version") or "10.0.0"),
+        "impersonate": str(source.get("impersonate") or "chrome"),
+    }
+
+
+DEFAULT_BROWSER_FINGERPRINT = _complete_browser_fingerprint(REGISTER_BROWSER_PROFILES[0])
+user_agent = (
+    DEFAULT_BROWSER_FINGERPRINT["user_agent"]
+)
+sec_ch_ua = DEFAULT_BROWSER_FINGERPRINT["sec_ch_ua"]
+sec_ch_ua_full_version_list = DEFAULT_BROWSER_FINGERPRINT["sec_ch_ua_full_version_list"]
 default_timeout = 30
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
@@ -624,10 +737,21 @@ def _set_oai_device_cookies(session: requests.Session, device_id: str) -> None:
             continue
 
 
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str, *, proxy: str = "") -> str:
+def build_sentinel_token(
+    session: requests.Session,
+    device_id: str,
+    flow: str,
+    *,
+    proxy: str = "",
+    user_agent_override: object = "",
+) -> str:
     """Return sentinel token header value."""
     _set_oai_device_cookies(session, device_id)
-    hints = _resolve_user_agent_client_hints(user_agent)
+    session_headers = getattr(session, "headers", {}) or {}
+    resolved_user_agent = _resolve_user_agent_override(user_agent_override) or str(
+        session_headers.get("User-Agent") or session_headers.get("user-agent") or user_agent
+    ).strip()
+    hints = _resolve_user_agent_client_hints(resolved_user_agent)
     sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(
         session,
         device_id,
@@ -640,14 +764,18 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str, *
     return sentinel_val
 
 
-def create_session(proxy: str = "") -> Any:
+def create_session(proxy: str = "", fingerprint: dict[str, str] | None = None) -> Any:
+    fp = _browser_fingerprint(fingerprint)
     kwargs = proxy_settings.build_session_kwargs(
         proxy=proxy,
         upstream=True,
         select_pool=False,
-        impersonate="chrome",
+        impersonate=fp["impersonate"],
+        verify=False,
     )
-    return requests.Session(**kwargs)
+    session = requests.Session(**kwargs)
+    session.headers.update({"user-agent": fp["user_agent"]})
+    return session
 
 
 def _check_task_control(stop_event: threading.Event | None = None, deadline: float | None = None) -> None:
@@ -774,6 +902,20 @@ def request_with_local_retry(
                 raise RegisterStopped("register_task_stopped")
             _check_task_control(stop_event, deadline)
     return None, last_error
+
+
+def is_register_proxy_connect_error(error: object) -> bool:
+    text = str(error or "").lower()
+    if not text:
+        return False
+    return (
+        "connect tunnel failed" in text
+        or "curl: (56)" in text
+        or "response 0" in text
+        or "proxy connect" in text
+        or "tunnel failed" in text
+        or "connect failed" in text and "proxy" in text
+    )
 
 
 def extract_oauth_callback_params_from_url(url: str) -> dict[str, str] | None:
@@ -1141,7 +1283,8 @@ class PlatformRegistrar:
         run_id: str = "",
     ) -> None:
         self.proxy = str(proxy or "").strip()
-        self.session = create_session(self.proxy)
+        self.fingerprint = _make_browser_fingerprint()
+        self.session = create_session(self.proxy, self.fingerprint)
         self.stop_event = stop_event
         self.deadline = deadline
         self.run_id = str(run_id or "")
@@ -1155,6 +1298,15 @@ class PlatformRegistrar:
 
     def close(self) -> None:
         self.session.close()
+
+    def _reset_session(self, *, rotate_fingerprint: bool = False) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        if rotate_fingerprint:
+            self.fingerprint = _make_browser_fingerprint()
+        self.session = create_session(self.proxy, self.fingerprint)
 
     def _request(self, session: requests.Session, method: str, url: str, **kwargs) -> tuple[object | None, str]:
         kwargs.pop("stop_event", None)
@@ -1173,13 +1325,13 @@ class PlatformRegistrar:
         _check_run_active(self.run_id)
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
-        headers = dict(navigate_headers)
+        headers = _header_fingerprint(navigate_headers, self.fingerprint)
         if referer:
             headers["referer"] = referer
         return headers
 
     def _json_headers(self, referer: str, device_id: str = "") -> dict[str, str]:
-        headers = dict(common_headers)
+        headers = _header_fingerprint(common_headers, self.fingerprint)
         headers["referer"] = referer
         headers["oai-device-id"] = str(device_id or self.device_id)
         headers.update(_make_trace_headers())
@@ -1293,6 +1445,19 @@ class PlatformRegistrar:
             user_agent_override=self._sentinel_user_agent(self.session),
         )
         resp, error = self._request(self.session, "get", target_url, headers=headers, allow_redirects=True, stop_event=self.stop_event, deadline=self.deadline)
+        if resp is None and is_register_proxy_connect_error(error):
+            step(index, "注册代理 CONNECT 失败，已重建 session 重试 platform authorize", "yellow")
+            self._reset_session()
+            _set_oai_device_cookies(self.session, self.device_id)
+            headers = _build_request_headers(
+                self._navigate_headers(f"{platform_base}/"),
+                target_url,
+                self.proxy,
+                user_agent_override=self._sentinel_user_agent(self.session),
+            )
+            resp, error = self._request(self.session, "get", target_url, headers=headers, allow_redirects=True, stop_event=self.stop_event, deadline=self.deadline)
+            if resp is None and is_register_proxy_connect_error(error):
+                raise RuntimeError(f"register_proxy_connect_failed: {error}")
         if _is_cloudflare_challenge(resp):
             raise RuntimeError(_cloudflare_block_message(resp))
         if resp is None or resp.status_code != 200:
@@ -1531,7 +1696,7 @@ class PlatformRegistrar:
     def _login_and_exchange_tokens(self, email: str, password: str, mailbox: dict, index: int) -> dict:
         self._check_task_control()
         step(index, "登录账号并重新交换 token")
-        login_session = create_session(self.proxy)
+        login_session = create_session(self.proxy, self.fingerprint)
         login_device_id = str(uuid.uuid4())
         _set_oai_device_cookies(login_session, login_device_id)
         code_verifier, code_challenge = _generate_pkce()
@@ -1815,11 +1980,11 @@ class PlatformRegistrar:
                                 raise RegisterStopped("register_task_stopped")
                         else:
                             time.sleep(wait_seconds)
-                    try:
-                        self.session.close()
-                    except Exception:
-                        pass
-                    self.session = create_session(self.proxy)
+                    reset_session = getattr(self, "_reset_session", None)
+                    if callable(reset_session):
+                        reset_session()
+                    else:
+                        self.session = create_session(self.proxy, getattr(self, "fingerprint", None))
                     self.device_id = str(uuid.uuid4())
                     self.code_verifier = ""
                     self.platform_auth_state = ""

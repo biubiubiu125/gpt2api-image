@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 import tempfile
 import threading
@@ -444,6 +445,113 @@ class RegisterStatsTest(unittest.TestCase):
         }
 
         self.assertFalse(register_service._image_account_usable(account, {}))
+
+
+    def test_register_proxy_connect_failure_has_dedicated_reason(self) -> None:
+        err = "Failed to perform, curl: (56) CONNECT tunnel failed, response 0"
+
+        self.assertTrue(openai_register.is_register_proxy_connect_error(err))
+        self.assertEqual(openai_register.classify_register_failure(err), "register_proxy_connect_failed")
+
+    def test_create_session_uses_browser_fingerprint_proxy_and_verify_false(self) -> None:
+        captured: dict = {}
+        original_session = openai_register.requests.Session
+
+        class FakeSession:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+                self.headers = {}
+
+        try:
+            openai_register.requests.Session = FakeSession
+            fp = openai_register._complete_browser_fingerprint({
+                "impersonate": "chrome136",
+                "major": "136",
+                "full_version": "136.0.0.0",
+            })
+            session = openai_register.create_session("http://proxy.example:8080", fp)
+        finally:
+            openai_register.requests.Session = original_session
+
+        self.assertEqual(captured["proxy"], "http://proxy.example:8080")
+        self.assertEqual(captured["impersonate"], "chrome136")
+        self.assertFalse(captured["verify"])
+        self.assertEqual(session.headers["user-agent"], fp["user_agent"])
+
+    def test_platform_authorize_rebuilds_session_once_on_proxy_connect_failure(self) -> None:
+        calls = {"count": 0, "reset": 0}
+
+        class FakeResponse:
+            status_code = 200
+            url = "https://auth.openai.com/create-account"
+
+            def json(self) -> dict:
+                return {}
+
+        registrar = openai_register.PlatformRegistrar("http://proxy.example:8080")
+        registrar._sentinel_user_agent = lambda session=None: registrar.fingerprint["user_agent"]  # type: ignore[method-assign]
+        original_request = registrar._request
+        original_reset = registrar._reset_session
+
+        def fake_request(session, method, url, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return None, "Failed to perform, curl: (56) CONNECT tunnel failed, response 0"
+            return FakeResponse(), ""
+
+        def fake_reset(*, rotate_fingerprint: bool = False):
+            calls["reset"] += 1
+
+        try:
+            registrar._request = fake_request  # type: ignore[method-assign]
+            registrar._reset_session = fake_reset  # type: ignore[method-assign]
+            registrar._platform_authorize("user@example.com", 1)
+        finally:
+            registrar._request = original_request  # type: ignore[method-assign]
+            registrar._reset_session = original_reset  # type: ignore[method-assign]
+            registrar.close()
+
+        self.assertEqual(calls, {"count": 2, "reset": 1})
+
+
+    def test_build_sentinel_token_uses_session_user_agent(self) -> None:
+        captured: dict = {}
+        original_builder = openai_register._build_sentinel_token_tuple
+        fp = openai_register._complete_browser_fingerprint({
+            "impersonate": "chrome136",
+            "major": "136",
+            "full_version": "136.0.0.0",
+        })
+        session = openai_register.create_session("", fp)
+
+        def fake_builder(session_arg, device_id, flow, **kwargs):
+            captured.update(kwargs)
+            return "sentinel-token", ""
+
+        try:
+            openai_register._build_sentinel_token_tuple = fake_builder
+            token = openai_register.build_sentinel_token(session, "device-id", "authorize_continue")
+        finally:
+            openai_register._build_sentinel_token_tuple = original_builder
+            session.close()
+
+        self.assertEqual(token, "sentinel-token")
+        self.assertEqual(captured["user_agent"], fp["user_agent"])
+        self.assertIn('"136"', captured["sec_ch_ua"])
+        self.assertIn('"136.0.0.0"', captured["sec_ch_ua_full_version_list"])
+
+    def test_login_fallback_session_uses_registrar_fingerprint(self) -> None:
+        source = inspect.getsource(openai_register.PlatformRegistrar._login_and_exchange_tokens)
+
+        self.assertIn("create_session(self.proxy, self.fingerprint)", source)
+        self.assertNotIn("login_session = create_session(self.proxy)\n", source)
+
+    def test_mailbox_retry_rebuilds_session_with_registrar_fingerprint(self) -> None:
+        source = inspect.getsource(openai_register.PlatformRegistrar.register)
+
+        self.assertIn("reset_session = getattr(self, \"_reset_session\", None)", source)
+        self.assertIn("create_session(self.proxy, getattr(self, \"fingerprint\", None))", source)
+        self.assertNotIn("self.session = create_session(self.proxy)\n", source)
 
 
 if __name__ == "__main__":

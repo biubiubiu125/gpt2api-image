@@ -47,6 +47,15 @@ def classify_register_failure(error: object) -> str:
         return "task_timeout"
     if "register_proxy_unavailable" in text:
         return "register_proxy_unavailable"
+    if (
+        "register_proxy_connect_failed" in text
+        or "connect tunnel failed" in text
+        or "curl: (56)" in text
+        or "response 0" in text
+        or "proxy connect" in text
+        or "tunnel failed" in text
+    ):
+        return "register_proxy_connect_failed"
     if "create mailbox" in text or "mailbox" in text and "address" in text:
         return "mail_create_failed"
     if "mail_code_timeout" in text or "wait code" in text or "验证码超时" in text:

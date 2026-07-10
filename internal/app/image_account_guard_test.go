@@ -2,7 +2,11 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,25 +15,32 @@ import (
 func newImageAccountGuardTestServer(t *testing.T) *Server {
 	t.Helper()
 	s := &Server{
-		cfg:   Config{ImageAccountConcurrency: 3},
+		cfg: Config{
+			ImageAccountConcurrency:           3,
+			AutoRemoveInvalidAccounts:         true,
+			AutoRemoveRateLimitedAccounts:     true,
+			AutoDeleteQuotaZeroAccounts:       true,
+			AutoDeleteUploadQuotaZeroAccounts: true,
+			AutoRefreshDeleteFailedAccounts:   true,
+		},
 		store: NewStore(t.TempDir()),
 	}
 	s.accountPool = newAccountPool(&s.cfg)
 	return s
 }
 
-func TestImageAccountAttemptScopeCapsAtFive(t *testing.T) {
-	scope := newImageAccountAttemptScope(maxImageAccountFallbackAttempts)
-	for i, token := range []string{"a", "b", "c", "d", "e"} {
+func TestImageAccountAttemptScopeCapsAtThree(t *testing.T) {
+	scope := newImageAccountAttemptScope(defaultImageAccountFallbackAttempts)
+	for i, token := range []string{"a", "b", "c"} {
 		if !scope.reserve(token) {
 			t.Fatalf("reserve %d should pass", i+1)
 		}
 	}
-	if scope.reserve("f") {
-		t.Fatalf("sixth image account attempt should be rejected")
+	if scope.reserve("d") {
+		t.Fatalf("fourth image account attempt should be rejected")
 	}
-	if got := scope.usedCount(); got != maxImageAccountFallbackAttempts {
-		t.Fatalf("used attempts = %d, want %d", got, maxImageAccountFallbackAttempts)
+	if got := scope.usedCount(); got != defaultImageAccountFallbackAttempts {
+		t.Fatalf("used attempts = %d, want %d", got, defaultImageAccountFallbackAttempts)
 	}
 }
 
@@ -263,6 +274,20 @@ func TestRetryableNonCredentialImageFailuresKeepAccount(t *testing.T) {
 	}
 }
 
+func TestImageFailureDeletesUpstream403AtConfiguredThreshold(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	s.cfg.Delete403Consecutive = 1
+	if err := s.store.SaveAccounts([]Account{{AccessToken: "tok", Status: accountStatusNormal, Quota: 5}}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+
+	s.markAccountFailure("tok", errors.New("turnstile required"), true)
+
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("suspicious 403 should delete account at configured threshold, got %#v", got)
+	}
+}
+
 func TestCodexSetupInvalidRefreshTokenRetriesAndDeletesAccounts(t *testing.T) {
 	s := newImageAccountGuardTestServer(t)
 	if err := s.store.SaveAccounts([]Account{
@@ -305,6 +330,186 @@ func TestRegisterRemovalDeletesUnknownQuotaAccounts(t *testing.T) {
 	}
 	if got := s.store.LoadAccounts(); len(got) != 0 {
 		t.Fatalf("unknown quota account should be removed, got %#v", got)
+	}
+}
+
+func TestCleanupRespectsAutoDeleteQuotaZeroAccountsSwitch(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	s.cfg.AutoDeleteQuotaZeroAccounts = false
+	if err := s.store.SaveAccounts([]Account{
+		{AccessToken: "zero", Status: accountStatusNormal, Quota: 0},
+		{AccessToken: "unknown", Status: accountStatusNormal, ImageQuotaUnknown: true, Quota: 10},
+	}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+
+	if changed := s.cleanupUnusableImageAccounts(); changed != 0 {
+		t.Fatalf("cleanup changed = %d, want 0 when quota-zero cleanup disabled", changed)
+	}
+	if got := s.store.LoadAccounts(); len(got) != 2 {
+		t.Fatalf("quota-zero accounts should be kept while switch disabled, got %#v", got)
+	}
+
+	s.cfg.AutoDeleteQuotaZeroAccounts = true
+	if changed := s.cleanupUnusableImageAccounts(); changed != 2 {
+		t.Fatalf("cleanup changed = %d, want 2 after enabling quota-zero cleanup", changed)
+	}
+	if got := s.store.LoadAccounts(); len(got) != 0 {
+		t.Fatalf("quota-zero accounts should be removed after enabling switch, got %#v", got)
+	}
+}
+
+func TestEffectiveAvailableHonorsLastRefreshErrorSwitch(t *testing.T) {
+	errText := "refresh failed"
+	s := newImageAccountGuardTestServer(t)
+	s.cfg.AutoRefreshDeleteFailedAccounts = true
+	if err := s.store.SaveAccounts([]Account{{AccessToken: "tok", Status: accountStatusNormal, Quota: 5, UploadQuotaUnknown: true, LastRefreshError: &errText}}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+
+	if got := s.effectiveAvailableImageAccounts(); got != 0 {
+		t.Fatalf("effective available = %d, want 0 when refresh-failed cleanup enabled", got)
+	}
+	s.cfg.AutoRefreshDeleteFailedAccounts = false
+	if got := s.effectiveAvailableImageAccounts(); got != 1 {
+		t.Fatalf("effective available = %d, want 1 when refresh-failed cleanup disabled", got)
+	}
+}
+
+func TestNextAutoRefreshTokensRotatesBatches(t *testing.T) {
+	s := newImageAccountGuardTestServer(t)
+	accounts := []Account{
+		{AccessToken: "a"},
+		{AccessToken: "b"},
+		{AccessToken: "c"},
+		{AccessToken: "d"},
+	}
+
+	if got := strings.Join(s.nextAutoRefreshTokens(accounts, 2), ","); got != "a,b" {
+		t.Fatalf("first batch = %q, want a,b", got)
+	}
+	if got := strings.Join(s.nextAutoRefreshTokens(accounts, 2), ","); got != "c,d" {
+		t.Fatalf("second batch = %q, want c,d", got)
+	}
+	if got := strings.Join(s.nextAutoRefreshTokens(accounts, 2), ","); got != "a,b" {
+		t.Fatalf("third batch = %q, want a,b", got)
+	}
+}
+
+func TestReloadConfigFromDiskPreservesSavedRuntimeSettings(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "config.json")
+	if err := writeJSONFile(configFile, map[string]any{
+		"auth-key":                  "safe-auth-key",
+		"base_url":                  "https://saved.example",
+		"image_route_strategy":      "codex_only",
+		"image_account_concurrency": 7,
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "env-safe-auth-key")
+	t.Setenv("GPT2API_IMAGE_ROUTE_STRATEGY", "web_first")
+
+	s := &Server{root: dir, configFile: configFile, accountPool: newAccountPool(&Config{})}
+	if err := s.reloadConfigFromDisk(); err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if got := s.cfg.ImageRouteStrategy; got != "codex_only" {
+		t.Fatalf("image_route_strategy = %q, want saved value codex_only", got)
+	}
+	if got := s.accountPool.cfg.ImageAccountConcurrency; got != 7 {
+		t.Fatalf("account pool concurrency = %d, want 7", got)
+	}
+}
+
+func TestLoadRuntimeConfigLetsSavedSettingsOverrideComposeDefaults(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "config.json")
+	if err := writeJSONFile(configFile, map[string]any{
+		"auth-key":             "safe-auth-key",
+		"base_url":             "https://saved.example",
+		"image_route_strategy": "codex_only",
+		"upstream_transport":   "curl-impersonate",
+		"log_request_text":     true,
+	}); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("GPT2API_IMAGE_AUTH_KEY", "env-safe-auth-key")
+	t.Setenv("GPT2API_IMAGE_BASE_URL", "https://env.example")
+	t.Setenv("GPT2API_IMAGE_ROUTE_STRATEGY", "web_first")
+	t.Setenv("GPT2API_IMAGE_UPSTREAM_TRANSPORT", "tls-client")
+	t.Setenv("GPT2API_IMAGE_LOG_REQUEST_TEXT", "0")
+
+	cfg, err := loadRuntimeConfig(configFile)
+	if err != nil {
+		t.Fatalf("load runtime config: %v", err)
+	}
+	if cfg.BaseURL != "https://saved.example" {
+		t.Fatalf("base_url = %q, want saved value", cfg.BaseURL)
+	}
+	if cfg.ImageRouteStrategy != "codex_only" {
+		t.Fatalf("image_route_strategy = %q, want saved value", cfg.ImageRouteStrategy)
+	}
+	if cfg.UpstreamTransport != "curl-impersonate" {
+		t.Fatalf("upstream_transport = %q, want saved value", cfg.UpstreamTransport)
+	}
+	if !cfg.LogRequestText {
+		t.Fatalf("log_request_text = false, want saved true")
+	}
+}
+
+func TestCleanupAccountsTriggersAutoRefillWhenEffectiveAvailableBelowMin(t *testing.T) {
+	startPayloads := []map[string]any{}
+	executor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Register-Internal-Key"); got != "internal-key" {
+			t.Fatalf("internal key header = %q, want internal-key", got)
+		}
+		switch r.URL.Path {
+		case "/api/register":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"register": map[string]any{
+					"auto_refill": map[string]any{
+						"enabled":       true,
+						"min_available": 2,
+						"batch_total":   5,
+					},
+				},
+			})
+		case "/api/register/start-auto-refill":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode start-auto-refill payload: %v", err)
+			}
+			startPayloads = append(startPayloads, payload)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer executor.Close()
+
+	s := newImageAccountGuardTestServer(t)
+	s.cfg.RegisterExecutorURL = executor.URL
+	s.cfg.RegisterInternalKey = "internal-key"
+	s.cfg.AutoRefillUseEffectiveAvailable = true
+	if err := s.store.SaveAccounts([]Account{{AccessToken: "zero", Status: accountStatusNormal, Quota: 0}}); err != nil {
+		t.Fatalf("save accounts: %v", err)
+	}
+
+	if changed := s.cleanupAccountsAndMaybeRefill("unit_test_cleanup"); changed != 1 {
+		t.Fatalf("cleanup changed = %d, want 1", changed)
+	}
+	if len(startPayloads) != 1 {
+		t.Fatalf("start-auto-refill calls = %d, want 1", len(startPayloads))
+	}
+	if got := intAny(startPayloads[0]["batch_total"], 0); got != 5 {
+		t.Fatalf("batch_total = %d, want 5", got)
+	}
+	if got := intAny(startPayloads[0]["effective_available"], -1); got != 0 {
+		t.Fatalf("effective_available = %d, want 0", got)
+	}
+	if got := strAny(startPayloads[0]["reason"], ""); got != "unit_test_cleanup" {
+		t.Fatalf("reason = %q, want unit_test_cleanup", got)
 	}
 }
 
@@ -399,6 +604,7 @@ func TestStalePendingRefreshValidationIsGloballyCleaned(t *testing.T) {
 
 func TestExistingValidatedAccountKeepsRuntimeStateWhenReimported(t *testing.T) {
 	s := newImageAccountGuardTestServer(t)
+	s.cfg.AutoRefreshDeleteFailedAccounts = false
 	limitedAt := "2026-01-01T00:00:00Z"
 	resetAt := "2026-01-01T01:00:00Z"
 	if err := s.store.SaveAccounts([]Account{{

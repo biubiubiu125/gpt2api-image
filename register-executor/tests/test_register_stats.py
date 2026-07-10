@@ -394,6 +394,57 @@ class RegisterStatsTest(unittest.TestCase):
         self.assertEqual(stats["failure_reasons"], {"account_delete_failed": 1})
         self.assertEqual(deleted, [["tok"]])
 
+    def test_pool_metrics_fetches_register_settings_once(self) -> None:
+        settings_calls = 0
+        original_list_accounts = register_service.account_service.list_accounts
+        original_get_settings = register_service.account_service.get_settings
+        try:
+            register_service.account_service.list_accounts = lambda: [
+                {"access_token": "tok-1", "status": "正常", "quota": 1},
+                {"access_token": "tok-2", "status": "正常", "quota": 2},
+            ]
+
+            def fake_get_settings() -> dict:
+                nonlocal settings_calls
+                settings_calls += 1
+                return {
+                    "delete_403_consecutive": 2,
+                    "delete_timeout_consecutive": 2,
+                    "auto_refresh_delete_failed_accounts": True,
+                }
+
+            register_service.account_service.get_settings = fake_get_settings
+            with tempfile.TemporaryDirectory() as temp_dir:
+                service = RegisterService(Path(temp_dir) / "register.json")
+                metrics = service._pool_metrics()
+        finally:
+            register_service.account_service.list_accounts = original_list_accounts
+            register_service.account_service.get_settings = original_get_settings
+
+        self.assertEqual(metrics, {"current_quota": 3, "current_available": 2})
+        self.assertEqual(settings_calls, 1)
+
+    def test_image_account_usable_honors_refresh_failed_switch(self) -> None:
+        account = {
+            "access_token": "tok",
+            "status": "正常",
+            "quota": 1,
+            "last_refresh_error": "refresh failed",
+        }
+
+        self.assertFalse(register_service._image_account_usable(account, {"auto_refresh_delete_failed_accounts": True}))
+        self.assertTrue(register_service._image_account_usable(account, {"auto_refresh_delete_failed_accounts": False}))
+
+    def test_image_account_usable_treats_known_zero_upload_quota_as_unusable(self) -> None:
+        account = {
+            "access_token": "tok",
+            "status": "正常",
+            "quota": 1,
+            "upload_quota": 0,
+        }
+
+        self.assertFalse(register_service._image_account_usable(account, {}))
+
 
 if __name__ == "__main__":
     unittest.main()

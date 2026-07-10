@@ -33,6 +33,13 @@ class OutlookPoolTestRequest(BaseModel):
     limit: int = 5
 
 
+class AutoRefillStartRequest(BaseModel):
+    batch_total: int | None = None
+    reason: str | None = None
+    effective_available: int | None = None
+    min_available: int | None = None
+
+
 class YYDSDomainBlacklistRequest(BaseModel):
     domain: str | None = None
     domains: list[str] = Field(default_factory=list)
@@ -93,6 +100,22 @@ def start_register(x_register_internal_key: str | None = Header(default=None), a
     _require_internal(x_register_internal_key, authorization)
     try:
         return {"register": register_service.start()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/register/start-auto-refill")
+def start_auto_refill_register(body: AutoRefillStartRequest, x_register_internal_key: str | None = Header(default=None), authorization: str | None = Header(default=None)):
+    _require_internal(x_register_internal_key, authorization)
+    cfg = register_service.get(redact=False)
+    auto_refill = cfg.get("auto_refill") if isinstance(cfg.get("auto_refill"), dict) else {}
+    batch_total = max(1, int(body.batch_total or auto_refill.get("batch_total") or 100))
+    trigger_log = (
+        f"自动补号即时触发：原因={body.reason or 'account_cleanup'}，"
+        f"当前有效账号={body.effective_available}，阈值={body.min_available}，本轮注册={batch_total}"
+    )
+    try:
+        return {"register": register_service.start_auto_refill(batch_total, trigger_log=trigger_log)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

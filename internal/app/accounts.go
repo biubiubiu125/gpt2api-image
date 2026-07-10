@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -535,6 +536,8 @@ func mergeRefreshedAccountInfo(dst *Account, src Account) {
 	dst.UploadLimitResetAt = uploadLimitResetAt
 	dst.UploadLimitFeatureName = uploadLimitFeatureName
 	dst.RefreshValidationPending = false
+	dst.LastRefreshError = nil
+	dst.LastRefreshErrorAt = nil
 	if refreshedHasImageQuotaSignal(src) {
 		dst.Status = src.Status
 		dst.ImageQuotaUnknown = src.ImageQuotaUnknown
@@ -616,6 +619,7 @@ func (s *Server) refreshAccountInfos(parent context.Context, tokens []string, de
 		cancel()
 		if err != nil {
 			errs = append(errs, map[string]any{"token": a.AccessToken, "error": err.Error()})
+			s.markAccountRefreshFailure(a.AccessToken, err)
 		}
 	}
 	if len(updates) > 0 {
@@ -645,7 +649,10 @@ func (s *Server) cleanupRefreshedAccountState(tokens []string, errs []map[string
 		return 0, 0
 	}
 	removed := s.removeRegisterUnusableAccounts(tokens, errs)
-	cleanupRemoved := s.cleanupUnusableImageAccounts()
+	cleanupRemoved := s.cleanupAccounts()
+	if (removed > 0 || cleanupRemoved > 0) && s.cfg.AutoRefreshTriggerRefill {
+		s.triggerAutoRefillIfNeeded("account_refresh")
+	}
 	return removed, cleanupRemoved
 }
 
@@ -682,6 +689,30 @@ func (s *Server) handleAccountsRefresh(w http.ResponseWriter, r *http.Request) {
 		s.logSvc.add("account", "刷新账号", map[string]any{"refreshed": refreshed, "errors": len(errs), "removed_unusable": removedUnusable, "cleanup_removed": cleanupRemoved, "emails": accountEmailsForRefreshLog(before, accounts, tokens)})
 	}
 	writeJSON(w, 200, map[string]any{"refreshed": refreshed, "errors": errs, "removed_unusable": removedUnusable, "cleanup_removed": cleanupRemoved, "items": accounts})
+}
+
+func (s *Server) markAccountRefreshFailure(token string, err error) {
+	token = strings.TrimSpace(token)
+	if token == "" || err == nil {
+		return
+	}
+	now := nowISO()
+	msg := truncateText(err.Error(), 500)
+	if saveErr := s.store.UpdateAccounts(func(accounts []Account) []Account {
+		for i := range accounts {
+			if accounts[i].AccessToken != token {
+				continue
+			}
+			accounts[i].LastRefreshError = &msg
+			accounts[i].LastRefreshErrorAt = &now
+			accounts[i].LastError = &msg
+			accounts[i].LastErrorAt = &now
+			break
+		}
+		return accounts
+	}); saveErr != nil {
+		log.Printf("[account-refresh] failed to save refresh failure state: %v", saveErr)
+	}
 }
 
 func accountEmailsForRefreshLog(before, after []Account, tokens []string) []string {

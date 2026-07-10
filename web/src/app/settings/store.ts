@@ -29,8 +29,21 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_poll_interval_secs: Number(config.image_poll_interval_secs || 4),
     image_poll_initial_wait_secs: Number(config.image_poll_initial_wait_secs || 0),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
-    auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
-    auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
+    image_account_fallback_attempts: Number(config.image_account_fallback_attempts || 3),
+    auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts ?? true),
+    auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts ?? true),
+    auto_delete_quota_zero_accounts: Boolean(config.auto_delete_quota_zero_accounts ?? true),
+    auto_delete_upload_quota_zero_accounts: Boolean(config.auto_delete_upload_quota_zero_accounts ?? true),
+    delete_403_consecutive: Number(config.delete_403_consecutive || 2),
+    delete_timeout_consecutive: Number(config.delete_timeout_consecutive || 2),
+    auto_refresh_accounts_enabled: Boolean(config.auto_refresh_accounts_enabled ?? true),
+    auto_refresh_accounts_interval_minutes: Number(config.auto_refresh_accounts_interval_minutes || 60),
+    auto_refresh_accounts_batch_size: Number(config.auto_refresh_accounts_batch_size || 0),
+    auto_refresh_delete_failed_accounts: Boolean(config.auto_refresh_delete_failed_accounts ?? true),
+    auto_refresh_trigger_refill: Boolean(config.auto_refresh_trigger_refill ?? true),
+    auto_cleanup_accounts_enabled: Boolean(config.auto_cleanup_accounts_enabled ?? true),
+    auto_cleanup_accounts_interval_seconds: Number(config.auto_cleanup_accounts_interval_seconds || 60),
+    auto_refill_use_effective_available: Boolean(config.auto_refill_use_effective_available ?? true),
     log_levels: Array.isArray(config.log_levels) ? config.log_levels : [],
     proxy: typeof config.proxy === "string" ? config.proxy : "",
     image_route_strategy: String(config.image_route_strategy || "web_first"),
@@ -140,8 +153,21 @@ type SettingsStore = {
   setImagePollIntervalSecs: (value: string) => void;
   setImagePollInitialWaitSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
+  setImageAccountFallbackAttempts: (value: string) => void;
   setAutoRemoveInvalidAccounts: (value: boolean) => void;
   setAutoRemoveRateLimitedAccounts: (value: boolean) => void;
+  setAutoDeleteQuotaZeroAccounts: (value: boolean) => void;
+  setAutoDeleteUploadQuotaZeroAccounts: (value: boolean) => void;
+  setDelete403Consecutive: (value: string) => void;
+  setDeleteTimeoutConsecutive: (value: string) => void;
+  setAutoRefreshAccountsEnabled: (value: boolean) => void;
+  setAutoRefreshAccountsIntervalMinutes: (value: string) => void;
+  setAutoRefreshAccountsBatchSize: (value: string) => void;
+  setAutoRefreshDeleteFailedAccounts: (value: boolean) => void;
+  setAutoRefreshTriggerRefill: (value: boolean) => void;
+  setAutoCleanupAccountsEnabled: (value: boolean) => void;
+  setAutoCleanupAccountsIntervalSeconds: (value: string) => void;
+  setAutoRefillUseEffectiveAvailable: (value: boolean) => void;
   setLogLevel: (level: string, enabled: boolean) => void;
   setProxy: (value: string) => void;
   setImageRouteStrategy: (value: string) => void;
@@ -225,8 +251,21 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       image_poll_interval_secs: Math.max(1, Number(config.image_poll_interval_secs) || 4),
       image_poll_initial_wait_secs: Math.max(0, Number(config.image_poll_initial_wait_secs) || 0),
       image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
-      auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
-      auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
+      image_account_fallback_attempts: Math.max(1, Number(config.image_account_fallback_attempts) || 3),
+      auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts ?? true),
+      auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts ?? true),
+      auto_delete_quota_zero_accounts: Boolean(config.auto_delete_quota_zero_accounts ?? true),
+      auto_delete_upload_quota_zero_accounts: Boolean(config.auto_delete_upload_quota_zero_accounts ?? true),
+      delete_403_consecutive: Math.max(1, Number(config.delete_403_consecutive) || 2),
+      delete_timeout_consecutive: Math.max(1, Number(config.delete_timeout_consecutive) || 2),
+      auto_refresh_accounts_enabled: Boolean(config.auto_refresh_accounts_enabled ?? true),
+      auto_refresh_accounts_interval_minutes: Math.max(1, Number(config.auto_refresh_accounts_interval_minutes) || 60),
+      auto_refresh_accounts_batch_size: Math.max(0, Number(config.auto_refresh_accounts_batch_size) || 0),
+      auto_refresh_delete_failed_accounts: Boolean(config.auto_refresh_delete_failed_accounts ?? true),
+      auto_refresh_trigger_refill: Boolean(config.auto_refresh_trigger_refill ?? true),
+      auto_cleanup_accounts_enabled: Boolean(config.auto_cleanup_accounts_enabled ?? true),
+      auto_cleanup_accounts_interval_seconds: Math.max(10, Number(config.auto_cleanup_accounts_interval_seconds) || 60),
+      auto_refill_use_effective_available: Boolean(config.auto_refill_use_effective_available ?? true),
       proxy: String(config.proxy || "").trim(),
       image_route_strategy: String(config.image_route_strategy || "web_first").trim(),
       base_url: String(config.base_url || "").trim(),
@@ -275,11 +314,50 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setImageAccountConcurrency: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_account_concurrency: value }, isDirty: true } : {});
   },
+  setImageAccountFallbackAttempts: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_account_fallback_attempts: value }, isDirty: true } : {});
+  },
   setAutoRemoveInvalidAccounts: (value) => {
     set((state) => state.config ? { config: { ...state.config, auto_remove_invalid_accounts: value }, isDirty: true } : {});
   },
   setAutoRemoveRateLimitedAccounts: (value) => {
     set((state) => state.config ? { config: { ...state.config, auto_remove_rate_limited_accounts: value }, isDirty: true } : {});
+  },
+  setAutoDeleteQuotaZeroAccounts: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_delete_quota_zero_accounts: value }, isDirty: true } : {});
+  },
+  setAutoDeleteUploadQuotaZeroAccounts: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_delete_upload_quota_zero_accounts: value }, isDirty: true } : {});
+  },
+  setDelete403Consecutive: (value) => {
+    set((state) => state.config ? { config: { ...state.config, delete_403_consecutive: value }, isDirty: true } : {});
+  },
+  setDeleteTimeoutConsecutive: (value) => {
+    set((state) => state.config ? { config: { ...state.config, delete_timeout_consecutive: value }, isDirty: true } : {});
+  },
+  setAutoRefreshAccountsEnabled: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_refresh_accounts_enabled: value }, isDirty: true } : {});
+  },
+  setAutoRefreshAccountsIntervalMinutes: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_refresh_accounts_interval_minutes: value }, isDirty: true } : {});
+  },
+  setAutoRefreshAccountsBatchSize: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_refresh_accounts_batch_size: value }, isDirty: true } : {});
+  },
+  setAutoRefreshDeleteFailedAccounts: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_refresh_delete_failed_accounts: value }, isDirty: true } : {});
+  },
+  setAutoRefreshTriggerRefill: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_refresh_trigger_refill: value }, isDirty: true } : {});
+  },
+  setAutoCleanupAccountsEnabled: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_cleanup_accounts_enabled: value }, isDirty: true } : {});
+  },
+  setAutoCleanupAccountsIntervalSeconds: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_cleanup_accounts_interval_seconds: value }, isDirty: true } : {});
+  },
+  setAutoRefillUseEffectiveAvailable: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_refill_use_effective_available: value }, isDirty: true } : {});
   },
   setLogLevel: (level, enabled) => {
     set((state) => {

@@ -19,30 +19,32 @@ const (
 )
 
 type Server struct {
-	root             string
-	configFile       string
-	dataDir          string
-	imagesDir        string
-	webDist          string
-	cfg              Config
-	store            *Store
-	mux              *http.ServeMux
-	accMu            sync.Mutex
-	authMu           sync.Mutex
-	taskMu           sync.Mutex
-	logMu            sync.Mutex
-	imageCleanupMu   sync.Mutex
-	lastImageCleanup time.Time
-	taskCleanupMu    sync.Mutex
-	lastTaskCleanup  time.Time
-	callStarts       map[string]time.Time
-	callDetails      map[string]map[string]any
-	taskCancels      map[string]context.CancelFunc
-	accountPool      *accountPool
-	logSvc           *logService
-	taskStore        *PGTaskStore
-	imageGenerator   imageGeneratorFunc
-	imageSaver       func(r *http.Request, data []byte) (string, string, error)
+	root              string
+	configFile        string
+	dataDir           string
+	imagesDir         string
+	webDist           string
+	cfg               Config
+	store             *Store
+	mux               *http.ServeMux
+	accMu             sync.Mutex
+	authMu            sync.Mutex
+	taskMu            sync.Mutex
+	logMu             sync.Mutex
+	imageCleanupMu    sync.Mutex
+	lastImageCleanup  time.Time
+	taskCleanupMu     sync.Mutex
+	lastTaskCleanup   time.Time
+	autoRefreshMu     sync.Mutex
+	autoRefreshCursor int
+	callStarts        map[string]time.Time
+	callDetails       map[string]map[string]any
+	taskCancels       map[string]context.CancelFunc
+	accountPool       *accountPool
+	logSvc            *logService
+	taskStore         *PGTaskStore
+	imageGenerator    imageGeneratorFunc
+	imageSaver        func(r *http.Request, data []byte) (string, string, error)
 }
 
 func NewServer(root string) (*Server, error) {
@@ -52,9 +54,62 @@ func NewServer(root string) (*Server, error) {
 func newServer(root string, startWatcher bool) (*Server, error) {
 	root, _ = filepath.Abs(root)
 	configFile := resolveConfigPath(root)
-	cfg, err := loadConfig(configFile)
+	cfg, err := loadRuntimeConfig(configFile)
 	if err != nil {
 		return nil, err
+	}
+	s := &Server{root: root, configFile: configFile, dataDir: filepath.Join(root, "data"), imagesDir: filepath.Join(root, "data", "images"), webDist: filepath.Join(root, "web_dist"), cfg: cfg, callStarts: map[string]time.Time{}, callDetails: map[string]map[string]any{}, taskCancels: map[string]context.CancelFunc{}, accountPool: newAccountPool(&cfg)}
+	if err := os.MkdirAll(s.imagesDir, 0755); err != nil {
+		return nil, err
+	}
+	s.logSvc = newLogService(s.dataDir)
+	s.store = NewStore(s.dataDir)
+	if strings.TrimSpace(cfg.DatabaseURL) != "" {
+		taskStore, err := NewPGTaskStore(cfg.DatabaseURL)
+		if err != nil {
+			return nil, err
+		}
+		s.taskStore = taskStore
+	}
+	s.recoverUnfinishedTasks()
+	s.cleanupOldTasks()
+	s.mux = http.NewServeMux()
+	s.routes()
+	if startWatcher {
+		s.startLimitedAccountWatcher()
+		s.startAutoAccountRefreshWatcher()
+		s.startAccountCleanupWatcher()
+	}
+	return s, nil
+}
+
+func loadRuntimeConfig(configFile string) (Config, error) {
+	cfg, err := loadConfig(configFile)
+	if err != nil {
+		return Config{}, err
+	}
+	applyConfigEnvOverrides(&cfg)
+	if err := normalizeRuntimeConfig(&cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func loadRuntimeConfigForReload(configFile string) (Config, error) {
+	cfg, err := loadConfig(configFile)
+	if err != nil {
+		return Config{}, err
+	}
+	applyConfigEnvOverrides(&cfg)
+	if err := normalizeRuntimeConfig(&cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func applyConfigEnvOverrides(cfg *Config) {
+	if cfg == nil {
+		return
 	}
 	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_AUTH_KEY")); env != "" {
 		cfg.AuthKey = env
@@ -62,7 +117,7 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_DATABASE_URL")); env != "" {
 		cfg.DatabaseURL = env
 	}
-	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_BASE_URL")); env != "" {
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_BASE_URL")); env != "" && !configStringSet(cfg.Extra, "base_url") {
 		cfg.BaseURL = env
 	}
 	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_REGISTER_EXECUTOR_URL")); env != "" {
@@ -71,23 +126,29 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_REGISTER_INTERNAL_KEY")); env != "" {
 		cfg.RegisterInternalKey = env
 	}
-	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_UPSTREAM_TRANSPORT")); env != "" {
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_UPSTREAM_TRANSPORT")); env != "" && (!configStringSet(cfg.Extra, "upstream_transport") || normalizeUpstreamTransport(env) != "tls-client") {
 		cfg.UpstreamTransport = env
 	}
-	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_ROUTE_STRATEGY")); env != "" {
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_ROUTE_STRATEGY")); env != "" && (!configStringSet(cfg.Extra, "image_route_strategy") || normalizeImageRouteStrategy(env) != "web_first") {
 		cfg.ImageRouteStrategy = env
 	}
 	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_CORS_ALLOWED_ORIGINS")); env != "" {
 		cfg.CORSAllowedOrigins = splitConfigList(env)
 	}
-	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_LOG_REQUEST_TEXT")); env != "" {
+	if env := strings.TrimSpace(os.Getenv("GPT2API_IMAGE_LOG_REQUEST_TEXT")); env != "" && (!configBoolSet(cfg.Extra, "log_request_text") || parseBoolEnv(env)) {
 		cfg.LogRequestText = parseBoolEnv(env)
 	}
+}
+
+func normalizeRuntimeConfig(cfg *Config) error {
+	if cfg == nil {
+		return errors.New("config is nil")
+	}
 	if strings.TrimSpace(cfg.AuthKey) == "" {
-		return nil, errors.New("auth-key 未设置")
+		return errors.New("auth-key 未设置")
 	}
 	if isUnsafeDefaultAuthKey(cfg.AuthKey) {
-		return nil, errors.New("auth-key 不能使用默认占位值，请设置 GPT2API_IMAGE_AUTH_KEY 或修改 data/config.json")
+		return errors.New("auth-key 不能使用默认占位值，请设置 GPT2API_IMAGE_AUTH_KEY 或修改 data/config.json")
 	}
 	if cfg.RefreshAccountIntervalMinute <= 0 {
 		cfg.RefreshAccountIntervalMinute = 60
@@ -119,32 +180,77 @@ func newServer(root string, startWatcher bool) (*Server, error) {
 	if cfg.ImageWorkerPollIntervalSecs <= 0 {
 		cfg.ImageWorkerPollIntervalSecs = 1
 	}
+	if cfg.ImageAccountFallbackAttempts <= 0 {
+		cfg.ImageAccountFallbackAttempts = 3
+	}
 	if cfg.ImageAccountConcurrency <= 0 {
 		cfg.ImageAccountConcurrency = 3
 	}
+	if !configBoolSet(cfg.Extra, "auto_delete_quota_zero_accounts") {
+		cfg.AutoDeleteQuotaZeroAccounts = true
+	}
+	if !configBoolSet(cfg.Extra, "auto_remove_invalid_accounts") {
+		cfg.AutoRemoveInvalidAccounts = true
+	}
+	if !configBoolSet(cfg.Extra, "auto_remove_rate_limited_accounts") {
+		cfg.AutoRemoveRateLimitedAccounts = true
+	}
+	if !configBoolSet(cfg.Extra, "auto_delete_upload_quota_zero_accounts") {
+		cfg.AutoDeleteUploadQuotaZeroAccounts = true
+	}
+	if cfg.Delete403Consecutive <= 0 {
+		cfg.Delete403Consecutive = 2
+	}
+	if cfg.DeleteTimeoutConsecutive <= 0 {
+		cfg.DeleteTimeoutConsecutive = 2
+	}
+	if !configBoolSet(cfg.Extra, "auto_refresh_accounts_enabled") {
+		cfg.AutoRefreshAccountsEnabled = true
+	}
+	if cfg.AutoRefreshAccountsIntervalMinutes <= 0 {
+		cfg.AutoRefreshAccountsIntervalMinutes = 60
+	}
+	if cfg.AutoRefreshAccountsBatchSize < 0 {
+		cfg.AutoRefreshAccountsBatchSize = 0
+	}
+	if !configBoolSet(cfg.Extra, "auto_refresh_delete_failed_accounts") {
+		cfg.AutoRefreshDeleteFailedAccounts = true
+	}
+	if !configBoolSet(cfg.Extra, "auto_refresh_trigger_refill") {
+		cfg.AutoRefreshTriggerRefill = true
+	}
+	if !configBoolSet(cfg.Extra, "auto_cleanup_accounts_enabled") {
+		cfg.AutoCleanupAccountsEnabled = true
+	}
+	if cfg.AutoCleanupAccountsIntervalSeconds <= 0 {
+		cfg.AutoCleanupAccountsIntervalSeconds = 60
+	}
+	if !configBoolSet(cfg.Extra, "auto_refill_use_effective_available") {
+		cfg.AutoRefillUseEffectiveAvailable = true
+	}
 	cfg.UpstreamTransport = normalizeUpstreamTransport(cfg.UpstreamTransport)
 	cfg.ImageRouteStrategy = normalizeImageRouteStrategy(cfg.ImageRouteStrategy)
-	s := &Server{root: root, configFile: configFile, dataDir: filepath.Join(root, "data"), imagesDir: filepath.Join(root, "data", "images"), webDist: filepath.Join(root, "web_dist"), cfg: cfg, callStarts: map[string]time.Time{}, callDetails: map[string]map[string]any{}, taskCancels: map[string]context.CancelFunc{}, accountPool: newAccountPool(&cfg)}
-	if err := os.MkdirAll(s.imagesDir, 0755); err != nil {
-		return nil, err
+	return nil
+}
+
+func (s *Server) applyRuntimeConfig(cfg Config) {
+	s.cfg = cfg
+	if s.accountPool != nil {
+		s.accountPool.setConfig(&s.cfg)
 	}
-	s.logSvc = newLogService(s.dataDir)
-	s.store = NewStore(s.dataDir)
-	if strings.TrimSpace(cfg.DatabaseURL) != "" {
-		taskStore, err := NewPGTaskStore(cfg.DatabaseURL)
-		if err != nil {
-			return nil, err
-		}
-		s.taskStore = taskStore
+}
+
+func (s *Server) reloadConfigFromDisk() error {
+	configFile := strings.TrimSpace(s.configFile)
+	if configFile == "" {
+		configFile = resolveConfigPath(s.root)
 	}
-	s.recoverUnfinishedTasks()
-	s.cleanupOldTasks()
-	s.mux = http.NewServeMux()
-	s.routes()
-	if startWatcher {
-		s.startLimitedAccountWatcher()
+	cfg, err := loadRuntimeConfigForReload(configFile)
+	if err != nil {
+		return err
 	}
-	return s, nil
+	s.applyRuntimeConfig(cfg)
+	return nil
 }
 
 func resolveConfigPath(root string) string {
@@ -176,6 +282,22 @@ func isUnsafeDefaultAuthKey(value string) bool {
 	default:
 		return false
 	}
+}
+
+func configBoolSet(extra map[string]any, key string) bool {
+	if extra == nil {
+		return false
+	}
+	_, ok := extra[key]
+	return ok
+}
+
+func configStringSet(extra map[string]any, key string) bool {
+	if extra == nil {
+		return false
+	}
+	value, ok := extra[key]
+	return ok && strings.TrimSpace(strAny(value, "")) != ""
 }
 
 func loadConfig(path string) (Config, error) {
@@ -256,8 +378,21 @@ func configMapFrom(cfg Config, includeAuth bool) map[string]any {
 	m["image_task_timeout_secs"] = cfg.ImageTaskTimeoutSecs
 	m["image_task_claim_ttl_secs"] = cfg.ImageTaskClaimTTLSecs
 	m["image_worker_poll_interval_secs"] = cfg.ImageWorkerPollIntervalSecs
+	m["image_account_fallback_attempts"] = cfg.ImageAccountFallbackAttempts
 	m["auto_remove_rate_limited_accounts"] = cfg.AutoRemoveRateLimitedAccounts
 	m["auto_remove_invalid_accounts"] = cfg.AutoRemoveInvalidAccounts
+	m["auto_delete_quota_zero_accounts"] = cfg.AutoDeleteQuotaZeroAccounts
+	m["auto_delete_upload_quota_zero_accounts"] = cfg.AutoDeleteUploadQuotaZeroAccounts
+	m["delete_403_consecutive"] = cfg.Delete403Consecutive
+	m["delete_timeout_consecutive"] = cfg.DeleteTimeoutConsecutive
+	m["auto_refresh_accounts_enabled"] = cfg.AutoRefreshAccountsEnabled
+	m["auto_refresh_accounts_interval_minutes"] = cfg.AutoRefreshAccountsIntervalMinutes
+	m["auto_refresh_accounts_batch_size"] = cfg.AutoRefreshAccountsBatchSize
+	m["auto_refresh_delete_failed_accounts"] = cfg.AutoRefreshDeleteFailedAccounts
+	m["auto_refresh_trigger_refill"] = cfg.AutoRefreshTriggerRefill
+	m["auto_cleanup_accounts_enabled"] = cfg.AutoCleanupAccountsEnabled
+	m["auto_cleanup_accounts_interval_seconds"] = cfg.AutoCleanupAccountsIntervalSeconds
+	m["auto_refill_use_effective_available"] = cfg.AutoRefillUseEffectiveAvailable
 	m["log_levels"] = cfg.LogLevels
 	m["log_request_text"] = cfg.LogRequestText
 	m["cors_allowed_origins"] = cfg.CORSAllowedOrigins
@@ -419,6 +554,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/internal/register/accounts", s.handleInternalRegisterAccounts)
 	s.mux.HandleFunc("/internal/register/accounts/refresh", s.handleInternalRegisterAccountsRefresh)
 	s.mux.HandleFunc("/internal/register/accounts/delete", s.handleInternalRegisterAccountsDelete)
+	s.mux.HandleFunc("/internal/register/settings", s.handleInternalRegisterSettings)
 	s.mux.HandleFunc("/v1/models", s.handleV1Models)
 	s.mux.HandleFunc("/v1/images/generations", s.handleV1ImagesGenerations)
 	s.mux.HandleFunc("/v1/images/edits", s.handleV1ImagesEdits)

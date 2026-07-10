@@ -14,7 +14,23 @@ const (
 	paidUploadLimitFallbackDelay    = 3 * time.Hour
 	unknownUploadLimitFallbackDelay = freeUploadLimitFallbackDelay
 	defaultUploadLimitFeature       = "upload"
+	defaultDelete403Consecutive     = 2
+	defaultDeleteTimeoutConsecutive = 2
 )
+
+func delete403ConsecutiveThreshold(cfg Config) int {
+	if cfg.Delete403Consecutive <= 0 {
+		return defaultDelete403Consecutive
+	}
+	return cfg.Delete403Consecutive
+}
+
+func deleteTimeoutConsecutiveThreshold(cfg Config) int {
+	if cfg.DeleteTimeoutConsecutive <= 0 {
+		return defaultDeleteTimeoutConsecutive
+	}
+	return cfg.DeleteTimeoutConsecutive
+}
 
 func isRateLimitErrorText(err error) bool {
 	if err == nil {
@@ -53,17 +69,28 @@ func isUpstreamBlockErrorText(err error) bool {
 		return false
 	}
 	text := strings.ToLower(err.Error())
-	return (strings.Contains(text, "status=403") || strings.Contains(text, "http 403")) &&
-		(strings.Contains(text, "<html") ||
-			strings.Contains(text, "<body") ||
-			strings.Contains(text, "meta http-equiv") ||
-			strings.Contains(text, "something seems to have gone wrong") ||
-			strings.Contains(text, "cloudflare") ||
-			strings.Contains(text, "just a moment") ||
-			strings.Contains(text, "attention required") ||
-			strings.Contains(text, "cf-chl") ||
-			strings.Contains(text, "__cf_chl") ||
-			strings.Contains(text, "cf-browser-verification"))
+	if strings.Contains(text, "unusual activity has been detected") ||
+		strings.Contains(text, "try again later") ||
+		strings.Contains(text, "device blocked") ||
+		strings.Contains(text, "suspicious activity") {
+		return true
+	}
+	if !(strings.Contains(text, "status=403") || strings.Contains(text, "http 403")) {
+		return false
+	}
+	return strings.Contains(text, "<html") ||
+		strings.Contains(text, "<body") ||
+		strings.Contains(text, "meta http-equiv") ||
+		strings.Contains(text, "something seems to have gone wrong") ||
+		strings.Contains(text, "cloudflare") ||
+		strings.Contains(text, "just a moment") ||
+		strings.Contains(text, "attention required") ||
+		strings.Contains(text, "cf-chl") ||
+		strings.Contains(text, "__cf_chl") ||
+		strings.Contains(text, "cf-browser-verification") ||
+		strings.Contains(text, "turnstile") ||
+		strings.Contains(text, "captcha") ||
+		strings.Contains(text, "blocked")
 }
 
 func isTurnstileRequirementErrorText(err error) bool {
@@ -93,6 +120,25 @@ func isTemporaryUpstreamErrorText(err error) bool {
 		}
 	}
 	return false
+}
+
+func accountFailureCategory(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case isInvalidTokenErrorText(err):
+		return "invalid_token"
+	case isRateLimitErrorText(err):
+		return "rate_limited"
+	case isUploadLimitErrorText(err):
+		return "upload_limited"
+	case isUpstreamBlockErrorText(err) || isTurnstileRequirementErrorText(err):
+		return "upstream_403"
+	case isTemporaryUpstreamErrorText(err):
+		return "temporary_timeout"
+	default:
+		return ""
+	}
 }
 
 func rateLimitRestoreDelay(err error) time.Duration {
@@ -167,12 +213,16 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 			}
 			accounts[i].Success++
 			accounts[i].LastUsedAt = &now
+			accounts[i].LastError = nil
+			accounts[i].LastErrorAt = nil
+			accounts[i].Consecutive403 = 0
+			accounts[i].ConsecutiveTimeout = 0
 			if image && !accounts[i].ImageQuotaUnknown && accounts[i].Quota > 0 {
 				accounts[i].Quota--
 				if accounts[i].Quota <= 0 {
 					accounts[i].Quota = 0
 					accounts[i].Status = accountStatusLimited
-					if accountHasUploadQuotaRuntimeValue(accounts[i]) {
+					if accountHasUploadQuotaRuntimeValue(accounts[i]) && !s.cfg.AutoDeleteQuotaZeroAccounts {
 						return accounts
 					}
 					removeReason = "image_quota_empty"
@@ -196,6 +246,7 @@ func (s *Server) markAccountSuccess(token string, image bool) {
 		if _, err := s.removeOrMarkImageAccount(token, removeReason); err != nil {
 			log.Printf("[account-state] failed to remove exhausted image account: %v", err)
 		}
+		s.triggerAutoRefillIfNeeded("image_quota_empty")
 	}
 }
 
@@ -231,6 +282,7 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 	}
 	now := nowISO()
 	removeReason := ""
+	category := accountFailureCategory(err)
 	if image {
 		if reason, ok := imageAccountErrorRemovalReason(err); ok {
 			removeReason = reason
@@ -243,6 +295,29 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 			}
 			accounts[i].Fail++
 			accounts[i].LastUsedAt = &now
+			if err != nil {
+				msg := truncateText(err.Error(), 500)
+				accounts[i].LastError = &msg
+				accounts[i].LastErrorAt = &now
+			}
+			switch category {
+			case "upstream_403":
+				accounts[i].Consecutive403++
+				accounts[i].ConsecutiveTimeout = 0
+			case "temporary_timeout":
+				accounts[i].ConsecutiveTimeout++
+				accounts[i].Consecutive403 = 0
+			default:
+				if category != "" {
+					accounts[i].Consecutive403 = 0
+					accounts[i].ConsecutiveTimeout = 0
+				}
+			}
+			if removeReason != "" {
+				if removeReason == "invalid_token" && !s.cfg.AutoRemoveInvalidAccounts {
+					removeReason = ""
+				}
+			}
 			if removeReason != "" {
 				accounts[i].Status = accountStatusInvalid
 				accounts[i].Quota = 0
@@ -255,6 +330,11 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 				accounts[i].UploadLimitResetAt = &reset
 				featureName := defaultUploadLimitFeature
 				accounts[i].UploadLimitFeatureName = &featureName
+				if image && s.cfg.AutoDeleteUploadQuotaZeroAccounts {
+					removeReason = "upload_quota_empty"
+					accounts[i].Status = accountStatusInvalid
+					accounts[i].Quota = 0
+				}
 				return accounts
 			}
 			if isRateLimitErrorText(err) {
@@ -271,8 +351,16 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 				accounts[i].Status = accountStatusInvalid
 				accounts[i].Quota = 0
 				if s.cfg.AutoRemoveInvalidAccounts {
-					accounts = append(accounts[:i], accounts[i+1:]...)
+					removeReason = "invalid_token"
 				}
+			} else if image && category == "upstream_403" && accounts[i].Consecutive403 >= delete403ConsecutiveThreshold(s.cfg) {
+				accounts[i].Status = accountStatusInvalid
+				accounts[i].Quota = 0
+				removeReason = "upstream_403"
+			} else if image && category == "temporary_timeout" && accounts[i].ConsecutiveTimeout >= deleteTimeoutConsecutiveThreshold(s.cfg) {
+				accounts[i].Status = accountStatusInvalid
+				accounts[i].Quota = 0
+				removeReason = "temporary_timeout"
 			}
 			return accounts
 		}
@@ -285,5 +373,6 @@ func (s *Server) markAccountFailure(token string, err error, image bool) {
 		if _, err := s.removeOrMarkImageAccount(token, removeReason); err != nil {
 			log.Printf("[account-state] failed to remove failed image account: %v", err)
 		}
+		s.triggerAutoRefillIfNeeded(removeReason)
 	}
 }

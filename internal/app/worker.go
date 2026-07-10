@@ -90,6 +90,9 @@ func (s *Server) workerLoop(ctx context.Context, workerID string, slot int, ttl 
 			sleepContext(ctx, pollInterval)
 			continue
 		}
+		if err := s.reloadConfigFromDisk(); err != nil {
+			log.Printf("worker reload config failed slot=%d error=%v", slot, err)
+		}
 		if err := s.runDBImageTask(ctx, claimID, ttl, task); err != nil {
 			log.Printf("worker task failed id=%s error=%v", task.ID, err)
 		}
@@ -99,6 +102,9 @@ func (s *Server) workerLoop(ctx context.Context, workerID string, slot int, ttl 
 func (s *Server) workerExpireLoop(ctx context.Context, interval time.Duration) {
 	if interval < 5*time.Second {
 		interval = 5 * time.Second
+	}
+	if err := s.reloadConfigFromDisk(); err != nil {
+		log.Printf("worker reload config failed before expire loop: %v", err)
 	}
 	s.expireOverdueDBTasks(ctx)
 	for sleepContextBool(ctx, interval) {

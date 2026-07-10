@@ -166,3 +166,34 @@ func (s *Server) postRegisterExecutor(path string, body any) (map[string]any, er
 	}
 	return out, nil
 }
+
+func (s *Server) fetchRegisterExecutorConfig() (map[string]any, error) {
+	if s.registerExecutorInternalKey() == "" {
+		return nil, fmt.Errorf("register_internal_key is required when register executor is configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.registerExecutorURL()+"/api/register", nil)
+	if err != nil {
+		return nil, err
+	}
+	if key := s.registerExecutorInternalKey(); key != "" {
+		req.Header.Set("X-Register-Internal-Key", key)
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("register executor http %d", resp.StatusCode)
+	}
+	register, _ := out["register"].(map[string]any)
+	if register == nil {
+		register = out
+	}
+	return register, nil
+}

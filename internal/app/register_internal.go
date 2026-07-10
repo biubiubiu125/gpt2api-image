@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -131,6 +132,27 @@ func (s *Server) handleInternalRegisterAccountsDelete(w http.ResponseWriter, r *
 	writeJSON(w, 200, map[string]any{"removed": removed, "items": s.store.LoadAccounts()})
 }
 
+func (s *Server) handleInternalRegisterSettings(w http.ResponseWriter, r *http.Request) {
+	if !s.requireRegisterInternal(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"config": map[string]any{
+			"auto_remove_invalid_accounts":           s.cfg.AutoRemoveInvalidAccounts,
+			"auto_remove_rate_limited_accounts":      s.cfg.AutoRemoveRateLimitedAccounts,
+			"auto_delete_quota_zero_accounts":        s.cfg.AutoDeleteQuotaZeroAccounts,
+			"auto_delete_upload_quota_zero_accounts": s.cfg.AutoDeleteUploadQuotaZeroAccounts,
+			"delete_403_consecutive":                 delete403ConsecutiveThreshold(s.cfg),
+			"delete_timeout_consecutive":             deleteTimeoutConsecutiveThreshold(s.cfg),
+			"auto_refresh_delete_failed_accounts":    s.cfg.AutoRefreshDeleteFailedAccounts,
+		},
+	})
+}
+
 func (s *Server) deleteAccountTokens(tokens []string) (int, error) {
 	targets := map[string]bool{}
 	for _, token := range tokens {
@@ -165,6 +187,7 @@ func (s *Server) deleteAccountTokens(tokens []string) (int, error) {
 
 func (s *Server) removeRegisterUnusableAccounts(tokens []string, errs []map[string]any) int {
 	targets := map[string]bool{}
+	errTargets := map[string]string{}
 	for _, token := range tokens {
 		if t := strings.TrimSpace(token); t != "" {
 			targets[t] = true
@@ -174,6 +197,7 @@ func (s *Server) removeRegisterUnusableAccounts(tokens []string, errs []map[stri
 		for _, key := range []string{"access_token", "token"} {
 			if t := strings.TrimSpace(strAny(item[key], "")); t != "" {
 				targets[t] = true
+				errTargets[t] = strings.TrimSpace(strAny(item["error"], "refresh failed"))
 			}
 		}
 	}
@@ -185,7 +209,20 @@ func (s *Server) removeRegisterUnusableAccounts(tokens []string, errs []map[stri
 		if !targets[account.AccessToken] {
 			continue
 		}
-		if reason, ok := registerImageAccountRemovalReason(account); ok {
+		if errMsg, failed := errTargets[account.AccessToken]; failed && s.cfg.AutoRefreshDeleteFailedAccounts {
+			reason := "refresh_failed"
+			if isInvalidTokenErrorText(errors.New(errMsg)) {
+				reason = "invalid_token"
+			}
+			if reason == "invalid_token" && !s.cfg.AutoRemoveInvalidAccounts {
+				continue
+			}
+			if ok, err := s.removeOrMarkImageAccount(account.AccessToken, reason); err == nil && ok {
+				changed++
+			}
+			continue
+		}
+		if reason, ok := s.registerImageAccountRemovalReason(account); ok {
 			if ok, err := s.removeOrMarkImageAccount(account.AccessToken, reason); err == nil && ok {
 				changed++
 			}

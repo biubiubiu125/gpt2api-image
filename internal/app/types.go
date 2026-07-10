@@ -3,33 +3,46 @@ package app
 import "time"
 
 type Config struct {
-	AuthKey                       string         `json:"auth-key"`
-	DatabaseURL                   string         `json:"database_url"`
-	RefreshAccountIntervalMinute  int            `json:"refresh_account_interval_minute"`
-	ImageRetentionDays            int            `json:"image_retention_days"`
-	ImageMaxStorageMB             int            `json:"image_max_storage_mb"`
-	ImagePollTimeoutSecs          int            `json:"image_poll_timeout_secs"`
-	ImagePollIntervalSecs         int            `json:"image_poll_interval_secs"`
-	ImagePollInitialWaitSecs      int            `json:"image_poll_initial_wait_secs"`
-	ImageTaskTimeoutSecs          int            `json:"image_task_timeout_secs"`
-	ImageTaskClaimTTLSecs         int            `json:"image_task_claim_ttl_secs"`
-	ImageWorkerPollIntervalSecs   int            `json:"image_worker_poll_interval_secs"`
-	AutoRemoveRateLimitedAccounts bool           `json:"auto_remove_rate_limited_accounts"`
-	AutoRemoveInvalidAccounts     bool           `json:"auto_remove_invalid_accounts"`
-	LogLevels                     []string       `json:"log_levels"`
-	LogRequestText                bool           `json:"log_request_text"`
-	CORSAllowedOrigins            []string       `json:"cors_allowed_origins"`
-	Proxy                         string         `json:"proxy"`
-	UpstreamTransport             string         `json:"upstream_transport"`
-	ImageRouteStrategy            string         `json:"image_route_strategy"`
-	BaseURL                       string         `json:"base_url"`
-	SensitiveWords                []string       `json:"sensitive_words"`
-	GlobalSystemPrompt            string         `json:"global_system_prompt"`
-	ImageAccountConcurrency       int            `json:"image_account_concurrency"`
-	CleanupProtectUserImages      bool           `json:"cleanup_protect_user_images"`
-	RegisterExecutorURL           string         `json:"register_executor_url"`
-	RegisterInternalKey           string         `json:"register_internal_key"`
-	Extra                         map[string]any `json:"-"`
+	AuthKey                            string         `json:"auth-key"`
+	DatabaseURL                        string         `json:"database_url"`
+	RefreshAccountIntervalMinute       int            `json:"refresh_account_interval_minute"`
+	ImageRetentionDays                 int            `json:"image_retention_days"`
+	ImageMaxStorageMB                  int            `json:"image_max_storage_mb"`
+	ImagePollTimeoutSecs               int            `json:"image_poll_timeout_secs"`
+	ImagePollIntervalSecs              int            `json:"image_poll_interval_secs"`
+	ImagePollInitialWaitSecs           int            `json:"image_poll_initial_wait_secs"`
+	ImageTaskTimeoutSecs               int            `json:"image_task_timeout_secs"`
+	ImageTaskClaimTTLSecs              int            `json:"image_task_claim_ttl_secs"`
+	ImageWorkerPollIntervalSecs        int            `json:"image_worker_poll_interval_secs"`
+	ImageAccountFallbackAttempts       int            `json:"image_account_fallback_attempts"`
+	AutoRemoveRateLimitedAccounts      bool           `json:"auto_remove_rate_limited_accounts"`
+	AutoRemoveInvalidAccounts          bool           `json:"auto_remove_invalid_accounts"`
+	AutoDeleteQuotaZeroAccounts        bool           `json:"auto_delete_quota_zero_accounts"`
+	AutoDeleteUploadQuotaZeroAccounts  bool           `json:"auto_delete_upload_quota_zero_accounts"`
+	Delete403Consecutive               int            `json:"delete_403_consecutive"`
+	DeleteTimeoutConsecutive           int            `json:"delete_timeout_consecutive"`
+	AutoRefreshAccountsEnabled         bool           `json:"auto_refresh_accounts_enabled"`
+	AutoRefreshAccountsIntervalMinutes int            `json:"auto_refresh_accounts_interval_minutes"`
+	AutoRefreshAccountsBatchSize       int            `json:"auto_refresh_accounts_batch_size"`
+	AutoRefreshDeleteFailedAccounts    bool           `json:"auto_refresh_delete_failed_accounts"`
+	AutoRefreshTriggerRefill           bool           `json:"auto_refresh_trigger_refill"`
+	AutoCleanupAccountsEnabled         bool           `json:"auto_cleanup_accounts_enabled"`
+	AutoCleanupAccountsIntervalSeconds int            `json:"auto_cleanup_accounts_interval_seconds"`
+	AutoRefillUseEffectiveAvailable    bool           `json:"auto_refill_use_effective_available"`
+	LogLevels                          []string       `json:"log_levels"`
+	LogRequestText                     bool           `json:"log_request_text"`
+	CORSAllowedOrigins                 []string       `json:"cors_allowed_origins"`
+	Proxy                              string         `json:"proxy"`
+	UpstreamTransport                  string         `json:"upstream_transport"`
+	ImageRouteStrategy                 string         `json:"image_route_strategy"`
+	BaseURL                            string         `json:"base_url"`
+	SensitiveWords                     []string       `json:"sensitive_words"`
+	GlobalSystemPrompt                 string         `json:"global_system_prompt"`
+	ImageAccountConcurrency            int            `json:"image_account_concurrency"`
+	CleanupProtectUserImages           bool           `json:"cleanup_protect_user_images"`
+	RegisterExecutorURL                string         `json:"register_executor_url"`
+	RegisterInternalKey                string         `json:"register_internal_key"`
+	Extra                              map[string]any `json:"-"`
 }
 
 type Account struct {
@@ -57,6 +70,12 @@ type Account struct {
 	PendingDelete            bool              `json:"pending_delete,omitempty"`
 	DeleteReason             *string           `json:"delete_reason,omitempty"`
 	DeleteMarkedAt           *string           `json:"delete_marked_at,omitempty"`
+	LastError                *string           `json:"last_error,omitempty"`
+	LastErrorAt              *string           `json:"last_error_at,omitempty"`
+	LastRefreshError         *string           `json:"last_refresh_error,omitempty"`
+	LastRefreshErrorAt       *string           `json:"last_refresh_error_at,omitempty"`
+	Consecutive403           int               `json:"consecutive_403,omitempty"`
+	ConsecutiveTimeout       int               `json:"consecutive_timeout,omitempty"`
 	Success                  int               `json:"success"`
 	Fail                     int               `json:"fail"`
 	LastUsedAt               *string           `json:"last_used_at,omitempty"`

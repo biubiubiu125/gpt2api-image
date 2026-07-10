@@ -13,11 +13,26 @@ type accountPool struct {
 	index          int
 	inflight       map[string]int
 	uploadReserved map[string]int
-	cfg            *Config
+	cfg            Config
+	hasCfg         bool
 }
 
 func newAccountPool(cfg *Config) *accountPool {
-	return &accountPool{inflight: make(map[string]int), uploadReserved: make(map[string]int), cfg: cfg}
+	p := &accountPool{inflight: make(map[string]int), uploadReserved: make(map[string]int)}
+	p.setConfig(cfg)
+	return p
+}
+
+func (p *accountPool) setConfig(cfg *Config) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if cfg == nil {
+		p.cfg = Config{}
+		p.hasCfg = false
+		return
+	}
+	p.cfg = *cfg
+	p.hasCfg = true
 }
 
 func ptrString(v *string) string {
@@ -39,6 +54,14 @@ func parseAccountTime(value string) (time.Time, error) {
 		return time.Parse(time.RFC3339Nano, text)
 	}
 	return time.Parse(time.RFC3339Nano, text)
+}
+
+func accountCreatedAtTime(a Account) time.Time {
+	t, err := parseAccountTime(ptrString(a.CreatedAt))
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 func accountHasActiveLimitWindow(a Account, now time.Time, blockWithoutReset bool) bool {
@@ -64,7 +87,10 @@ func (p *accountPool) pickTokenExcluding(accounts []Account, needCodex bool, cod
 func (p *accountPool) pickTokenExcludingForUploads(accounts []Account, needCodex bool, codexPlanType string, excluded map[string]bool, requiredUploads int) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	maxConc := p.cfg.ImageAccountConcurrency
+	maxConc := 0
+	if p.hasCfg {
+		maxConc = p.cfg.ImageAccountConcurrency
+	}
 	if maxConc < 1 {
 		maxConc = 3
 	}
@@ -76,6 +102,7 @@ func (p *accountPool) pickTokenExcludingForUploads(accounts []Account, needCodex
 		offset   int
 		inflight int
 		used     int
+		created  time.Time
 	}
 	candidates := []candidate{}
 	uploadBlocked := false
@@ -127,10 +154,20 @@ func (p *accountPool) pickTokenExcludingForUploads(accounts []Account, needCodex
 			offset:   offset,
 			inflight: p.inflight[a.AccessToken],
 			used:     a.Success + a.Fail,
+			created:  accountCreatedAtTime(a),
 		})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
+		if !left.created.Equal(right.created) {
+			return left.created.After(right.created)
+		}
+		if left.account.Quota != right.account.Quota {
+			return left.account.Quota > right.account.Quota
+		}
+		if left.inflight != right.inflight {
+			return left.inflight < right.inflight
+		}
 		if requiredUploads > 0 && !needCodex {
 			leftKnown := !left.account.UploadQuotaUnknown
 			rightKnown := !right.account.UploadQuotaUnknown
@@ -145,14 +182,8 @@ func (p *accountPool) pickTokenExcludingForUploads(accounts []Account, needCodex
 				}
 			}
 		}
-		if left.account.Quota != right.account.Quota {
-			return left.account.Quota > right.account.Quota
-		}
 		if left.used != right.used {
 			return left.used < right.used
-		}
-		if left.inflight != right.inflight {
-			return left.inflight < right.inflight
 		}
 		return left.offset < right.offset
 	})
@@ -225,7 +256,10 @@ func (p *accountPool) pickTextTokenExcluding(accounts []Account, planType string
 func (p *accountPool) pickTextTokenExcludingForUploads(accounts []Account, planType string, excluded map[string]bool, requiredUploads int) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	maxConc := p.cfg.ImageAccountConcurrency
+	maxConc := 0
+	if p.hasCfg {
+		maxConc = p.cfg.ImageAccountConcurrency
+	}
 	if maxConc < 1 {
 		maxConc = 3
 	}

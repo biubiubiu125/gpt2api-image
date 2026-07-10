@@ -791,9 +791,15 @@ export async function resetYYDSDomainBlacklist() {
 
 export type ProxyTestResult = {
   ok: boolean;
-  status: number;
+  status?: number;
   latency_ms: number;
-  error: string | null;
+  error?: string | null;
+  ip?: string;
+  country?: string;
+  colo?: string;
+  http?: string;
+  tls?: string;
+  target?: string;
 };
 
 export async function testProxy(url?: string) {

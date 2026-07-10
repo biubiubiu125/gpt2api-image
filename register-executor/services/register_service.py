@@ -304,11 +304,46 @@ def _update_source_stats(
     item["updated_at"] = updated_at
 
 
-def _image_account_usable(item: dict) -> bool:
+def _register_settings() -> dict:
+    try:
+        settings = account_service.get_settings()
+        return settings if isinstance(settings, dict) else {}
+    except Exception:
+        return {}
+
+
+def _settings_bool(settings: dict | None, key: str, default: bool) -> bool:
+    if not isinstance(settings, dict) or key not in settings:
+        return default
+    return bool(settings.get(key))
+
+
+def _delete_403_threshold(settings: dict | None = None) -> int:
+    data = settings if isinstance(settings, dict) else _register_settings()
+    return max(1, _int_or_default(data.get("delete_403_consecutive"), 2))
+
+
+def _delete_timeout_threshold(settings: dict | None = None) -> int:
+    data = settings if isinstance(settings, dict) else _register_settings()
+    return max(1, _int_or_default(data.get("delete_timeout_consecutive"), 2))
+
+
+def _auto_refresh_delete_failed_accounts(settings: dict | None = None) -> bool:
+    data = settings if isinstance(settings, dict) else _register_settings()
+    return _settings_bool(data, "auto_refresh_delete_failed_accounts", True)
+
+
+def _image_account_usable(item: dict, settings: dict | None = None) -> bool:
+    data = settings if isinstance(settings, dict) else _register_settings()
+    upload_quota_known = "upload_quota" in item and not bool(item.get("upload_quota_unknown"))
     return (
-        str(item.get("status") or "正常") == "正常"
+        str(item.get("status") or "\u6b63\u5e38") == "\u6b63\u5e38"
         and not bool(item.get("pending_delete"))
+        and _int_or_default(item.get("consecutive_403"), 0) < _delete_403_threshold(data)
+        and _int_or_default(item.get("consecutive_timeout"), 0) < _delete_timeout_threshold(data)
+        and (not _auto_refresh_delete_failed_accounts(data) or not str(item.get("last_refresh_error") or "").strip())
         and not bool(item.get("image_quota_unknown"))
+        and not (upload_quota_known and _int_or_default(item.get("upload_quota"), 0) <= 0)
         and _int_or_default(item.get("quota"), 0) > 0
     )
 
@@ -1011,7 +1046,10 @@ class RegisterService:
 
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
-        normal = [item for item in items if _image_account_usable(item)]
+        if not items:
+            return {"current_quota": 0, "current_available": 0}
+        settings = _register_settings()
+        normal = [item for item in items if _image_account_usable(item, settings)]
         return {
             "current_quota": sum(int(item.get("quota") or 0) for item in normal),
             "current_available": len(normal),
@@ -1330,7 +1368,7 @@ class RegisterService:
                         self._append_log(f"{email} 刷新后仍不可用，已移除", "yellow")
                     else:
                         refreshed_account = account_service.get_account(token)
-                        if not _image_account_usable(refreshed_account or {}):
+                        if not _image_account_usable(refreshed_account or {}, _register_settings()):
                             fail += 1
                             if refreshed_account is None:
                                 _bump_failure_reason(failure_reasons, "account_unusable_after_refresh")

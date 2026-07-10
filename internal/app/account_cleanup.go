@@ -29,15 +29,15 @@ func isAccountInvalidStatus(status string) bool {
 	return status != "" && status != accountStatusNormal && status != accountStatusDisabled && status != accountStatusLimited
 }
 
-func imageAccountRecordRemovalReason(a Account) (string, bool) {
-	return imageAccountRemovalReason(a, false)
+func (s *Server) imageAccountRecordRemovalReason(a Account) (string, bool) {
+	return s.imageAccountRemovalReason(a, false)
 }
 
-func registerImageAccountRemovalReason(a Account) (string, bool) {
-	return imageAccountRemovalReason(a, true)
+func (s *Server) registerImageAccountRemovalReason(a Account) (string, bool) {
+	return s.imageAccountRemovalReason(a, true)
 }
 
-func imageAccountRemovalReason(a Account, includePendingRefreshValidation bool) (string, bool) {
+func (s *Server) imageAccountRemovalReason(a Account, includePendingRefreshValidation bool) (string, bool) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return "", false
 	}
@@ -48,22 +48,53 @@ func imageAccountRemovalReason(a Account, includePendingRefreshValidation bool) 
 		return "pending_delete", true
 	}
 	if isAccountInvalidStatus(a.Status) {
+		if !s.cfg.AutoRemoveInvalidAccounts {
+			return "", false
+		}
 		return "account_status_invalid", true
+	}
+	if isAccountStatus(a.Status, accountStatusLimited) && s.cfg.AutoRemoveRateLimitedAccounts {
+		return "image_account_rate_limited", true
 	}
 	if a.RefreshValidationPending && !includePendingRefreshValidation && accountRefreshValidationRecentlyStarted(a) {
 		return "", false
 	}
 	if a.ImageQuotaUnknown {
-		if accountHasUploadQuotaRuntimeValue(a) {
+		if accountHasUploadQuotaRuntimeValue(a) || !s.cfg.AutoDeleteQuotaZeroAccounts {
 			return "", false
 		}
 		return "image_quota_unknown", true
 	}
 	if a.Quota <= 0 {
-		if accountHasUploadQuotaRuntimeValue(a) {
+		if accountHasUploadQuotaRuntimeValue(a) || !s.cfg.AutoDeleteQuotaZeroAccounts {
 			return "", false
 		}
 		return "image_quota_empty", true
+	}
+	return "", false
+}
+
+func (s *Server) imageAccountRuntimeRemovalReason(a Account) (string, bool) {
+	if reason, ok := s.imageAccountRecordRemovalReason(a); ok {
+		return reason, true
+	}
+	if a.RefreshValidationPending && accountRefreshValidationRecentlyStarted(a) {
+		return "", false
+	}
+	if s.cfg.AutoDeleteQuotaZeroAccounts && a.Quota <= 0 {
+		return "image_quota_empty", true
+	}
+	if s.cfg.AutoDeleteUploadQuotaZeroAccounts && !a.UploadQuotaUnknown && a.UploadQuota <= 0 {
+		return "upload_quota_empty", true
+	}
+	if s.cfg.AutoRefreshDeleteFailedAccounts && strings.TrimSpace(ptrString(a.LastRefreshError)) != "" {
+		return "refresh_failed", true
+	}
+	if a.Consecutive403 >= delete403ConsecutiveThreshold(s.cfg) {
+		return "upstream_403", true
+	}
+	if a.ConsecutiveTimeout >= deleteTimeoutConsecutiveThreshold(s.cfg) {
+		return "temporary_timeout", true
 	}
 	return "", false
 }
@@ -199,20 +230,107 @@ func (s *Server) cleanupPendingDeletedAccounts() int {
 }
 
 func (s *Server) cleanupUnusableImageAccounts() int {
-	removed := 0
+	changed := 0
 	for _, account := range s.store.LoadAccounts() {
-		reason, ok := imageAccountRecordRemovalReason(account)
+		reason, ok := s.imageAccountRuntimeRemovalReason(account)
 		if !ok {
 			continue
 		}
-		before := len(s.store.LoadAccounts())
-		if _, err := s.removeOrMarkImageAccount(account.AccessToken, reason); err != nil {
+		if ok, err := s.removeOrMarkImageAccount(account.AccessToken, reason); err != nil || !ok {
 			continue
 		}
-		after := len(s.store.LoadAccounts())
-		if after < before {
-			removed += before - after
-		}
+		changed++
 	}
-	return removed
+	return changed
+}
+
+func (s *Server) cleanupAccounts() int {
+	changed := s.cleanupPendingDeletedAccounts()
+	changed += s.cleanupUnusableImageAccounts()
+	return changed
+}
+
+func (s *Server) cleanupAccountsAndMaybeRefill(reason string) int {
+	changed := s.cleanupAccounts()
+	if changed > 0 {
+		s.triggerAutoRefillIfNeeded(reason)
+	}
+	return changed
+}
+
+func (s *Server) effectiveAvailableImageAccounts() int {
+	count := 0
+	now := time.Now().UTC()
+	for _, account := range s.store.LoadAccounts() {
+		if !s.isEffectiveAvailableImageAccount(account, now) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func (s *Server) isEffectiveAvailableImageAccount(account Account, now time.Time) bool {
+	if strings.TrimSpace(account.AccessToken) == "" || account.PendingDelete || isAccountDisabled(account.Status) || isAccountInvalidStatus(account.Status) {
+		return false
+	}
+	if accountHasActiveLimitWindow(account, now, true) {
+		return false
+	}
+	if account.ImageQuotaUnknown || account.Quota <= 0 {
+		return false
+	}
+	if !account.UploadQuotaUnknown && account.UploadQuota <= 0 {
+		return false
+	}
+	if account.Consecutive403 >= delete403ConsecutiveThreshold(s.cfg) {
+		return false
+	}
+	if account.ConsecutiveTimeout >= deleteTimeoutConsecutiveThreshold(s.cfg) {
+		return false
+	}
+	if strings.TrimSpace(ptrString(account.LastRefreshError)) != "" && s.cfg.AutoRefreshDeleteFailedAccounts {
+		return false
+	}
+	return true
+}
+
+func (s *Server) triggerAutoRefillIfNeeded(reason string) {
+	if !s.registerExecutorConfigured() || !s.cfg.AutoRefillUseEffectiveAvailable {
+		return
+	}
+	cfg, err := s.fetchRegisterExecutorConfig()
+	if err != nil {
+		log.Printf("[account-refill] fetch register config failed: %v", err)
+		return
+	}
+	refill, _ := cfg["auto_refill"].(map[string]any)
+	if !boolAny(refill["enabled"], false) {
+		return
+	}
+	minAvailable := intAny(refill["min_available"], 30)
+	if minAvailable < 1 {
+		minAvailable = 1
+	}
+	current := s.effectiveAvailableImageAccounts()
+	if current >= minAvailable {
+		if s.logSvc != nil {
+			s.logSvc.add("account", "自动补号跳过", map[string]any{"reason": reason, "effective_available": current, "min_available": minAvailable})
+		}
+		return
+	}
+	batchTotal := intAny(refill["batch_total"], 100)
+	if batchTotal < 1 {
+		batchTotal = 1
+	}
+	if _, err := s.postRegisterExecutor("/api/register/start-auto-refill", map[string]any{"batch_total": batchTotal, "reason": reason, "effective_available": current, "min_available": minAvailable}); err != nil {
+		log.Printf("[account-refill] trigger auto refill failed: %v", err)
+		if s.logSvc != nil {
+			s.logSvc.add("account", "自动补号触发失败", map[string]any{"reason": reason, "effective_available": current, "min_available": minAvailable, "error": err.Error()})
+		}
+		return
+	}
+	if s.logSvc != nil {
+		s.logSvc.add("account", "自动补号触发", map[string]any{"reason": reason, "effective_available": current, "min_available": minAvailable, "batch_total": batchTotal})
+	}
 }

@@ -1,6 +1,9 @@
 package app
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -80,6 +83,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if v, ok := body["image_worker_poll_interval_secs"]; ok {
 			next.ImageWorkerPollIntervalSecs = intAny(v, next.ImageWorkerPollIntervalSecs)
 		}
+		if v, ok := body["image_account_fallback_attempts"]; ok {
+			next.ImageAccountFallbackAttempts = intAny(v, next.ImageAccountFallbackAttempts)
+			if next.ImageAccountFallbackAttempts < 1 {
+				next.ImageAccountFallbackAttempts = 1
+			}
+		}
 		if v, ok := body["image_account_concurrency"]; ok {
 			next.ImageAccountConcurrency = intAny(v, next.ImageAccountConcurrency)
 		}
@@ -88,6 +97,57 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if v, ok := body["auto_remove_rate_limited_accounts"]; ok {
 			next.AutoRemoveRateLimitedAccounts = boolAny(v, false)
+		}
+		if v, ok := body["auto_delete_quota_zero_accounts"]; ok {
+			next.AutoDeleteQuotaZeroAccounts = boolAny(v, true)
+		}
+		if v, ok := body["auto_delete_upload_quota_zero_accounts"]; ok {
+			next.AutoDeleteUploadQuotaZeroAccounts = boolAny(v, true)
+		}
+		if v, ok := body["delete_403_consecutive"]; ok {
+			next.Delete403Consecutive = intAny(v, next.Delete403Consecutive)
+			if next.Delete403Consecutive < 1 {
+				next.Delete403Consecutive = 1
+			}
+		}
+		if v, ok := body["delete_timeout_consecutive"]; ok {
+			next.DeleteTimeoutConsecutive = intAny(v, next.DeleteTimeoutConsecutive)
+			if next.DeleteTimeoutConsecutive < 1 {
+				next.DeleteTimeoutConsecutive = 1
+			}
+		}
+		if v, ok := body["auto_refresh_accounts_enabled"]; ok {
+			next.AutoRefreshAccountsEnabled = boolAny(v, true)
+		}
+		if v, ok := body["auto_refresh_accounts_interval_minutes"]; ok {
+			next.AutoRefreshAccountsIntervalMinutes = intAny(v, next.AutoRefreshAccountsIntervalMinutes)
+			if next.AutoRefreshAccountsIntervalMinutes < 1 {
+				next.AutoRefreshAccountsIntervalMinutes = 1
+			}
+		}
+		if v, ok := body["auto_refresh_accounts_batch_size"]; ok {
+			next.AutoRefreshAccountsBatchSize = intAny(v, next.AutoRefreshAccountsBatchSize)
+			if next.AutoRefreshAccountsBatchSize < 0 {
+				next.AutoRefreshAccountsBatchSize = 0
+			}
+		}
+		if v, ok := body["auto_refresh_delete_failed_accounts"]; ok {
+			next.AutoRefreshDeleteFailedAccounts = boolAny(v, true)
+		}
+		if v, ok := body["auto_refresh_trigger_refill"]; ok {
+			next.AutoRefreshTriggerRefill = boolAny(v, true)
+		}
+		if v, ok := body["auto_cleanup_accounts_enabled"]; ok {
+			next.AutoCleanupAccountsEnabled = boolAny(v, true)
+		}
+		if v, ok := body["auto_cleanup_accounts_interval_seconds"]; ok {
+			next.AutoCleanupAccountsIntervalSeconds = intAny(v, next.AutoCleanupAccountsIntervalSeconds)
+			if next.AutoCleanupAccountsIntervalSeconds < 10 {
+				next.AutoCleanupAccountsIntervalSeconds = 10
+			}
+		}
+		if v, ok := body["auto_refill_use_effective_available"]; ok {
+			next.AutoRefillUseEffectiveAvailable = boolAny(v, true)
 		}
 		if v, ok := body["cleanup_protect_user_images"]; ok {
 			next.CleanupProtectUserImages = boolAny(v, true)
@@ -115,7 +175,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, "failed to save config: "+err.Error())
 			return
 		}
-		s.cfg = next
+		s.applyRuntimeConfig(next)
 		writeJSON(w, 200, map[string]any{"config": s.configMap(false)})
 	default:
 		writeErr(w, 405, "method not allowed")
@@ -201,7 +261,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, "failed to save config: "+err.Error())
 			return
 		}
-		s.cfg = next
+		s.applyRuntimeConfig(next)
 		writeJSON(w, 200, map[string]any{"proxy": map[string]any{"url": s.cfg.Proxy, "enabled": s.cfg.Proxy != ""}})
 		return
 	}
@@ -211,26 +271,98 @@ func (s *Server) handleProxyTest(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
-	target := "https://chatgpt.com/backend-api/me"
-	client := &http.Client{Timeout: 15 * time.Second}
-	if strings.TrimSpace(s.cfg.Proxy) != "" {
-		proxy, err := normalizeProxyURL(s.cfg.Proxy)
-		if err != nil {
-			writeJSON(w, 200, map[string]any{"result": map[string]any{"ok": false, "message": err.Error()}})
-			return
-		}
-		proxyURL, _ := url.Parse(proxy)
-		client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
-	}
-	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		writeJSON(w, 200, map[string]any{"result": map[string]any{"ok": false, "message": err.Error()}})
+	if r.Method != http.MethodPost {
+		writeErr(w, 405, "method not allowed")
 		return
 	}
+	var body map[string]any
+	if !readBody(w, r, &body) {
+		return
+	}
+	candidate := strings.TrimSpace(strAny(body["url"], strAny(body["proxy"], s.cfg.Proxy)))
+	result := s.testProxyConnectivity(r.Context(), candidate)
+	writeJSON(w, 200, map[string]any{"result": result})
+}
+
+func (s *Server) testProxyConnectivity(ctx context.Context, candidate string) map[string]any {
+	result := map[string]any{
+		"ok":         false,
+		"proxy":      maskProxyURL(candidate),
+		"latency_ms": 0,
+		"error":      nil,
+	}
+	proxy, err := normalizeProxyURL(candidate)
+	if err != nil {
+		result["error"] = err.Error()
+		return result
+	}
+	if proxy == "" {
+		result["error"] = "proxy is required"
+		return result
+	}
+	proxyURL, _ := url.Parse(proxy)
+	client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	start := time.Now()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.cloudflare.com/cdn-cgi/trace", nil)
+	resp, err := client.Do(req)
+	latency := int(time.Since(start).Milliseconds())
+	result["latency_ms"] = latency
+	if err != nil {
+		result["error"] = err.Error()
+		return result
+	}
 	defer resp.Body.Close()
-	ok := resp.StatusCode > 0 && resp.StatusCode < 500
-	writeJSON(w, 200, map[string]any{"result": map[string]any{"ok": ok, "status": resp.StatusCode, "message": resp.Status}})
+	result["status"] = resp.StatusCode
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	trace := parseCloudflareTrace(string(body))
+	if resp.StatusCode != http.StatusOK {
+		result["error"] = fmt.Sprintf("proxy check http %d", resp.StatusCode)
+		return result
+	}
+	if strings.TrimSpace(trace["ip"]) == "" {
+		result["error"] = "proxy check did not return exit ip"
+		return result
+	}
+	result["ok"] = true
+	result["ip"] = trace["ip"]
+	result["country"] = trace["loc"]
+	result["colo"] = trace["colo"]
+	result["http"] = trace["http"]
+	result["tls"] = trace["tls"]
+	result["target"] = "https://www.cloudflare.com/cdn-cgi/trace"
+	return result
+}
+
+func parseCloudflareTrace(body string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		out[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+	}
+	return out
+}
+
+func maskProxyURL(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	u, err := url.Parse(value)
+	if err != nil || u.User == nil {
+		return value
+	}
+	username := u.User.Username()
+	if _, ok := u.User.Password(); ok {
+		u.User = url.UserPassword(username, "***")
+	}
+	return u.String()
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {

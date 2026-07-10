@@ -20,6 +20,110 @@ func (s *Server) startLimitedAccountWatcher() {
 	}()
 }
 
+func (s *Server) startAutoAccountRefreshWatcher() {
+	go func() {
+		lastRun := time.Time{}
+		for {
+			if !s.cfg.AutoRefreshAccountsEnabled {
+				lastRun = time.Now()
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			interval := autoAccountRefreshInterval(s.cfg)
+			if lastRun.IsZero() || time.Since(lastRun) >= interval {
+				lastRun = time.Now()
+				s.autoRefreshAccounts()
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}()
+}
+
+func autoAccountRefreshInterval(cfg Config) time.Duration {
+	interval := time.Duration(cfg.AutoRefreshAccountsIntervalMinutes) * time.Minute
+	if interval <= 0 {
+		interval = 60 * time.Minute
+	}
+	return interval
+}
+
+func (s *Server) startAccountCleanupWatcher() {
+	go func() {
+		lastRun := time.Time{}
+		for {
+			if !s.cfg.AutoCleanupAccountsEnabled {
+				lastRun = time.Now()
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			interval := accountCleanupInterval(s.cfg)
+			if lastRun.IsZero() || time.Since(lastRun) >= interval {
+				lastRun = time.Now()
+				removed := s.cleanupAccountsAndMaybeRefill("account_cleanup_watcher")
+				if removed > 0 && s.logSvc != nil {
+					s.logSvc.add("account", "\u5b9a\u65f6\u6e05\u7406\u5f02\u5e38\u8d26\u53f7", map[string]any{"removed": removed, "effective_available": s.effectiveAvailableImageAccounts()})
+				}
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}()
+}
+
+func accountCleanupInterval(cfg Config) time.Duration {
+	interval := time.Duration(cfg.AutoCleanupAccountsIntervalSeconds) * time.Second
+	if interval < 10*time.Second {
+		interval = 60 * time.Second
+	}
+	return interval
+}
+
+func (s *Server) autoRefreshAccounts() {
+	accounts := s.store.LoadAccounts()
+	tokens := s.nextAutoRefreshTokens(accounts, s.cfg.AutoRefreshAccountsBatchSize)
+	if len(tokens) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(maxInt(60, len(tokens)*45+30))*time.Second)
+	defer cancel()
+	before := s.store.LoadAccounts()
+	refreshed, errs, removed, cleanupRemoved := s.refreshAccountInfos(ctx, tokens)
+	if s.logSvc != nil {
+		s.logSvc.add("account", "定时刷新账号", map[string]any{"refreshed": refreshed, "errors": len(errs), "removed_unusable": removed, "cleanup_removed": cleanupRemoved, "emails": accountEmailsForRefreshLog(before, s.store.LoadAccounts(), tokens)})
+	}
+	if s.cfg.AutoRefreshTriggerRefill {
+		s.triggerAutoRefillIfNeeded("auto_account_refresh")
+	}
+}
+
+func (s *Server) nextAutoRefreshTokens(accounts []Account, batchSize int) []string {
+	eligible := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		token := strings.TrimSpace(account.AccessToken)
+		if token == "" || account.PendingDelete {
+			continue
+		}
+		eligible = append(eligible, token)
+	}
+	if len(eligible) == 0 {
+		return nil
+	}
+	if batchSize <= 0 || batchSize >= len(eligible) {
+		s.autoRefreshMu.Lock()
+		s.autoRefreshCursor = 0
+		s.autoRefreshMu.Unlock()
+		return eligible
+	}
+	s.autoRefreshMu.Lock()
+	start := s.autoRefreshCursor % len(eligible)
+	s.autoRefreshCursor = (start + batchSize) % len(eligible)
+	s.autoRefreshMu.Unlock()
+	out := make([]string, 0, batchSize)
+	for i := 0; i < batchSize; i++ {
+		out = append(out, eligible[(start+i)%len(eligible)])
+	}
+	return out
+}
+
 func (s *Server) refreshAccountsNeedingLimitRefresh() {
 	limited := accountsNeedingLimitRefresh(s.store.LoadAccounts())
 	if len(limited) == 0 {
@@ -61,7 +165,7 @@ func (s *Server) refreshAccountsNeedingLimitRefresh() {
 			log.Printf("[account-limited-watcher] failed to save refreshed account: %v", err)
 			continue
 		}
-		s.cleanupUnusableImageAccounts()
+		s.cleanupAccountsAndMaybeRefill("limited_account_refresh")
 	}
 }
 

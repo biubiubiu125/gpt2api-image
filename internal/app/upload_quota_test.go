@@ -147,6 +147,7 @@ func TestUnknownUploadQuotaBlocksTextUploadTask(t *testing.T) {
 
 func TestUploadQuotaAccountSurvivesImageQuotaCleanupForTextUploads(t *testing.T) {
 	s := newImageAccountGuardTestServer(t)
+	s.cfg.AutoDeleteQuotaZeroAccounts = false
 	resetAt := "2026-07-08T00:00:00Z"
 	featureName := "file_uploads"
 	account := Account{
@@ -281,6 +282,7 @@ func TestNormalizeAccountLimitStatePreservesGenericRateLimit(t *testing.T) {
 
 func TestImageSuccessKeepsUploadCapableAccountWhenImageQuotaReachesZero(t *testing.T) {
 	s := newImageAccountGuardTestServer(t)
+	s.cfg.AutoDeleteQuotaZeroAccounts = false
 	if err := s.store.SaveAccounts([]Account{{
 		AccessToken:        "tok",
 		Status:             accountStatusNormal,
@@ -377,6 +379,7 @@ func TestAcquireUploadAccountLeaseRejectsUnknownQuota(t *testing.T) {
 
 func TestUploadLimitFailureDoesNotClearImageQuota(t *testing.T) {
 	s := newImageAccountGuardTestServer(t)
+	s.cfg.AutoDeleteUploadQuotaZeroAccounts = false
 	if err := s.store.SaveAccounts([]Account{{
 		AccessToken:        "tok",
 		Type:               "free",
@@ -407,6 +410,7 @@ func TestUploadLimitFailureDoesNotClearImageQuota(t *testing.T) {
 
 func TestGenericRateLimitClearsStaleImageReset(t *testing.T) {
 	s := newImageAccountGuardTestServer(t)
+	s.cfg.AutoRemoveRateLimitedAccounts = false
 	imageResetAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
 	if err := s.store.SaveAccounts([]Account{{
 		AccessToken:        "tok",
@@ -516,6 +520,7 @@ func TestUploadLimitRestoreDelayUsesPlanFallbacks(t *testing.T) {
 
 func TestUploadLimitFailureUsesPaidFallbackResetWindow(t *testing.T) {
 	s := newImageAccountGuardTestServer(t)
+	s.cfg.AutoDeleteUploadQuotaZeroAccounts = false
 	if err := s.store.SaveAccounts([]Account{{
 		AccessToken:        "tok",
 		Type:               "Plus",

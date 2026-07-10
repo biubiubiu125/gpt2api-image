@@ -286,10 +286,18 @@ func redactRegisterSecrets(cfg RegisterConfig) RegisterConfig {
 
 func redactRegisterProviderSecrets(provider map[string]any) {
 	for key, value := range provider {
-		if isRegisterSecretKey(key) && strings.TrimSpace(strAny(value, "")) != "" {
+		if shouldRedactRegisterProviderSecret(provider, key) && strings.TrimSpace(strAny(value, "")) != "" {
 			provider[key] = registerSecretPlaceholder
 		}
 	}
+}
+
+func shouldRedactRegisterProviderSecret(provider map[string]any, key string) bool {
+	k := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "-", "_"))
+	if strings.EqualFold(strAny(provider["type"], ""), "yyds_mail") && k == "api_key" {
+		return false
+	}
+	return isRegisterSecretKey(k)
 }
 
 func isRegisterSecretKey(key string) bool {

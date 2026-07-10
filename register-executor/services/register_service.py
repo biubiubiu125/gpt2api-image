@@ -60,6 +60,13 @@ def _is_secret_key(key: object) -> bool:
     )
 
 
+def _should_redact_provider_secret(provider: dict, key: object) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    if str(provider.get("type") or "") == "yyds_mail" and normalized == "api_key":
+        return False
+    return _is_secret_key(normalized)
+
+
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
     return "\n".join(
         f'{c["email"]}----{c.get("password", "")}----{c["client_id"]}----{c["refresh_token"]}' for c in credentials
@@ -567,7 +574,7 @@ class RegisterService:
             if not isinstance(provider, dict):
                 continue
             for key, value in list(provider.items()):
-                if _is_secret_key(key) and str(value or "").strip():
+                if _should_redact_provider_secret(provider, key) and str(value or "").strip():
                     provider[key] = SECRET_PLACEHOLDER
             if provider.get("type") == "outlook_token":
                 credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
